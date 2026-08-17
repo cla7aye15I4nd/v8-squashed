@@ -1389,6 +1389,8 @@ DEFINE_NEG_IMPLICATION(shared_heap, always_use_string_forwarding_table)
 
 DEFINE_BOOL(transition_strings_during_gc_with_stack, false,
             "Transition strings during a full GC with stack")
+DEFINE_NEG_IMPLICATION(shared_string_table,
+                       transition_strings_during_gc_with_stack)
 
 DEFINE_SIZE_T(initial_shared_heap_size, 0,
               "initial size of the shared heap (in Mbytes); "
@@ -3112,6 +3114,7 @@ DEFINE_BOOL(test_small_max_function_context_stub_size, false,
             "by making the maximum size smaller")
 DEFINE_WEAK_IMPLICATION(future, fast_api_indexof)
 DEFINE_BOOL(fast_api_indexof, false, "enable using indexOf Api callbacks")
+DEFINE_WEAK_IMPLICATION(future, fast_api_iterable_to_list)
 DEFINE_BOOL(fast_api_iterable_to_list, false,
             "enable fast path for IterableToList for indexed interceptors")
 
