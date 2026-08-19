@@ -470,6 +470,7 @@ class ExceptionHandlerInfo;
   V(StoreFixedArrayElementWithWriteBarrier)   \
   V(StoreFixedArrayElementNoWriteBarrier)     \
   V(StoreFixedDoubleArrayElement)             \
+  V(StoreFixedDoubleArrayHole)                \
   V(StoreFixedHoleyDoubleArrayElement)        \
   V(StoreInt32)                               \
   V(StoreFloat64)                             \
@@ -705,6 +706,7 @@ constexpr bool IsSimpleFieldStore(Opcode opcode) {
          opcode == Opcode::kStoreFixedArrayElementWithWriteBarrier ||
          opcode == Opcode::kStoreFixedArrayElementNoWriteBarrier ||
          opcode == Opcode::kStoreFixedDoubleArrayElement ||
+         opcode == Opcode::kStoreFixedDoubleArrayHole ||
          opcode == Opcode::kStoreFixedHoleyDoubleArrayElement ||
          opcode == Opcode::kStoreTrustedPointerFieldWithWriteBarrier ||
          opcode == Opcode::kStoreContextSlotWithWriteBarrier ||
@@ -723,6 +725,7 @@ constexpr bool IsElementsArrayWrite(Opcode opcode) {
 // allocated backing store.
 constexpr bool PreservesTaggedKeyedProperties(Opcode opcode) {
   return opcode == Opcode::kStoreFixedDoubleArrayElement ||
+         opcode == Opcode::kStoreFixedDoubleArrayHole ||
          opcode == Opcode::kStoreFixedHoleyDoubleArrayElement ||
          opcode == Opcode::kTransitionElementsKind ||
          opcode == Opcode::kTransitionElementsKindOrCheckMap;
@@ -1475,6 +1478,10 @@ class DeoptFrame {
     const base::Vector<ValueNode*> parameters;
     ValueNode* context;
     compiler::OptionalJSFunctionRef maybe_js_target;
+    // If true, the deoptimizer treats this continuation as a catch handler
+    // when a throw arrives at the call, passing the exception in the slot it
+    // pushes itself (kJavaScriptBuiltinContinuationWithCatch frames).
+    bool is_with_catch = false;
   };
 
   using FrameData = base::DiscriminatedUnion<
@@ -1655,15 +1662,16 @@ class BuiltinContinuationDeoptFrame : public DeoptFrame {
                                 base::Vector<ValueNode*> parameters,
                                 ValueNode* context,
                                 compiler::OptionalJSFunctionRef maybe_js_target,
-                                DeoptFrame* parent)
+                                DeoptFrame* parent, bool is_with_catch)
       : DeoptFrame(BuiltinContinuationFrameData{builtin_id, parameters, context,
-                                                maybe_js_target},
+                                                maybe_js_target, is_with_catch},
                    parent) {}
 
   const Builtin& builtin_id() const { return data().builtin_id; }
   base::Vector<ValueNode*> parameters() const { return data().parameters; }
   ValueNode*& context() { return data().context; }
   ValueNode* context() const { return data().context; }
+  bool is_with_catch() const { return data().is_with_catch; }
   bool is_javascript() const { return data().maybe_js_target.has_value(); }
   compiler::JSFunctionRef javascript_target() const {
     return data().maybe_js_target.value();
@@ -5866,11 +5874,9 @@ class VirtualObject : public FixedInputValueNodeT<0, VirtualObject> {
         vobj::Field snd = FieldForOffset(offsetof(ConsString, second_));
         return callback(slots_[snd.slot_index], snd);
       }
-      if (object_type() == vobj::ObjectType::kHeapNumber) {
-        // HeapNumber materialization creates a literal object instead of
-        // slot traversal.
-        return true;
-      }
+      // TODO(victorgomes): Constrain which objects may contain mutable
+      // HeapNumbers. Immutable HeapNumbers can be stored as a literal object
+      // instead of traversing their slots.
     }
     for (int i = 0; i < slot_count(); i++) {
       vobj::Field field = FieldForSlot(i);
@@ -6074,8 +6080,7 @@ struct VirtualJSStringIteratorShape : VirtualJSObjectShape {
 struct VirtualJSMapIteratorShape : VirtualJSObjectShape {
   using T = JSCollectionIterator;
 #define FIELD_LIST(V)                                     \
-  V(table, offsetof(T, table_), vobj::FieldType::kTagged, \
-    vobj::FieldConstness::kConstAfterInit)                \
+  V(table, offsetof(T, table_), vobj::FieldType::kTagged) \
   V(index, offsetof(T, index_), vobj::FieldType::kTagged)
   DEF_SHAPE(VirtualJSObjectShape, FIELD_LIST);
 #undef FIELD_LIST
@@ -6236,8 +6241,8 @@ struct VirtualPrimitiveHeapObjectShape : VirtualHeapObjectShape {};
 
 struct VirtualHeapNumberShape : VirtualPrimitiveHeapObjectShape {
   using T = HeapNumber;
-  // Special handling needed; deopt materialization uses a special path.
-  // TODO(jgruber): .. but could it take the standard path instead?
+  // Special handling needed; instances may be mutable object fields and thus
+  // must never be deduplicated in deopt frames.
   static constexpr vobj::ObjectType kObjectType = vobj::ObjectType::kHeapNumber;
 #define FIELD_LIST(V) V(value, offsetof(T, value_), vobj::FieldType::kFloat64)
   DEF_SHAPE(VirtualPrimitiveHeapObjectShape, FIELD_LIST);
@@ -8868,6 +8873,24 @@ class StoreFixedDoubleArrayElement
                                            ValueRepresentation::kFloat64> {
  public:
   explicit StoreFixedDoubleArrayElement(uint64_t bitfield) : Base(bitfield) {}
+
+  void VerifyInputs() const;
+};
+
+// Writes the hole into an element, marking it absent. This is the only way a
+// hole gets into a double array on purpose, which is what lets
+// StoreFixedDoubleArrayElement mean "stores a number".
+class StoreFixedDoubleArrayHole
+    : public FixedInputNodeT<2, StoreFixedDoubleArrayHole> {
+ public:
+  explicit StoreFixedDoubleArrayHole(uint64_t bitfield) : Base(bitfield) {}
+
+  static constexpr OpProperties kProperties = OpProperties::CanWrite();
+  DECLARE_INPUTS(Elements, Index)
+  DECLARE_INPUT_TYPES(Tagged, Int32)
+
+  void SetValueLocationConstraints();
+  void GenerateCode(MaglevAssembler*, const ProcessingState&);
 };
 
 // Stores a value that can be undefined. HoleyFloat64 spells undefined in two

@@ -71,13 +71,13 @@ template <typename BaseT>
 MaglevReducer<BaseT>::LazyDeoptFrameScope::LazyDeoptFrameScope(
     MaglevReducer* reducer, ValueNode* context, Builtin continuation,
     compiler::OptionalJSFunctionRef maybe_js_target,
-    base::Vector<ValueNode* const> parameters)
+    base::Vector<ValueNode* const> parameters, bool is_with_catch)
     : reducer_(reducer),
       data_(DeoptFrame::BuiltinContinuationFrameData{
           continuation,
           parameters.empty() ? base::Vector<ValueNode*>{}
                              : reducer->zone()->CloneVector(parameters),
-          context, maybe_js_target}),
+          context, maybe_js_target, is_with_catch}),
       parent_(reducer->current_lazy_deopt_scope_) {
   if constexpr (ReducerBaseWithDeoptFrameScopeHooks<BaseT>) {
     reducer->base_->OnBeginDeoptFrameScope();
@@ -91,8 +91,10 @@ MaglevReducer<BaseT>::LazyDeoptFrameScope::LazyDeoptFrameScope(
       receiver->ForceEscaping();
     }
   }
-  DebugVerifyBuiltinDeoptFrame(data_,
-                               compiler::ContinuationFrameStateMode::LAZY);
+  DebugVerifyBuiltinDeoptFrame(
+      data_, is_with_catch
+                 ? compiler::ContinuationFrameStateMode::LAZY_WITH_CATCH
+                 : compiler::ContinuationFrameStateMode::LAZY);
   reducer->current_lazy_deopt_scope_ = this;
 }
 
@@ -5013,6 +5015,121 @@ MaybeReduceResult MaglevReducer<BaseT>::TryReduceStringLength(
 }
 
 template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceConstantStringAt(
+    ValueNode* receiver, ValueNode* index, StringAtOOBMode oob_mode) {
+  auto constant_receiver = TryGetConstant<HeapObject>(receiver);
+  if (!constant_receiver) return {};
+  if (!constant_receiver->IsString()) {
+    return EmitUnconditionalDeopt(DeoptimizeReason::kNotAString);
+  }
+  compiler::StringRef string = constant_receiver->AsString();
+  auto maybe_constant_index = TryGetInt32Constant(index);
+  if (!maybe_constant_index) return {};
+  int32_t constant_index = *maybe_constant_index;
+
+  if (static_cast<uint32_t>(constant_index) >= string.length()) {
+    switch (oob_mode) {
+      case StringAtOOBMode::kElement:
+        // For element access, a negative index triggers a named lookup rather
+        // than an element lookup; when this is the case, we shouldn't be trying
+        // to optimize an elements access at all, so deopt.
+        if (constant_index < 0) {
+          return EmitUnconditionalDeopt(DeoptimizeReason::kOutOfBounds);
+        }
+        // Otherwise, this is hole-like access, so guard against elements on the
+        // prototype to return undefined.
+        if (broker()->dependencies()->DependOnNoElementsProtector()) {
+          return GetRootConstant(RootIndex::kUndefinedValue);
+        }
+        // If the no elements protector is invalidated, unconditionally deopt.
+        // This shouldn't trigger a deopt look because the feedback should
+        // transition to megamorphic.
+        return EmitUnconditionalDeopt(DeoptimizeReason::kOutOfBounds);
+      case StringAtOOBMode::kCharAt: {
+        // OOB for charAt is always the empty string.
+        return GetRootConstant(RootIndex::kempty_string);
+      }
+    }
+    UNREACHABLE();
+  }
+
+  if (std::optional<uint16_t> value =
+          string.GetChar(broker(), constant_index)) {
+    return GetConstantSingleCharacterStringFromCode(*value);
+  }
+  return {};
+}
+
+template <typename BaseT>
+MaybeReduceResult
+MaglevReducer<BaseT>::GetConstantSingleCharacterStringFromCode(uint16_t code) {
+  // Only handle the one-byte character case, which accesses roots.
+  if (code <= String::kMaxOneByteCharCode) {
+    return GetRootConstant(RootsTable::SingleCharacterStringIndex(code));
+  }
+  return {};
+}
+
+template <typename BaseT>
+ReduceResult MaglevReducer<BaseT>::BuildLoadStringLength(ValueNode* string) {
+  RETURN_IF_DONE(TryReduceStringLength(string));
+  ValueNode* result;
+  GET_VALUE_OR_ABORT(result, AddNewNode<StringLength>({string}));
+  RecordKnownProperty(string, PropertyKey::StringLength(), result, true,
+                      compiler::AccessMode::kLoad);
+  return result;
+}
+
+template <typename BaseT>
+ReduceResult MaglevReducer<BaseT>::BuildGetCharCodeAt(ValueNode* string,
+                                                      ValueNode* index) {
+  return AddNewNode<BuiltinStringPrototypeCharCodeOrCodePointAt>(
+      {string, index},
+      BuiltinStringPrototypeCharCodeOrCodePointAt::kCharCodeAt);
+}
+
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceStringPrototypeIndexOfIncludes(
+    CallArguments& args, bool is_includes) {
+  if (!CanSpeculateCall()) return {};
+
+  ValueNode* receiver = GetValueOrUndefined(args.receiver());
+  RETURN_IF_ABORT(BuildCheckString(receiver));
+
+  ValueNode* search_element =
+      args.count() > 0 ? args[0]
+                       : GetRootConstant(RootIndex::kundefined_string);
+  RETURN_IF_ABORT(BuildCheckString(search_element));
+
+  ValueNode* start = args.count() > 1 ? args[1] : GetInt32Constant(0);
+  ValueNode* receiver_length;
+  GET_VALUE_OR_ABORT(receiver_length, BuildLoadStringLength(receiver));
+
+  // min(max(start, 0), receiver_length)
+  ValueNode* max_value;
+  GET_VALUE_OR_ABORT(max_value, BuildInt32Max(start, GetInt32Constant(0)));
+  ValueNode* clamped_start;
+  GET_VALUE_OR_ABORT(clamped_start, BuildInt32Min(max_value, receiver_length));
+
+  // TODO(496266449): Change StringIndexOf value representation type to
+  // kSmi and remove this GetSmiValue call.
+  ValueNode* clamped_start_smi;
+  GET_VALUE_OR_ABORT(clamped_start_smi, GetSmiValue(clamped_start));
+
+  ValueNode* result;
+  GET_VALUE_OR_ABORT(result,
+                     (AddNewNode<StringIndexOf>(
+                         {receiver, search_element, clamped_start_smi})));
+
+  if (is_includes) {
+    return (AddNewNode<Int32Compare>({result, GetInt32Constant(0)},
+                                     Operation::kGreaterThanOrEqual));
+  }
+
+  return result;
+}
+
+template <typename BaseT>
 template <typename LoadNode>
 MaybeReduceResult MaglevReducer<BaseT>::TryBuildLoadDataView(
     const CallArguments& args, ExternalArrayType type) {
@@ -6356,6 +6473,421 @@ template <typename BaseT>
 MaybeReduceResult MaglevReducer<BaseT>::TryReduceReturnReceiver(
     ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
   return GetValueOrUndefined(args.receiver());
+}
+
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceStringFromCharCode(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  if (!CanSpeculateCall()) return {};
+  if (args.count() != 1) return {};
+  ValueNode* value;
+  GET_VALUE_OR_ABORT(
+      value, GetTruncatedInt32ForToNumber(args[0], NodeType::kNumberOrOddball));
+  return AddNewNode<BuiltinStringFromCharCode>({value});
+}
+
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceStringPrototypeCharAt(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  if (!CanSpeculateCall({SpeculationMode::kDisallowBoundsCheckSpeculation})) {
+    return {};
+  }
+
+  ValueNode* receiver = GetValueOrUndefined(args.receiver());
+  ValueNode* index;
+  if (args.count() == 0) {
+    // Index is the undefined object. ToIntegerOrInfinity(undefined) = 0.
+    index = GetInt32Constant(0);
+  } else {
+    GET_VALUE_OR_ABORT(index, GetInt32ElementIndex(args[0]));
+  }
+  // Any other argument is ignored.
+
+  RETURN_IF_DONE(
+      TryReduceConstantStringAt(receiver, index, StringAtOOBMode::kCharAt));
+
+  // Ensure that {receiver} is actually a String.
+  RETURN_IF_ABORT(BuildCheckString(receiver));
+  // And index is below length.
+  ValueNode* length;
+  GET_VALUE_OR_ABORT(length, BuildLoadStringLength(receiver));
+
+  auto GetCharAt = [&]() -> ReduceResult {
+    return AddNewNode<StringAt>({receiver, index});
+  };
+  if (current_speculation_mode_ ==
+      SpeculationMode::kDisallowBoundsCheckSpeculation) {
+    return Select(
+        [&](BranchBuilder& builder) {
+          // Do unsafe conversions of length and index into uint32, to do an
+          // unsigned comparison. The index might actually be a negative signed
+          // value, but this "unsafe" cast will still work, converting it into a
+          // large unsigned value which compares greater than the length.
+          return BuildBranchIfUint32Compare(
+              builder, Operation::kLessThan,
+              // 'index' and 'length' are both int32, so no input conversion is
+              // needed.
+              AddNewNodeNoInputConversion<UnsafeInt32ToUint32>({index}),
+              AddNewNodeNoInputConversion<UnsafeInt32ToUint32>({length}));
+        },
+        [&]() -> ReduceResult { return GetCharAt(); },
+        [&]() -> ReduceResult {
+          return GetRootConstant(RootIndex::kempty_string);
+        });
+  }
+
+  DCHECK_EQ(current_speculation_mode_, SpeculationMode::kAllowSpeculation);
+  RETURN_IF_ABORT(TryBuildCheckInt32Condition(
+      index, length, AssertCondition::kUnsignedLessThan,
+      DeoptimizeReason::kOutOfBounds));
+  return GetCharAt();
+}
+
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceStringPrototypeCharCodeAt(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  if (!CanSpeculateCall({SpeculationMode::kDisallowBoundsCheckSpeculation})) {
+    return {};
+  }
+  ValueNode* receiver = GetValueOrUndefined(args.receiver());
+  ValueNode* index;
+  if (args.count() == 0) {
+    // Index is the undefined object. ToIntegerOrInfinity(undefined) = 0.
+    index = GetInt32Constant(0);
+  } else {
+    GET_VALUE_OR_ABORT(index, GetInt32ElementIndex(args[0]));
+  }
+  // Any other argument is ignored.
+
+  // Try to constant-fold if receiver and index are constant
+  if (auto cst = TryGetConstant<String>(receiver)) {
+    if (index->template Is<Int32Constant>()) {
+      int idx = index->template Cast<Int32Constant>()->value();
+      if (idx >= 0 && static_cast<uint32_t>(idx) < cst->length()) {
+        if (std::optional<uint16_t> value = cst->GetChar(broker(), idx)) {
+          return GetSmiConstant(*value);
+        }
+      }
+    }
+  }
+
+  // Ensure that {receiver} is actually a String.
+  RETURN_IF_ABORT(BuildCheckString(receiver));
+  // And index is below length.
+  ValueNode* length;
+  GET_VALUE_OR_ABORT(length, BuildLoadStringLength(receiver));
+
+  if (current_speculation_mode_ ==
+      SpeculationMode::kDisallowBoundsCheckSpeculation) {
+    return Select(
+        [&](BranchBuilder& builder) {
+          // Do unsafe conversions of length and index into uint32, to do an
+          // unsigned comparison. The index might actually be a negative signed
+          // value, but this "unsafe" cast will still work, converting it into a
+          // large unsigned value which compares greater than the length.
+          return BuildBranchIfUint32Compare(
+              builder, Operation::kLessThan,
+              // 'index' and 'length' are both int32, so no input conversion is
+              // needed.
+              AddNewNodeNoInputConversion<UnsafeInt32ToUint32>({index}),
+              AddNewNodeNoInputConversion<UnsafeInt32ToUint32>({length}));
+        },
+        [&]() -> ReduceResult { return BuildGetCharCodeAt(receiver, index); },
+        [&]() -> ReduceResult {
+          return GetRootConstant(RootIndex::kNanValue);
+        });
+  }
+
+  RETURN_IF_ABORT(TryBuildCheckInt32Condition(
+      index, length, AssertCondition::kUnsignedLessThan,
+      DeoptimizeReason::kOutOfBounds));
+  return BuildGetCharCodeAt(receiver, index);
+}
+
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceStringPrototypeCodePointAt(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  if (!CanSpeculateCall({SpeculationMode::kDisallowBoundsCheckSpeculation})) {
+    return {};
+  }
+  ValueNode* receiver = GetValueOrUndefined(args.receiver());
+  ValueNode* index;
+  if (args.count() == 0) {
+    // Index is the undefined object. ToIntegerOrInfinity(undefined) = 0.
+    index = GetInt32Constant(0);
+  } else {
+    GET_VALUE_OR_ABORT(index, GetInt32ElementIndex(args[0]));
+  }
+  // Any other argument is ignored.
+  // Ensure that {receiver} is actually a String.
+  RETURN_IF_ABORT(BuildCheckString(receiver));
+  // And index is below length.
+  ValueNode* length;
+  GET_VALUE_OR_ABORT(length, BuildLoadStringLength(receiver));
+
+  auto GetCodePointAt = [&]() -> ReduceResult {
+    return AddNewNode<BuiltinStringPrototypeCharCodeOrCodePointAt>(
+        {receiver, index},
+        BuiltinStringPrototypeCharCodeOrCodePointAt::kCodePointAt);
+  };
+
+  if (current_speculation_mode_ ==
+      SpeculationMode::kDisallowBoundsCheckSpeculation) {
+    return Select(
+        [&](BranchBuilder& builder) {
+          // Do unsafe conversions of length and index into uint32, to do an
+          // unsigned comparison. The index might actually be a negative signed
+          // value, but this "unsafe" cast will still work, converting it into a
+          // large unsigned value which compares greater than the length.
+          return BuildBranchIfUint32Compare(
+              builder, Operation::kLessThan,
+              // 'index' and 'length' are both int32, so no input conversion is
+              // needed.
+              AddNewNodeNoInputConversion<UnsafeInt32ToUint32>({index}),
+              AddNewNodeNoInputConversion<UnsafeInt32ToUint32>({length}));
+        },
+        [&]() -> ReduceResult { return GetCodePointAt(); },
+        [&]() -> ReduceResult {
+          return GetRootConstant(RootIndex::kUndefinedValue);
+        });
+  }
+
+  RETURN_IF_ABORT(TryBuildCheckInt32Condition(
+      index, length, AssertCondition::kUnsignedLessThan,
+      DeoptimizeReason::kOutOfBounds));
+  return GetCodePointAt();
+}
+
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceStringPrototypeSlice(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  if (!CanSpeculateCall()) return {};
+
+  ValueNode* receiver = GetValueOrUndefined(args.receiver());
+  // Ensure that {receiver} is actually a String.
+  RETURN_IF_ABORT(BuildCheckString(receiver));
+
+  if (args.count() == 1) {
+    // Reduce slice(-1).
+    if (std::optional<int32_t> index_const = TryGetInt32Constant(args[0]);
+        index_const && *index_const == -1) {
+      ValueNode* receiver_length;
+      GET_VALUE_OR_ABORT(receiver_length, BuildLoadStringLength(receiver));
+
+      return Select(
+          [&](BranchBuilder& builder) {
+            return BuildBranchIfInt32Compare(builder, Operation::kEqual,
+                                             receiver_length,
+                                             GetInt32Constant(0));
+          },
+          [&] { return GetRootConstant(RootIndex::kempty_string); },
+          [&] {
+            ValueNode* index_last;
+            // TODO(marja): Consider TryReduceConstantStringAt.
+            GET_VALUE_OR_ABORT(index_last,
+                               (AddNewNode<Int32Subtract>(
+                                   {receiver_length, GetInt32Constant(1)})));
+            return AddNewNode<StringAt>({receiver, index_last});
+          });
+    }
+  }
+
+  ValueNode* start_index;
+  bool start_is_undefined = false;
+  if (args.count() >= 1) {
+    if (RootConstant* root_cst = args[0]->template TryCast<RootConstant>()) {
+      start_is_undefined = (root_cst->index() == RootIndex::kUndefinedValue);
+    }
+  }
+  if (args.count() == 0 || start_is_undefined) {
+    start_index = GetInt32Constant(0);
+  } else {
+    GET_VALUE_OR_ABORT(start_index, GetInt32(args[0]));
+  }
+
+  ValueNode* end_index;
+  bool end_is_undefined = false;
+  if (args.count() >= 2) {
+    if (RootConstant* root_cst = args[1]->template TryCast<RootConstant>()) {
+      end_is_undefined = (root_cst->index() == RootIndex::kUndefinedValue);
+    }
+  }
+  if (args.count() < 2 || end_is_undefined) {
+    // Use String::kMaxLength as sentinel, as it is >= receiver.length it
+    // will be set to receiver.length when the node is lowered. This avoids
+    // loading the string length here.
+    end_index = GetInt32Constant(String::kMaxLength);
+  } else {
+    GET_VALUE_OR_ABORT(end_index, GetInt32(args[1]));
+  }
+
+  return AddNewNode<StringSlice>({receiver, start_index, end_index});
+}
+
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceStringPrototypeSubstring(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  if (!CanSpeculateCall()) return {};
+
+  if (args.count() != 1 && args.count() != 2) return {};
+
+  ValueNode* receiver = GetValueOrUndefined(args.receiver());
+  RETURN_IF_ABORT(BuildCheckString(receiver));
+
+  ValueNode* start_index = args[0];
+  ValueNode* end_index;
+  if (args.count() > 1) {
+    end_index = args[1];
+  } else {
+    GET_VALUE_OR_ABORT(end_index, BuildLoadStringLength(receiver));
+  }
+
+  ValueNode* zero = GetInt32Constant(0);
+  ValueNode* length;
+  GET_VALUE_OR_ABORT(length, BuildLoadStringLength(receiver));
+
+  ValueNode* clamped_start;
+  GET_VALUE_OR_ABORT(clamped_start, BuildInt32Max(start_index, zero));
+  GET_VALUE_OR_ABORT(clamped_start, BuildInt32Min(clamped_start, length));
+
+  ValueNode* clamped_end;
+  GET_VALUE_OR_ABORT(clamped_end, BuildInt32Max(end_index, zero));
+  GET_VALUE_OR_ABORT(clamped_end, BuildInt32Min(clamped_end, length));
+
+  ValueNode* from;
+  GET_VALUE_OR_ABORT(from, BuildInt32Min(clamped_start, clamped_end));
+  ValueNode* to;
+  GET_VALUE_OR_ABORT(to, BuildInt32Max(clamped_start, clamped_end));
+  return AddNewNode<StringSubstring>({receiver, from, to});
+}
+
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceStringPrototypeStartsWith(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  if (!CanSpeculateCall()) return {};
+
+  ValueNode* search_element =
+      args[0] ? args[0] : GetRootConstant(RootIndex::kundefined_string);
+
+  ValueNode* receiver = GetValueOrUndefined(args.receiver());
+
+  if (!NodeTypeIs(GetType(search_element), NodeType::kString)) return {};
+
+  ValueNode* start_arg = GetValueOrUndefined(args[1]);
+  ValueNode* start =
+      start_arg->IsUndefinedValue() ? GetInt32Constant(0) : start_arg;
+
+  RETURN_IF_ABORT(BuildCheckString(receiver));
+  RETURN_IF_ABORT(BuildCheckSmi(start));
+
+  ValueNode* receiver_length;
+  GET_VALUE_OR_ABORT(receiver_length, BuildLoadStringLength(receiver));
+
+  // min(max(start, 0), receiver_length)
+  ValueNode* max_value;
+  GET_VALUE_OR_ABORT(max_value, BuildInt32Max(start, GetInt32Constant(0)));
+  ValueNode* min_value;
+  GET_VALUE_OR_ABORT(min_value, BuildInt32Min(max_value, receiver_length));
+  ValueNode* clamped_start;
+  GET_VALUE_OR_ABORT(clamped_start, GetInt32(min_value));
+
+  ValueNode* search_length;
+  GET_VALUE_OR_ABORT(search_length, BuildLoadStringLength(search_element));
+
+  // TODO(all): Introduce a ForInt32 helper.
+  Subgraph<BaseT> sub_graph(this, 2);
+  using Variable = typename Subgraph<BaseT>::Variable;
+  using Label = typename Subgraph<BaseT>::Label;
+  using LoopLabel = typename Subgraph<BaseT>::LoopLabel;
+  Variable ret_val(0);
+  Variable var_i(1);
+  Label done(&sub_graph, 2, {&ret_val});
+  Label return_false(&sub_graph, 2);
+
+  // receiver_length - clamped_start < search_length
+  ValueNode* remaining;
+  GET_VALUE_OR_ABORT(
+      remaining, (AddNewNode<Int32Subtract>({receiver_length, clamped_start})));
+  RETURN_IF_ABORT((sub_graph.template GotoIfTrue<BranchIfInt32Compare>(
+      &return_false, {remaining, search_length}, Operation::kLessThan)));
+
+  // i = 0
+  sub_graph.set(var_i, GetInt32Constant(0));
+  LoopLabel loop_header = sub_graph.BeginLoop({&var_i});
+  Label return_true(&sub_graph, 1);
+
+  ValueNode* index_int32 = sub_graph.get(var_i);
+
+  // if (i < search_length) continue; else exit loop
+  RETURN_IF_ABORT((sub_graph.template GotoIfFalse<BranchIfInt32Compare>(
+      &return_true, {index_int32, search_length}, Operation::kLessThan)));
+
+  // pos = clamped_start + i
+  ValueNode* pos;
+  GET_VALUE_OR_ABORT(pos, (AddNewNode<Int32Add>({clamped_start, index_int32})));
+
+  // TODO(dmercadier): without static knowledge about maps shapes (which we
+  // probably don't have), BuildGetCharCodeAt generates fairly expensive code
+  // since it needs to handle all string shapes. It would be more efficient to
+  // have a pre-processing before the loop that computes a single linear buffer
+  // for each string (+ maybe an index, for SlicedString in particular), that's
+  // then accessed directly in the loop (cf StringPrepareForGetCodeUnit in
+  // Turboshaft). Here in particular, the loop doesn't contain anything that can
+  // trigger a GC, so this should be safe.
+  ValueNode* lhs_ch;
+  GET_VALUE_OR_ABORT(lhs_ch, BuildGetCharCodeAt(receiver, pos));
+  ValueNode* rhs_ch;
+  GET_VALUE_OR_ABORT(rhs_ch, BuildGetCharCodeAt(search_element, index_int32));
+  ValueNode* is_equal;
+  GET_VALUE_OR_ABORT(is_equal, BuildTaggedEqual(lhs_ch, rhs_ch));
+
+  // If chars are not equal, return false.
+  RETURN_IF_ABORT((sub_graph.template GotoIfFalse<BranchIfRootConstant>(
+      &return_false, {is_equal}, RootIndex::kTrueValue)));
+
+  // i++; goto loop_header
+  ValueNode* next_index_int32;
+  GET_VALUE_OR_ABORT(
+      next_index_int32,
+      (AddNewNode<Int32Add>({sub_graph.get(var_i), GetInt32Constant(1)})));
+  sub_graph.set(var_i, next_index_int32);
+  sub_graph.EndLoop(&loop_header);
+
+  sub_graph.Bind(&return_true);
+  sub_graph.set(ret_val, GetRootConstant(RootIndex::kTrueValue));
+  sub_graph.Goto(&done);
+
+  sub_graph.Bind(&return_false);
+  sub_graph.set(ret_val, GetRootConstant(RootIndex::kFalseValue));
+  sub_graph.Goto(&done);
+
+  sub_graph.Bind(&done);
+  return sub_graph.get(ret_val);
+}
+
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceStringPrototypeIndexOf(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  return TryReduceStringPrototypeIndexOfIncludes(args, false);
+}
+
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceStringPrototypeIncludes(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  return TryReduceStringPrototypeIndexOfIncludes(args, true);
+}
+
+template <typename BaseT>
+MaybeReduceResult MaglevReducer<BaseT>::TryReduceStringPrototypeIterator(
+    ValueNode* context, compiler::JSFunctionRef target, CallArguments& args) {
+  if (!CanSpeculateCall()) return {};
+  ValueNode* receiver = GetValueOrUndefined(args.receiver());
+  // Ensure that {receiver} is actually a String.
+  RETURN_IF_ABORT(BuildCheckString(receiver));
+  compiler::MapRef map =
+      broker()->target_native_context().initial_string_iterator_map(broker());
+  VirtualObject* string_iterator = CreateJSStringIterator(map, receiver);
+  return BuildInlinedAllocation(string_iterator, AllocationType::kYoung);
 }
 
 template <typename BaseT>
