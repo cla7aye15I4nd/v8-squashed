@@ -382,6 +382,9 @@ DEFINE_BOOL(js_shipping, true, "enable all shipped JavaScript features")
   V(js_iterator_join, "Iterator.prototype.join")                             \
   V(js_iterator_sequencing, "iterator sequencing")                           \
   V(js_joint_iteration, "joint iteration")                                   \
+  V(js_pr_3883,                                                              \
+    "Let Promise.try not wrap the result in an extra promise in the "        \
+    "non-throwing case (https://github.com/tc39/ecma262/pull/3883)")         \
   V(js_promise_try, "Promise.try")                                           \
   V(js_regexp_duplicate_named_groups, "RegExp duplicate named groups")       \
   V(js_regexp_escape, "RegExp.escape")                                       \
@@ -3326,9 +3329,6 @@ DEFINE_WEAK_IMPLICATION(future, clone_object_sidestep_transitions)
 DEFINE_INT(fast_properties_soft_limit, 12,
            "limits the number of properties that can be added to an object "
            "using keyed store before transitioning to dictionary mode")
-DEFINE_INT(max_fast_properties, 128,
-           "limits the number of mutable properties that can be added to an "
-           "object before transitioning to dictionary mode")
 
 DEFINE_BOOL(native_code_counters, DEBUG_BOOL,
             "generate extra code for manipulating stats counters")
