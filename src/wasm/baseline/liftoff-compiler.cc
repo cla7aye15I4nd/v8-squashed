@@ -131,6 +131,13 @@ struct assert_field_size {
 // from exceeding backend limits (like register allocation timeouts).
 constexpr int GetOpcodeCost(WasmOpcode opcode) {
   switch (opcode) {
+    // Opcodes that trigger memory growth and external memory reallocation.
+    // Memory allocation, zeroing, and external memory GC accounting have high
+    // overhead, so we charge a higher static cost to prevent GC thrashing in
+    // loops.
+    case kExprMemoryGrow:
+      return 10000;
+
     // Opcodes that trigger runtime calls and process bulk data.
     // These can have execution times significantly higher than a single
     // instruction and often involve complex backend lowering.
@@ -138,7 +145,6 @@ constexpr int GetOpcodeCost(WasmOpcode opcode) {
     case kExprMemoryFill:
     case kExprMemoryInit:
     case kExprDataDrop:
-    case kExprMemoryGrow:
     case kExprTableCopy:
     case kExprTableFill:
     case kExprTableInit:
@@ -4650,9 +4656,10 @@ class LiftoffCompiler {
                i64_offset);
     } else {
       LiftoffRegister full_index = __ PopToRegister(pinned);
-      ForceCheck force_check = (kPartialOOBWritesAreNoops || type.size() == 1)
-                                   ? kDontForceCheck
-                                   : kDoForceCheck;
+      ForceCheck force_check =
+          (v8_flags.wasm_partial_oob_writes_are_noops || type.size() == 1)
+              ? kDontForceCheck
+              : kDoForceCheck;
       index =
           BoundsCheckMem(decoder, imm.memory, type.size(), imm.offset,
                          full_index, pinned, force_check, kDontCheckAlignment);
@@ -4685,9 +4692,10 @@ class LiftoffCompiler {
     LiftoffRegList pinned;
     LiftoffRegister value = pinned.set(__ PopToRegister());
     LiftoffRegister full_index = __ PopToRegister(pinned);
-    ForceCheck force_check = (kPartialOOBWritesAreNoops || type.size() == 1)
-                                 ? kDontForceCheck
-                                 : kDoForceCheck;
+    ForceCheck force_check =
+        (v8_flags.wasm_partial_oob_writes_are_noops || type.size() == 1)
+            ? kDontForceCheck
+            : kDoForceCheck;
     Register index =
         BoundsCheckMem(decoder, imm.memory, type.size(), imm.offset, full_index,
                        pinned, force_check, kDontCheckAlignment);

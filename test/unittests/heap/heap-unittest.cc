@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "include/v8-callbacks.h"
+#include "include/v8-function.h"
 #include "include/v8-initialization.h"
 #include "include/v8-isolate.h"
 #include "include/v8-object.h"
@@ -50,6 +51,8 @@
 #include "src/objects/internal-index.h"
 #include "src/objects/js-array-buffer-inl.h"
 #include "src/objects/js-collection-inl.h"
+#include "src/objects/script-inl.h"
+#include "src/objects/shared-function-info-inl.h"
 #include "src/objects/transitions-inl.h"
 #include "src/sandbox/external-pointer-table.h"
 #include "test/common/noop-bytecode-verifier.h"
@@ -2307,6 +2310,79 @@ TEST_F(HeapTest, LeakNativeContextViaMap) {
   }
   EXPECT_EQ(1, NumberOfGlobalObjects());
 }
+
+TEST_F(HeapTest, LeakNativeContextViaMapProto) {
+  v8_flags.allow_natives_syntax = true;
+  v8::Isolate* isolate = v8_isolate();
+  Heap* heap_instance = heap();
+  v8::HandleScope outer_scope(isolate);
+  v8::Persistent<v8::Context> ctx1p;
+  v8::Persistent<v8::Context> ctx2p;
+  {
+    v8::HandleScope scope(isolate);
+    ctx1p.Reset(isolate, v8::Context::New(isolate));
+    ctx2p.Reset(isolate, v8::Context::New(isolate));
+    v8::Local<v8::Context>::New(isolate, ctx1p)->Enter();
+  }
+
+  {
+    // In this test, we need to invoke GC without stack, otherwise some objects
+    // may not be reclaimed because of conservative stack scanning.
+    DisableConservativeStackScanningScopeForTesting no_stack_scanning(
+        heap_instance);
+    InvokeMemoryReducingMajorGCs();
+  }
+  EXPECT_EQ(3, NumberOfGlobalObjects());
+
+  {
+    v8::HandleScope inner_scope(isolate);
+    v8::Local<v8::Context> ctx1 = v8::Local<v8::Context>::New(isolate, ctx1p);
+    v8::Local<v8::Context> ctx2 = v8::Local<v8::Context>::New(isolate, ctx2p);
+    RunJS(ctx1, "var v = { y: 42};");
+    v8::Local<v8::Value> v =
+        ctx1->Global()
+            ->Get(ctx1, v8::String::NewFromUtf8Literal(isolate, "v"))
+            .ToLocalChecked();
+    ctx2->Enter();
+    EXPECT_TRUE(ctx2->Global()
+                    ->Set(ctx2, v8::String::NewFromUtf8Literal(isolate, "o"), v)
+                    .FromJust());
+    Handle<Object> res = RunJS(ctx2,
+                               "function f() {"
+                               "  var p = {x: 42};"
+                               "  p.__proto__ = o;"
+                               "  return p.x;"
+                               "}"
+                               "%PrepareFunctionForOptimization(f);"
+                               "for (var i = 0; i < 10; ++i) f();"
+                               "%OptimizeFunctionOnNextCall(f);"
+                               "f();");
+    EXPECT_EQ(42, Object::NumberValue(*res));
+    EXPECT_TRUE(ctx2->Global()
+                    ->Set(ctx2, v8::String::NewFromUtf8Literal(isolate, "o"),
+                          v8::Int32::New(isolate, 0))
+                    .FromJust());
+    ctx2->Exit();
+    v8::Local<v8::Context>::New(isolate, ctx1)->Exit();
+    ctx1p.Reset();
+    isolate->ContextDisposedNotification(
+        v8::ContextDependants::kSomeDependants);
+  }
+  {
+    DisableConservativeStackScanningScopeForTesting no_stack_scanning(
+        heap_instance);
+    InvokeMemoryReducingMajorGCs();
+  }
+  EXPECT_EQ(2, NumberOfGlobalObjects());
+  ctx2p.Reset();
+  {
+    DisableConservativeStackScanningScopeForTesting no_stack_scanning(
+        heap_instance);
+    InvokeMemoryReducingMajorGCs();
+  }
+  EXPECT_EQ(1, NumberOfGlobalObjects());
+}
+
 TEST_F(HeapTest, OptimizedPretenuringNestedDoubleLiterals) {
   v8_flags.allow_natives_syntax = true;
   v8_flags.expose_gc = true;
@@ -2500,5 +2576,396 @@ TEST_F(HeapTest, OptimizedPretenuringMixedInObjectProperties) {
   EXPECT_TRUE(heap()->InOldSpace(inner_object->RawFastPropertyAt(idx1)));
   EXPECT_TRUE(heap()->InOldSpace(inner_object->RawFastPropertyAt(idx2)));
 }
+
+TEST_F(HeapTest, OptimizedPretenuringDoubleArrayLiterals) {
+  v8_flags.allow_natives_syntax = true;
+  v8_flags.expose_gc = true;
+  if (!i_isolate()->use_optimizer()) return;
+  if (v8_flags.gc_global || v8_flags.stress_compaction ||
+      v8_flags.stress_incremental_marking || v8_flags.single_generation ||
+      v8_flags.stress_concurrent_allocation || v8_flags.scavenger_chaos_mode) {
+    return;
+  }
+  v8::HandleScope scope(v8_isolate());
+  const char* extension_names[] = {"v8/gc"};
+  v8::ExtensionConfiguration extensions(1, extension_names);
+  v8::Local<v8::Context> ctx = v8::Context::New(v8_isolate(), &extensions);
+  v8::Context::Scope context_scope(ctx);
+  ManualGCScope manual_gc_scope(i_isolate());
+  GrowNewSpaceToMaximumCapacity();
+
+  static const int kPretenureCreationCount =
+      PretenuringHandler::GetMinMementoCountForTesting() + 1;
+
+  auto source = base::OwnedVector<char>::NewForOverwrite(1024);
+  base::SNPrintF(source.as_vector(),
+                 "var number_elements = %d;"
+                 "var elements = new Array(number_elements);"
+                 "function f() {"
+                 "  for (var i = 0; i < number_elements; i++) {"
+                 "    elements[i] = [1.1, 2.2, 3.3];"
+                 "  }"
+                 "  return elements[number_elements - 1];"
+                 "};"
+                 "%%PrepareFunctionForOptimization(f);"
+                 "f(); gc({type: 'minor'});"
+                 "f(); f();"
+                 "%%OptimizeFunctionOnNextCall(f);"
+                 "f();",
+                 kPretenureCreationCount);
+
+  Handle<JSObject> o = Cast<JSObject>(RunJS(ctx, source.begin()));
+
+  EXPECT_TRUE(heap()->InOldSpace(o->elements()));
+  EXPECT_TRUE(heap()->InOldSpace(*o));
+}
+
+TEST_F(HeapTest, OptimizedPretenuringNestedMixedArrayLiterals) {
+  v8_flags.allow_natives_syntax = true;
+  v8_flags.expose_gc = true;
+  if (!i_isolate()->use_optimizer()) return;
+  if (v8_flags.gc_global || v8_flags.stress_compaction ||
+      v8_flags.stress_incremental_marking || v8_flags.single_generation ||
+      v8_flags.stress_concurrent_allocation || v8_flags.scavenger_chaos_mode) {
+    return;
+  }
+  v8::HandleScope scope(v8_isolate());
+  const char* extension_names[] = {"v8/gc"};
+  v8::ExtensionConfiguration extensions(1, extension_names);
+  v8::Local<v8::Context> ctx = v8::Context::New(v8_isolate(), &extensions);
+  v8::Context::Scope context_scope(ctx);
+  ManualGCScope manual_gc_scope(i_isolate());
+  GrowNewSpaceToMaximumCapacity();
+
+  static const int kPretenureCreationCount =
+      PretenuringHandler::GetMinMementoCountForTesting() + 1;
+
+  auto source = base::OwnedVector<char>::NewForOverwrite(1024);
+  base::SNPrintF(source.as_vector(),
+                 "var number_elements = %d;"
+                 "var elements = new Array(number_elements);"
+                 "function f() {"
+                 "  for (var i = 0; i < number_elements; i++) {"
+                 "    elements[i] = [[{}, {}, {}], [1.1, 2.2, 3.3]];"
+                 "  }"
+                 "  return elements[number_elements - 1];"
+                 "};"
+                 "%%PrepareFunctionForOptimization(f);"
+                 "f(); gc({type: 'minor'});"
+                 "f(); f();"
+                 "%%OptimizeFunctionOnNextCall(f);"
+                 "f();",
+                 kPretenureCreationCount);
+
+  Handle<JSObject> o = Cast<JSObject>(RunJS(ctx, source.begin()));
+
+  v8::Local<v8::Value> int_array = v8::Utils::ToLocal(o)
+                                       ->ToObject(ctx)
+                                       .ToLocalChecked()
+                                       ->Get(ctx, NewString("0"))
+                                       .ToLocalChecked();
+  i::DirectHandle<JSObject> int_array_handle = i::Cast<JSObject>(
+      v8::Utils::OpenDirectHandle(*v8::Local<v8::Object>::Cast(int_array)));
+  v8::Local<v8::Value> double_array = v8::Utils::ToLocal(o)
+                                          ->ToObject(ctx)
+                                          .ToLocalChecked()
+                                          ->Get(ctx, NewString("1"))
+                                          .ToLocalChecked();
+  i::DirectHandle<JSObject> double_array_handle = i::Cast<JSObject>(
+      v8::Utils::OpenDirectHandle(*v8::Local<v8::Object>::Cast(double_array)));
+
+  EXPECT_TRUE(heap()->InOldSpace(*o));
+  EXPECT_TRUE(heap()->InOldSpace(*int_array_handle));
+  EXPECT_TRUE(heap()->InOldSpace(int_array_handle->elements()));
+  EXPECT_TRUE(heap()->InOldSpace(*double_array_handle));
+  EXPECT_TRUE(heap()->InOldSpace(double_array_handle->elements()));
+}
+
+TEST_F(HeapTest, IncrementalMarkingPreservesMonomorphicConstructor) {
+  if (!v8_flags.incremental_marking) return;
+  v8_flags.allow_natives_syntax = true;
+  v8::HandleScope scope(v8_isolate());
+  v8::Local<v8::Context> ctx = v8_isolate()->GetCurrentContext();
+  // Prepare function f that contains a monomorphic IC for object
+  // originating from the same native context.
+  RunJS(ctx,
+        "function fun() { this.x = 1; };"
+        "function f(o) { return new o(); }"
+        "%EnsureFeedbackVectorForFunction(f);"
+        "f(fun); f(fun);");
+  DirectHandle<JSFunction> f = Cast<JSFunction>(
+      v8::Utils::OpenDirectHandle(*v8::Local<v8::Function>::Cast(
+          ctx->Global()
+              ->Get(ctx, v8::String::NewFromUtf8Literal(v8_isolate(), "f"))
+              .ToLocalChecked())));
+
+  DirectHandle<FeedbackVector> vector(f->feedback_vector(), i_isolate());
+  EXPECT_TRUE(vector->Get(FeedbackSlot(0)).IsWeakOrCleared());
+
+  SimulateIncrementalMarking();
+  InvokeMajorGC();
+
+  EXPECT_TRUE(vector->Get(FeedbackSlot(0)).IsWeakOrCleared());
+}
+namespace {
+
+template <typename T>
+DirectHandle<SharedFunctionInfo> GetSharedFunctionInfo(
+    v8::Local<T> function_or_script, Isolate* isolate) {
+  DirectHandle<JSFunction> i_function =
+      Cast<JSFunction>(v8::Utils::OpenDirectHandle(*function_or_script));
+  return direct_handle(i_function->shared(), isolate);
+}
+
+template <typename T>
+void AgeBytecode(v8::Local<T> function_or_script, Isolate* isolate) {
+  DirectHandle<SharedFunctionInfo> shared =
+      GetSharedFunctionInfo(function_or_script, isolate);
+  EXPECT_TRUE(shared->HasBytecodeArray());
+  SharedFunctionInfo::EnsureOldForTesting(*shared);
+}
+
+void RunCompilationCacheRegenerationTest(HeapTest* test, bool retain_root_sfi,
+                                         bool flush_root_sfi,
+                                         bool flush_eager_sfi) {
+  // If the compilation cache is turned off, this test is invalid.
+  if (!v8_flags.compilation_cache) {
+    return;
+  }
+
+  // Skip test if code flushing was disabled.
+  if (!v8_flags.flush_bytecode ||
+      (v8_flags.always_sparkplug && !v8_flags.flush_baseline_code)) {
+    return;
+  }
+
+  Isolate* isolate = test->i_isolate();
+  Heap* heap = test->heap();
+  v8::Isolate* v8_isolate = test->v8_isolate();
+
+  const char* source =
+      "({"
+      "  lazyFunction: function () {"
+      "    var x = 42;"
+      "    var y = 42;"
+      "    var z = x + y;"
+      "  },"
+      "  eagerFunction: (function () {"
+      "    var x = 43;"
+      "    var y = 43;"
+      "    var z = x + y;"
+      "  })"
+      "})";
+
+  v8::Global<v8::Script> outer_function;
+  v8::Global<v8::Function> lazy_function;
+  v8::Global<v8::Function> eager_function;
+
+  {
+    v8::HandleScope scope(v8_isolate);
+    v8::Local<v8::Context> context = test->context();
+    v8::Local<v8::String> source_str =
+        v8::String::NewFromUtf8(v8_isolate, source).ToLocalChecked();
+    v8::Local<v8::Script> script =
+        v8::Script::Compile(context, source_str).ToLocalChecked();
+    outer_function.Reset(v8_isolate, script);
+
+    // Even though the script has not executed, it should already be parsed.
+    DirectHandle<SharedFunctionInfo> script_sfi =
+        GetSharedFunctionInfo(script, isolate);
+    EXPECT_TRUE(script_sfi->is_compiled());
+
+    v8::Local<v8::Value> result = script->Run(context).ToLocalChecked();
+
+    // Now that the script has run, we can get references to the inner
+    // functions, and verify that the eager parsing heuristics are behaving as
+    // expected.
+    v8::Local<v8::Object> result_obj =
+        result->ToObject(context).ToLocalChecked();
+    v8::Local<v8::Value> lazy_function_value =
+        result_obj
+            ->GetRealNamedProperty(
+                context, v8::String::NewFromUtf8(v8_isolate, "lazyFunction")
+                             .ToLocalChecked())
+            .ToLocalChecked();
+    EXPECT_TRUE(lazy_function_value->IsFunction());
+    EXPECT_FALSE(
+        GetSharedFunctionInfo(lazy_function_value, isolate)->is_compiled());
+    lazy_function.Reset(v8_isolate, lazy_function_value.As<v8::Function>());
+    v8::Local<v8::Value> eager_function_value =
+        result_obj
+            ->GetRealNamedProperty(
+                context, v8::String::NewFromUtf8(v8_isolate, "eagerFunction")
+                             .ToLocalChecked())
+            .ToLocalChecked();
+    EXPECT_TRUE(eager_function_value->IsFunction());
+    eager_function.Reset(v8_isolate, eager_function_value.As<v8::Function>());
+    EXPECT_TRUE(
+        GetSharedFunctionInfo(eager_function_value, isolate)->is_compiled());
+  }
+
+  {
+    v8::HandleScope scope(v8_isolate);
+
+    // Progress code age until it's old and ready for GC.
+    if (flush_root_sfi) {
+      v8::Local<v8::Script> outer_function_value =
+          outer_function.Get(v8_isolate);
+      AgeBytecode(outer_function_value, isolate);
+    }
+    if (flush_eager_sfi) {
+      v8::Local<v8::Function> eager_function_value =
+          eager_function.Get(v8_isolate);
+      AgeBytecode(eager_function_value, isolate);
+    }
+    if (!retain_root_sfi) {
+      outer_function.Reset();
+    }
+  }
+
+  {
+    // In these tests, we need to invoke GC without stack, otherwise some
+    // objects may not be reclaimed because of conservative stack scanning.
+    DisableConservativeStackScanningScopeForTesting no_stack_scanning(heap);
+
+    if (v8_flags.stress_incremental_marking) {
+      // This GC finishes incremental marking if it is already running. If
+      // incremental marking was already running we would not flush the code
+      // right away.
+      test->InvokeMajorGC();
+    }
+
+    // The first GC performs code flushing.
+    test->InvokeMajorGC();
+    // The second GC clears the entry from the compilation cache.
+    test->InvokeMajorGC();
+  }
+
+  // The root SharedFunctionInfo can be retained either by a Global in this
+  // function or by the compilation cache.
+  bool root_sfi_should_still_exist = retain_root_sfi || !flush_root_sfi;
+
+  {
+    v8::HandleScope scope(v8_isolate);
+
+    // The lazy function should still not be compiled.
+    DirectHandle<SharedFunctionInfo> lazy_sfi =
+        GetSharedFunctionInfo(lazy_function.Get(v8_isolate), isolate);
+    EXPECT_FALSE(lazy_sfi->is_compiled());
+
+    // The eager function may have had its bytecode flushed.
+    DirectHandle<SharedFunctionInfo> eager_sfi =
+        GetSharedFunctionInfo(eager_function.Get(v8_isolate), isolate);
+    EXPECT_EQ(!flush_eager_sfi, eager_sfi->is_compiled());
+
+    // Check whether the root SharedFunctionInfo is still reachable from the
+    // Script.
+    DirectHandle<Script> script(Cast<Script>(lazy_sfi->script()), isolate);
+    bool root_sfi_still_exists = false;
+    Tagged<MaybeObject> maybe_root_sfi =
+        script->infos()->get(kFunctionLiteralIdTopLevel);
+    if (Tagged<HeapObject> sfi_or_undefined;
+        maybe_root_sfi.GetHeapObject(&sfi_or_undefined)) {
+      root_sfi_still_exists = !IsUndefined(sfi_or_undefined);
+    }
+    EXPECT_EQ(root_sfi_should_still_exist, root_sfi_still_exists);
+  }
+
+  {
+    // Run the script again and check that no SharedFunctionInfos were
+    // duplicated, and that the expected ones were compiled.
+    v8::HandleScope scope(v8_isolate);
+    v8::Local<v8::Context> context = test->context();
+    v8::Local<v8::String> source_str =
+        v8::String::NewFromUtf8(v8_isolate, source).ToLocalChecked();
+    v8::Local<v8::Script> script =
+        v8::Script::Compile(context, source_str).ToLocalChecked();
+
+    // The script should be compiled by now.
+    DirectHandle<SharedFunctionInfo> script_sfi =
+        GetSharedFunctionInfo(script, isolate);
+    EXPECT_TRUE(script_sfi->is_compiled());
+
+    // This compilation should not have created a new root SharedFunctionInfo if
+    // one already existed.
+    if (retain_root_sfi) {
+      DirectHandle<SharedFunctionInfo> old_script_sfi =
+          GetSharedFunctionInfo(outer_function.Get(v8_isolate), isolate);
+      EXPECT_EQ(*old_script_sfi, *script_sfi);
+    }
+
+    DirectHandle<SharedFunctionInfo> old_lazy_sfi =
+        GetSharedFunctionInfo(lazy_function.Get(v8_isolate), isolate);
+    EXPECT_FALSE(old_lazy_sfi->is_compiled());
+
+    // The only way for the eager function to be uncompiled at this point is if
+    // it was flushed but the root function was not.
+    DirectHandle<SharedFunctionInfo> old_eager_sfi =
+        GetSharedFunctionInfo(eager_function.Get(v8_isolate), isolate);
+    EXPECT_EQ(!(flush_eager_sfi && !flush_root_sfi),
+              old_eager_sfi->is_compiled());
+
+    v8::Local<v8::Value> result = script->Run(context).ToLocalChecked();
+
+    // Check that both functions reused the existing SharedFunctionInfos.
+    v8::Local<v8::Object> result_obj =
+        result->ToObject(context).ToLocalChecked();
+    v8::Local<v8::Value> lazy_function_value =
+        result_obj
+            ->GetRealNamedProperty(
+                context, v8::String::NewFromUtf8(v8_isolate, "lazyFunction")
+                             .ToLocalChecked())
+            .ToLocalChecked();
+    EXPECT_TRUE(lazy_function_value->IsFunction());
+    DirectHandle<SharedFunctionInfo> lazy_sfi =
+        GetSharedFunctionInfo(lazy_function_value, isolate);
+    EXPECT_EQ(*old_lazy_sfi, *lazy_sfi);
+    v8::Local<v8::Value> eager_function_value =
+        result_obj
+            ->GetRealNamedProperty(
+                context, v8::String::NewFromUtf8(v8_isolate, "eagerFunction")
+                             .ToLocalChecked())
+            .ToLocalChecked();
+    EXPECT_TRUE(eager_function_value->IsFunction());
+    DirectHandle<SharedFunctionInfo> eager_sfi =
+        GetSharedFunctionInfo(eager_function_value, isolate);
+    EXPECT_EQ(*old_eager_sfi, *eager_sfi);
+  }
+}
+
+}  // namespace
+
+TEST_F(HeapTest, CompilationCacheRegeneration0) {
+  RunCompilationCacheRegenerationTest(this, false, false, false);
+}
+
+TEST_F(HeapTest, CompilationCacheRegeneration1) {
+  RunCompilationCacheRegenerationTest(this, false, false, true);
+}
+
+TEST_F(HeapTest, CompilationCacheRegeneration2) {
+  RunCompilationCacheRegenerationTest(this, false, true, false);
+}
+
+TEST_F(HeapTest, CompilationCacheRegeneration3) {
+  RunCompilationCacheRegenerationTest(this, false, true, true);
+}
+
+TEST_F(HeapTest, CompilationCacheRegeneration4) {
+  RunCompilationCacheRegenerationTest(this, true, false, false);
+}
+
+TEST_F(HeapTest, CompilationCacheRegeneration5) {
+  RunCompilationCacheRegenerationTest(this, true, false, true);
+}
+
+TEST_F(HeapTest, CompilationCacheRegeneration6) {
+  RunCompilationCacheRegenerationTest(this, true, true, false);
+}
+
+TEST_F(HeapTest, CompilationCacheRegeneration7) {
+  RunCompilationCacheRegenerationTest(this, true, true, true);
+}
+
 }  // namespace internal
 }  // namespace v8
