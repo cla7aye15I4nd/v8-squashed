@@ -70,7 +70,15 @@ static_assert(sizeof(ScopeRecord) == 16);
 using ScopeTypeBits = base::BitField<ScopeType, 0, 4, uint16_t>;
 using HasChildrenBit = ScopeTypeBits::Next<bool, 1>;
 using HasSiblingBit = HasChildrenBit::Next<bool, 1>;
-static_assert(HasSiblingBit::kLastUsedBit < 16);
+using IsHiddenBit = HasSiblingBit::Next<bool, 1>;
+using LanguageModeBit = IsHiddenBit::Next<LanguageMode, 1>;
+using IsArrowScopeBit = LanguageModeBit::Next<bool, 1>;
+using HasThisDeclarationBit = IsArrowScopeBit::Next<bool, 1>;
+using HasThisReferenceBit = HasThisDeclarationBit::Next<bool, 1>;
+using HasSimpleParametersBit = HasThisReferenceBit::Next<bool, 1>;
+using SloppyEvalCanExtendVarsBit = HasSimpleParametersBit::Next<bool, 1>;
+using NeedsContextBit = SloppyEvalCanExtendVarsBit::Next<bool, 1>;
+static_assert(NeedsContextBit::kLastUsedBit < 16);
 
 int32_t GetScopeCount(Tagged<DebugScriptScopeInfo> info) {
   Tagged<ByteArray> bytes = info->numeric_data();
@@ -158,6 +166,71 @@ bool DebugScriptScope::is_declaration_scope() const {
          scope_type() == ScopeType::EVAL_SCOPE;
 }
 
+LanguageMode DebugScriptScope::language_mode() const {
+  return LanguageModeBit::decode(flags());
+}
+
+bool DebugScriptScope::is_arrow_scope() const {
+  return IsArrowScopeBit::decode(flags());
+}
+
+bool DebugScriptScope::is_class_scope() const {
+  return scope_type() == ScopeType::CLASS_SCOPE;
+}
+
+bool DebugScriptScope::is_with_scope() const {
+  return scope_type() == ScopeType::WITH_SCOPE;
+}
+
+bool DebugScriptScope::is_module_scope() const {
+  return scope_type() == ScopeType::MODULE_SCOPE;
+}
+
+bool DebugScriptScope::is_eval_scope() const {
+  return scope_type() == ScopeType::EVAL_SCOPE;
+}
+
+bool DebugScriptScope::is_catch_scope() const {
+  return scope_type() == ScopeType::CATCH_SCOPE;
+}
+
+bool DebugScriptScope::is_repl_mode_scope() const {
+  return scope_type() == ScopeType::REPL_MODE_SCOPE;
+}
+
+bool DebugScriptScope::is_hidden() const {
+  return IsHiddenBit::decode(flags());
+}
+
+bool DebugScriptScope::has_this_declaration() const {
+  return HasThisDeclarationBit::decode(flags());
+}
+
+bool DebugScriptScope::has_this_reference() const {
+  return HasThisReferenceBit::decode(flags());
+}
+
+bool DebugScriptScope::has_simple_parameters() const {
+  return HasSimpleParametersBit::decode(flags());
+}
+
+bool DebugScriptScope::sloppy_eval_can_extend_vars() const {
+  return SloppyEvalCanExtendVarsBit::decode(flags());
+}
+
+bool DebugScriptScope::needs_context() const {
+  return NeedsContextBit::decode(flags());
+}
+
+int DebugScriptScope::unique_id_in_script() const {
+  if (!needs_context()) return -3;
+  const uint8_t* ptr = payload() + sizeof(ScopeRecord);
+  if (HasSiblingBit::decode(flags())) {
+    ptr += kInt32Size;
+  }
+  return base::ReadUnalignedValue<int32_t>(ptr);
+}
+
 Handle<DebugScriptScopeInfo> SerializeDebugScriptScopeInfo(
     Isolate* isolate, DeclarationScope* script_scope) {
   DCHECK_NOT_NULL(script_scope);
@@ -194,6 +267,9 @@ Handle<DebugScriptScopeInfo> SerializeDebugScriptScopeInfo(
     if (all_scopes[i]->sibling() != nullptr) {
       total_size += kInt32Size;
     }
+    if (all_scopes[i]->NeedsContext()) {
+      total_size += kInt32Size;
+    }
   }
 
   // Stage 2: Allocate a ByteArray and write directly into it with
@@ -217,11 +293,26 @@ Handle<DebugScriptScopeInfo> SerializeDebugScriptScopeInfo(
 
     int next_sibling = find_scope_index(scope->sibling());
     bool has_sibling = next_sibling != -1;
+    bool needs_context = scope->NeedsContext();
 
     uint16_t flags = 0;
     flags = ScopeTypeBits::update(flags, scope->scope_type());
     flags = HasChildrenBit::update(flags, scope->inner_scope() != nullptr);
     flags = HasSiblingBit::update(flags, has_sibling);
+    flags = IsHiddenBit::update(flags, scope->is_hidden());
+    flags = LanguageModeBit::update(flags, scope->language_mode());
+    flags = HasThisReferenceBit::update(flags, scope->HasThisReference());
+    flags = NeedsContextBit::update(flags, needs_context);
+    if (scope->is_declaration_scope()) {
+      DeclarationScope* decl_scope = scope->AsDeclarationScope();
+      flags = IsArrowScopeBit::update(flags, decl_scope->is_arrow_scope());
+      flags = HasThisDeclarationBit::update(flags,
+                                            decl_scope->has_this_declaration());
+      flags = HasSimpleParametersBit::update(
+          flags, decl_scope->has_simple_parameters());
+      flags = SloppyEvalCanExtendVarsBit::update(
+          flags, decl_scope->sloppy_eval_can_extend_vars());
+    }
 
     base::WriteUnalignedValue<ScopeRecord>(
         record,
@@ -233,9 +324,18 @@ Handle<DebugScriptScopeInfo> SerializeDebugScriptScopeInfo(
             .var_count = 0,
         });
 
+    size_t optional_offset = sizeof(ScopeRecord);
     if (has_sibling) {
-      base::WriteUnalignedValue<int32_t>(record + sizeof(ScopeRecord),
+      base::WriteUnalignedValue<int32_t>(record + optional_offset,
                                          next_sibling);
+      optional_offset += kInt32Size;
+    }
+    if (needs_context) {
+      // We only need the context ID to match DebugScopeInfo against runtime
+      // ScopeInfo. V8 omits runtime ScopeInfo for any scope that doesn't need a
+      // context so we don't need to waste the bytes.
+      base::WriteUnalignedValue<int32_t>(record + optional_offset,
+                                         scope->UniqueIdInScript());
     }
   }
 
@@ -268,12 +368,21 @@ void DebugScriptScopeInfo::DebugScriptScopeInfoVerify(Isolate* isolate) {
     uint32_t offset = GetScopeOffset(this, i);
     CHECK_EQ(offset % kUInt32Size, 0);
     CHECK_GE(offset, header_and_table_size);
-    CHECK_LE(offset + sizeof(ScopeRecord),
-             static_cast<size_t>(bytes->length().value()));
-
     DebugScriptScope scope = DebugScriptScope::FromIndex(info_handle, i);
     CHECK_EQ(scope.scope_index(), i);
     CHECK_LE(scope.start_position(), scope.end_position());
+
+    size_t record_size = sizeof(ScopeRecord) +
+                         (scope.next_sibling().has_value() ? kInt32Size : 0) +
+                         (scope.needs_context() ? kInt32Size : 0);
+    CHECK_LE(offset + record_size,
+             static_cast<size_t>(bytes->length().value()));
+
+    if (scope.needs_context()) {
+      CHECK_GE(scope.unique_id_in_script(), -2);
+    } else {
+      CHECK_EQ(scope.unique_id_in_script(), -3);
+    }
 
     if (i == 0) {
       CHECK(!scope.parent().has_value());

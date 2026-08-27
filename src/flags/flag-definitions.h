@@ -342,6 +342,9 @@ DEFINE_EXPERIMENTAL_FEATURE(
 DEFINE_BOOL(icu_timezone_data, true, "get information about timezones from ICU")
 DEFINE_STRING(icu_datetime_compat_lang, "*",
               "limits ICU date time compat changes to the given language")
+DEFINE_BOOL(
+    intl_date_time_pattern_generator_cache_eviction, false,
+    "enable 9-entry cache eviction in DateTimePatternGeneratorCache")
 #endif
 
 #ifdef V8_ENABLE_DOUBLE_CONST_STORE_CHECK
@@ -3275,7 +3278,7 @@ DEFINE_GENERIC_IMPLICATION(
                 v8::tracing::TracingCategoryObserver::ENABLED_BY_NATIVE))
 DEFINE_BOOL_READONLY(fast_map_update, false,
                      "enable fast map update by caching the migration target")
-#define DEFAULT_MAX_POLYMORPHIC_MAP_COUNT 4
+#define DEFAULT_MAX_POLYMORPHIC_MAP_COUNT 10
 DEFINE_INT(max_valid_polymorphic_map_count, DEFAULT_MAX_POLYMORPHIC_MAP_COUNT,
            "maximum number of valid maps to track in POLYMORPHIC state")
 DEFINE_BOOL(
@@ -3296,6 +3299,9 @@ DEFINE_BOOL(native_code_counters, DEBUG_BOOL,
 // feature-flags.h instead of here to follow the regular launch process format.
 DEFINE_BOOL_READONLY(sparkplug_plus, false,
                      "enable dynamic patching on JS baseline code")
+DEFINE_BOOL_READONLY(sparkplug_inline_smi, false,
+                     "inline the Smi fast path of embedded feedback "
+                     "operations into baseline code")
 #endif
 DEFINE_IMPLICATION(sparkplug_plus, short_builtin_calls)
 
