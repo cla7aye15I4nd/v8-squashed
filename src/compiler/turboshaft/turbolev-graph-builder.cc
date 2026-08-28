@@ -3911,11 +3911,11 @@ class GraphBuildingNodeProcessor {
                       DeoptimizeReason::kOutOfBounds,
                       node->eager_deopt_info()->feedback_to_update());
     }
-    __ DeoptimizeIfNot(
-        __ Uint32LessThan(Map<Word32>(node->IndexInput()),
-                          __ TruncateWordPtrToWord32(byte_length)),
-        frame_state, DeoptimizeReason::kOutOfBounds,
-        node->eager_deopt_info()->feedback_to_update());
+    __ DeoptimizeIfNot(__ UintPtrLessThan(__ ChangeInt32ToIntPtr(
+                                              Map<Word32>(node->IndexInput())),
+                                          byte_length),
+                       frame_state, DeoptimizeReason::kOutOfBounds,
+                       node->eager_deopt_info()->feedback_to_update());
     return maglev::ProcessResult::kContinue;
   }
 
@@ -3931,7 +3931,7 @@ class GraphBuildingNodeProcessor {
               TruncateJSPrimitiveToUntaggedOp::InputAssumptions::kObject);
     SetMap(node, __ LoadDataViewElement(
                      Map(node->ObjectInput()), storage,
-                     __ ChangeUint32ToUintPtr(Map<Word32>(node->IndexInput())),
+                     __ ChangeInt32ToIntPtr(Map<Word32>(node->IndexInput())),
                      is_little_endian, node->external_array_type()));
     return maglev::ProcessResult::kContinue;
   }
@@ -3948,7 +3948,7 @@ class GraphBuildingNodeProcessor {
     SetMap(node,
            __ LoadDataViewElement(
                Map(node->ObjectInput()), storage,
-               __ ChangeUint32ToUintPtr(Map<Word32>(node->IndexInput())),
+               __ ChangeInt32ToIntPtr(Map<Word32>(node->IndexInput())),
                is_little_endian, ExternalArrayType::kExternalFloat64Array));
     return maglev::ProcessResult::kContinue;
   }
@@ -3965,7 +3965,7 @@ class GraphBuildingNodeProcessor {
               TruncateJSPrimitiveToUntaggedOp::InputAssumptions::kObject);
     __ StoreDataViewElement(
         Map(node->ObjectInput()), storage,
-        __ ChangeUint32ToUintPtr(Map<Word32>(node->IndexInput())),
+        __ ChangeInt32ToIntPtr(Map<Word32>(node->IndexInput())),
         Map<Word32>(node->ValueInput()), is_little_endian,
         node->external_array_type());
     return maglev::ProcessResult::kContinue;
@@ -3982,7 +3982,7 @@ class GraphBuildingNodeProcessor {
               TruncateJSPrimitiveToUntaggedOp::InputAssumptions::kObject);
     __ StoreDataViewElement(
         Map(node->ObjectInput()), storage,
-        __ ChangeUint32ToUintPtr(Map<Word32>(node->IndexInput())),
+        __ ChangeInt32ToIntPtr(Map<Word32>(node->IndexInput())),
         Map<Float64>(node->ValueInput()), is_little_endian,
         ExternalArrayType::kExternalFloat64Array);
     return maglev::ProcessResult::kContinue;
@@ -5827,6 +5827,7 @@ class GraphBuildingNodeProcessor {
   }
   maglev::ProcessResult Process(maglev::HandleNoHeapWritesInterrupt* node,
                                 const maglev::ProcessingState&) {
+    DCHECK(!v8_flags.disable_loop_stack_checks);
     GET_FRAME_STATE_MAYBE_ABORT(frame_state, node->lazy_deopt_info());
     __ JSLoopStackCheck(native_context(), frame_state);
     return maglev::ProcessResult::kContinue;

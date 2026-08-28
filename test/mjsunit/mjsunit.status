@@ -559,6 +559,9 @@
   # https://crbug.com/v8/13461
   'maglev/inner-function': [SKIP],
 
+  # https://crbug.com/552791801
+  'maglev/float64-conversions': [SKIP],
+
   # https://crbug.com/v8/13916
   'readonly': [SKIP],
 
@@ -1285,6 +1288,7 @@
   'regress/regress-354626177': [SKIP],
   'regress/wasm/regress-398439335': [SKIP],
   'turbolev/regress-488090094': [SKIP],
+  'turbolev/dataview-deopt-oob': [SKIP],
   'maglev/regress-498816446-3': [SKIP],
   'maglev/regress-521604719': [SKIP],
 
