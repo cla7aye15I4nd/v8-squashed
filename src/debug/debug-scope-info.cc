@@ -78,9 +78,10 @@ using HasThisReferenceBit = HasThisDeclarationBit::Next<bool, 1>;
 using HasSimpleParametersBit = HasThisReferenceBit::Next<bool, 1>;
 using SloppyEvalCanExtendVarsBit = HasSimpleParametersBit::Next<bool, 1>;
 using NeedsContextBit = SloppyEvalCanExtendVarsBit::Next<bool, 1>;
-static_assert(NeedsContextBit::kLastUsedBit < 16);
+using HasArgumentsBit = NeedsContextBit::Next<bool, 1>;
+static_assert(HasArgumentsBit::kLastUsedBit < 16);
 
-// Encodes receiver allocation info into a 16-bit word:
+// Encodes receiver or arguments allocation info into a 16-bit word:
 // - Bits 0..1: VariableAllocationInfo (NONE, STACK, CONTEXT, UNUSED)
 // - Bits 2..15: 14-bit signed slot/parameter index
 //
@@ -116,6 +117,23 @@ uint32_t GetScopeOffset(Tagged<DebugScriptScopeInfo> info, int scope_index) {
   return base::ReadUnalignedValue<uint32_t>(ptr);
 }
 
+class ByteArrayWriter {
+ public:
+  explicit ByteArrayWriter(Address cursor) : cursor_(cursor) {}
+
+  template <typename T>
+  void Write(const T& value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    base::WriteUnalignedValue<T>(cursor_, value);
+    cursor_ += sizeof(T);
+  }
+
+  Address cursor() const { return cursor_; }
+
+ private:
+  Address cursor_;
+};
+
 }  // namespace
 
 const uint8_t* DebugScriptScope::payload() const {
@@ -147,7 +165,7 @@ std::optional<DebugScriptScope> DebugScriptScope::first_child() const {
 
 std::optional<DebugScriptScope> DebugScriptScope::next_sibling() const {
   if (!HasSiblingBit::decode(flags())) return std::nullopt;
-  const uint8_t* sibling_ptr = payload() + sizeof(ScopeRecord);
+  const uint8_t* sibling_ptr = payload() + next_sibling_offset();
   int sibling_idx = base::ReadUnalignedValue<int32_t>(sibling_ptr);
   return FromIndex(info_, sibling_idx);
 }
@@ -236,6 +254,10 @@ bool DebugScriptScope::has_simple_parameters() const {
   return HasSimpleParametersBit::decode(flags());
 }
 
+bool DebugScriptScope::has_arguments() const {
+  return HasArgumentsBit::decode(flags());
+}
+
 bool DebugScriptScope::sloppy_eval_can_extend_vars() const {
   return SloppyEvalCanExtendVarsBit::decode(flags());
 }
@@ -244,21 +266,46 @@ bool DebugScriptScope::needs_context() const {
   return NeedsContextBit::decode(flags());
 }
 
+size_t DebugScriptScope::next_sibling_offset() const {
+  return sizeof(ScopeRecord);
+}
+
+size_t DebugScriptScope::context_id_offset() const {
+  return next_sibling_offset() +
+         (HasSiblingBit::decode(flags()) ? kInt32Size : 0);
+}
+
+size_t DebugScriptScope::receiver_info_offset() const {
+  return context_id_offset() +
+         (NeedsContextBit::decode(flags()) ? kInt32Size : 0);
+}
+
+size_t DebugScriptScope::arguments_info_offset() const {
+  return receiver_info_offset() +
+         (HasThisDeclarationBit::decode(flags()) ? kUInt16Size : 0);
+}
+
+size_t DebugScriptScope::record_size() const {
+  return arguments_info_offset() +
+         (HasArgumentsBit::decode(flags()) ? kUInt16Size : 0);
+}
+
 int DebugScriptScope::unique_id_in_script() const {
   if (!needs_context()) return -3;
-  const uint8_t* ptr = payload() + sizeof(ScopeRecord);
-  if (HasSiblingBit::decode(flags())) {
-    ptr += kInt32Size;
-  }
-  return base::ReadUnalignedValue<int32_t>(ptr);
+  return base::ReadUnalignedValue<int32_t>(payload() + context_id_offset());
 }
 
 std::pair<VariableAllocationInfo, int> DebugScriptScope::receiver_info() const {
   if (!has_this_declaration()) return {VariableAllocationInfo::NONE, -1};
-  const uint8_t* ptr = payload() + sizeof(ScopeRecord);
-  if (HasSiblingBit::decode(flags())) ptr += kInt32Size;
-  if (NeedsContextBit::decode(flags())) ptr += kInt32Size;
-  return DecodeAllocInfo(base::ReadUnalignedValue<uint16_t>(ptr));
+  return DecodeAllocInfo(
+      base::ReadUnalignedValue<uint16_t>(payload() + receiver_info_offset()));
+}
+
+std::pair<VariableAllocationInfo, int> DebugScriptScope::arguments_info()
+    const {
+  if (!has_arguments()) return {VariableAllocationInfo::NONE, -1};
+  return DecodeAllocInfo(
+      base::ReadUnalignedValue<uint16_t>(payload() + arguments_info_offset()));
 }
 
 Handle<DebugScriptScopeInfo> SerializeDebugScriptScopeInfo(
@@ -304,23 +351,25 @@ Handle<DebugScriptScopeInfo> SerializeDebugScriptScopeInfo(
         all_scopes[i]->AsDeclarationScope()->has_this_declaration()) {
       total_size += kUInt16Size;
     }
+    if (all_scopes[i]->is_declaration_scope() &&
+        all_scopes[i]->AsDeclarationScope()->arguments() != nullptr) {
+      total_size += kUInt16Size;
+    }
   }
 
   // Stage 2: Allocate a ByteArray and write directly into it with
-  // base::WriteUnalignedValue.
+  // ByteArrayWriter.
   Handle<ByteArray> byte_array = isolate->factory()->NewByteArray(
       static_cast<int>(total_size), AllocationType::kOld);
 
-  base::WriteUnalignedValue<int32_t>(
-      reinterpret_cast<Address>(byte_array->begin()),
-      static_cast<int32_t>(all_scopes.size()));
+  ByteArrayWriter header_writer(reinterpret_cast<Address>(byte_array->begin()));
+  header_writer.Write<int32_t>(static_cast<int32_t>(all_scopes.size()));
 
   for (size_t i = 0; i < all_scopes.size(); ++i) {
-    size_t offset = kInt32Size + i * kUInt32Size;
-    Address offset_ptr =
-        reinterpret_cast<Address>(byte_array->begin()) + offset;
-    base::WriteUnalignedValue<uint32_t>(offset_ptr, offsets[i]);
+    header_writer.Write<uint32_t>(offsets[i]);
+  }
 
+  for (size_t i = 0; i < all_scopes.size(); ++i) {
     Address record =
         reinterpret_cast<Address>(byte_array->begin()) + offsets[i];
     Scope* scope = all_scopes[i];
@@ -329,6 +378,7 @@ Handle<DebugScriptScopeInfo> SerializeDebugScriptScopeInfo(
     bool has_sibling = next_sibling != -1;
     bool needs_context = scope->NeedsContext();
     bool has_this_decl = false;
+    bool has_arguments = false;
 
     uint16_t flags = 0;
     flags = ScopeTypeBits::update(flags, scope->scope_type());
@@ -341,6 +391,7 @@ Handle<DebugScriptScopeInfo> SerializeDebugScriptScopeInfo(
     if (scope->is_declaration_scope()) {
       DeclarationScope* decl_scope = scope->AsDeclarationScope();
       has_this_decl = decl_scope->has_this_declaration();
+      has_arguments = decl_scope->arguments() != nullptr;
       flags = IsArrowScopeBit::update(flags, decl_scope->is_arrow_scope());
       flags = HasThisDeclarationBit::update(flags, has_this_decl);
       flags = HasSimpleParametersBit::update(
@@ -348,40 +399,44 @@ Handle<DebugScriptScopeInfo> SerializeDebugScriptScopeInfo(
       flags = SloppyEvalCanExtendVarsBit::update(
           flags, decl_scope->sloppy_eval_can_extend_vars());
     }
+    flags = HasArgumentsBit::update(flags, has_arguments);
 
-    base::WriteUnalignedValue<ScopeRecord>(
-        record,
-        ScopeRecord{
-            .start_position = scope->start_position(),
-            .end_position = scope->end_position(),
-            .parent_scope_index = find_scope_index(scope->outer_scope()),
-            .flags = flags,
-            .var_count = 0,
-        });
+    ByteArrayWriter writer(record);
+    writer.Write<ScopeRecord>(ScopeRecord{
+        .start_position = scope->start_position(),
+        .end_position = scope->end_position(),
+        .parent_scope_index = find_scope_index(scope->outer_scope()),
+        .flags = flags,
+        .var_count = 0,
+    });
 
-    size_t optional_offset = sizeof(ScopeRecord);
     if (has_sibling) {
-      base::WriteUnalignedValue<int32_t>(record + optional_offset,
-                                         next_sibling);
-      optional_offset += kInt32Size;
+      writer.Write<int32_t>(next_sibling);
     }
     if (needs_context) {
       // We only need the context ID to match DebugScopeInfo against runtime
       // ScopeInfo. V8 omits runtime ScopeInfo for any scope that doesn't need a
       // context so we don't need to waste the bytes.
-      base::WriteUnalignedValue<int32_t>(record + optional_offset,
-                                         scope->UniqueIdInScript());
-      optional_offset += kInt32Size;
+      writer.Write<int32_t>(scope->UniqueIdInScript());
     }
     if (has_this_decl) {
       Variable* var = scope->AsDeclarationScope()->receiver();
       VariableAllocationInfo info = var->location() == VariableLocation::CONTEXT
                                         ? VariableAllocationInfo::CONTEXT
                                         : VariableAllocationInfo::STACK;
-      base::WriteUnalignedValue<uint16_t>(record + optional_offset,
-                                          EncodeAllocInfo(info, var->index()));
-      optional_offset += kUInt16Size;
+      writer.Write<uint16_t>(EncodeAllocInfo(info, var->index()));
     }
+    if (has_arguments) {
+      Variable* var = scope->AsDeclarationScope()->arguments();
+      VariableAllocationInfo info = var->location() == VariableLocation::CONTEXT
+                                        ? VariableAllocationInfo::CONTEXT
+                                        : VariableAllocationInfo::STACK;
+      writer.Write<uint16_t>(EncodeAllocInfo(info, var->index()));
+    }
+
+    size_t expected_size =
+        (i + 1 < all_scopes.size() ? offsets[i + 1] : total_size) - offsets[i];
+    CHECK_EQ(writer.cursor(), record + expected_size);
   }
 
   Handle<FixedArray> string_table = isolate->factory()->empty_fixed_array();
@@ -417,10 +472,7 @@ void DebugScriptScopeInfo::DebugScriptScopeInfoVerify(Isolate* isolate) {
     CHECK_EQ(scope.scope_index(), i);
     CHECK_LE(scope.start_position(), scope.end_position());
 
-    size_t record_size = sizeof(ScopeRecord) +
-                         (scope.next_sibling().has_value() ? kInt32Size : 0) +
-                         (scope.needs_context() ? kInt32Size : 0) +
-                         (scope.has_this_declaration() ? kUInt16Size : 0);
+    size_t record_size = scope.record_size();
     CHECK_LE(offset + record_size,
              static_cast<size_t>(bytes->length().value()));
 
@@ -432,6 +484,11 @@ void DebugScriptScopeInfo::DebugScriptScopeInfoVerify(Isolate* isolate) {
 
     if (!scope.has_this_declaration()) {
       CHECK_EQ(scope.receiver_info(),
+               (std::pair{VariableAllocationInfo::NONE, -1}));
+    }
+
+    if (!scope.has_arguments()) {
+      CHECK_EQ(scope.arguments_info(),
                (std::pair{VariableAllocationInfo::NONE, -1}));
     }
 
