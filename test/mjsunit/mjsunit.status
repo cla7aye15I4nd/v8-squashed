@@ -76,6 +76,7 @@
 
   'turbolev/regress-532607231': [PASS, SLOW],
   'turbolev/regress-540717862': [PASS, SLOW],
+  'turboshaft/regress-554421904': [PASS, SLOW],
 
   # https://crbug.com/1129854
   'tools/log': ['arch == arm or arch == arm64', SKIP],
@@ -1234,6 +1235,7 @@
   'regress/regress-1447383': [SKIP],
   'regress/regress-crbug-335592010': [SKIP],
   'regress/regress-352402863': [SKIP],
+  'regress/regress-549231120': [SKIP],
   'string-localecompare-inline': [SKIP],
 
   # Non-BMP characters currently aren't considered identifiers without i18n
