@@ -48,7 +48,7 @@ declare_args() {
   # metagen (tools/metagen/) or Torque's emission. Both actions are wired
   # in the build, so flipping this is a rebuild, not a regen. Sets
   # -DV8_USE_METAGEN_INSTANCE_TYPES=0 when off.
-  v8_use_metagen_instance_types = true
+  v8_use_metagen_instance_types = false
 
   # Native libclang for the metagen instance-type harvest, for platforms
   # that have no prebuilt llvm-libclang package (currently ppc64 and s390x).
@@ -162,7 +162,7 @@ declare_args() {
   v8_enable_slow_dchecks = false
 
   # Enable fast mksnapshot runs.
-  v8_enable_fast_mksnapshot = false
+  v8_enable_fast_mksnapshot = build_with_chromium && (is_debug || dcheck_always_on) && !is_official_build
 
   # Enable using multiple threads to build builtins in mksnapshot.
   v8_enable_concurrent_mksnapshot = true
