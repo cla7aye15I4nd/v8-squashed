@@ -2554,6 +2554,11 @@ if (v8_use_metagen_instance_types) {
       rebase_path(".", root_build_dir),
       "--build-dir",
       ".",  # The action runs with cwd=root_build_dir.
+
+      # metagen cannot find this by walking up from the build dir: on
+      # ChromeOS the build dir sits outside the checkout entirely.
+      "--source-root",
+      rebase_path("//", root_build_dir),
       "--out",
       rebase_path(_metagen_out_dir, root_build_dir),
 
@@ -5257,8 +5262,6 @@ v8_header_set("v8_internal_headers") {
 
   if (v8_enable_wasm_simd256_revec) {
     sources += [
-      "src/compiler/linear-scheduler.h",
-      "src/compiler/revectorizer.h",
       "src/compiler/turboshaft/wasm-revec-phase.h",
       "src/compiler/turboshaft/wasm-revec-reducer.h",
     ]
@@ -6015,8 +6018,6 @@ if (v8_enable_webassembly) {
 
 if (v8_enable_wasm_simd256_revec) {
   v8_compiler_sources += [
-    "src/compiler/linear-scheduler.cc",
-    "src/compiler/revectorizer.cc",
     "src/compiler/turboshaft/wasm-revec-phase.cc",
     "src/compiler/turboshaft/wasm-revec-reducer.cc",
   ]
