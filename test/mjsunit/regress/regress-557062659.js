@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-import text from 'modules-skip-1.txt' with { type: 'text' };
+// Flags: --cache=after-execute
 
-assertEquals("Hello, import text!\n", text);
+var R = Array.of(() => { 'use strict'; return eval('1'); }, "hello_world");
+assertEquals("hello_world", R[1]);
+assertEquals(1, R[0]());
