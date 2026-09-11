@@ -388,6 +388,7 @@
   'compiler/string-from-code-point': [SKIP],
   'compiler/regress-9945-1': [SKIP],
   'es6/iterator-eager-deopt': [SKIP],
+  'es6/array-iterator-turbo': [SKIP],
   'compiler/typedarray-resizablearraybuffer': [SKIP],
   'optimized-filter': [SKIP],
   'optimized-map': [SKIP],
@@ -467,6 +468,7 @@
   'regress/wasm/regress-438770394': [SKIP],
   'regress/regress-505551322': [SKIP],
   'regress/regress-508672637': [SKIP],
+  'regress/regress-fast-api-uint64-negative': [SKIP],
   'regress/regress-366323469': [SKIP],
   'regress/regress-366635361': [SKIP],
   # Maglev doesn't specialise the IsBeingInterpreted runtime func.
@@ -1325,6 +1327,7 @@
   'compiler/fast-api-deopt': [SKIP],
   'regress/regress-505551322': [SKIP],
   'regress/regress-508672637': [SKIP],
+  'regress/regress-fast-api-uint64-negative': [SKIP],
   'compiler/regress-crbug-1201011': [SKIP],
   'compiler/regress-crbug-1201057': [SKIP],
   'compiler/regress-crbug-1201082': [SKIP],
@@ -3006,6 +3009,7 @@
   'compiler/fast-api-annotations': [SKIP],
   'regress/regress-505551322': [SKIP],
   'regress/regress-508672637': [SKIP],
+  'regress/regress-fast-api-uint64-negative': [SKIP],
 }],  # arch != x64 and arch != arm64 and arch != loong64 and arch != mips64 and arch != riscv64'
 
 ##############################################################################
