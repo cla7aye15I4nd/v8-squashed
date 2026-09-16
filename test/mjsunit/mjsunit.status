@@ -202,8 +202,8 @@
   'regress/regress-crbug-808192': [PASS, SLOW, NO_VARIANTS, ['arch not in (ia32, x64)', SKIP], ['tsan', SKIP]],
   'regress/regress-crbug-918301': [PASS, SLOW, NO_VARIANTS, ['mode != release or dcheck_always_on', SKIP], ['(arch == arm or arch == arm64) and simulator_run', SKIP]],
   'regress/regress-crbug-1276923': [PASS, SLOW],
-  # Builds a chain of 80000 functions linked through their prototypes.
-  'regress/regress-crbug-388320179': [PASS, SLOW],
+  # Builds a chain of 80000 functions, which takes minutes with dchecks.
+  'regress/regress-crbug-388320179': [PASS, ['mode != release', SKIP]],
   'regress/regress-390568195': [PASS, SLOW, NO_VARIANTS, ['mode != release or dcheck_always_on', SKIP], ['arch != x64', SKIP]],
   'regress/regress-447613219': [PASS, SLOW],
   'regress/regress-494583765' : [PASS, SLOW],
@@ -662,6 +662,9 @@
   'opt-elements-kind': [SKIP],
   'regress/regress-trap-allocation-memento': [SKIP],
   'regress/regress-4121': [SKIP],
+  # --concurrent-recompilation-delay sleeps before the compile starts, so the
+  # test's cell rotation finishes before the broker reads the cell.
+  'regress/regress-crbug-560233248': [SKIP],
   # Tests taking too long
   'regress/regress-1122': [SKIP],
   'regress/regress-353551': [SKIP],
@@ -2136,6 +2139,8 @@
 
   # Too slow.
   'wasm/futex': [SKIP],
+  # Builds a chain of 80000 functions; times out on the tsan bot.
+  'regress/regress-crbug-388320179': [SKIP],
 
   # https://crbug.com/496520250
   'maglev/regress-494492520': [SKIP],
