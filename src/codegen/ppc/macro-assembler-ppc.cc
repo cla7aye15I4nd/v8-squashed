@@ -1870,8 +1870,10 @@ void MacroAssembler::LoadWeakValue(Register out, Register in,
   CmpS32(in, Operand(kClearedWeakHeapObjectLower32));
   beq(target_if_cleared);
 
-  mov(r0, Operand(~kWeakHeapObjectMask));
-  and_(out, in, r0);
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
+  mov(scratch, Operand(~kWeakHeapObjectMask));
+  and_(out, in, scratch);
 }
 
 void MacroAssembler::EmitIncrementCounter(StatsCounter* counter, int value,
@@ -2041,8 +2043,10 @@ void MacroAssembler::AssertUnreachable(AbortReason reason) {
 void MacroAssembler::AssertZeroExtended(Register int32_register) {
   if (!v8_flags.debug_code) return;
   ASM_CODE_COMMENT(this);
-  mov(r0, Operand(kMaxUInt32));
-  CmpS64(int32_register, r0);
+  UseScratchRegisterScope temps(this);
+  Register scratch = temps.Acquire();
+  mov(scratch, Operand(kMaxUInt32));
+  CmpS64(int32_register, scratch);
   Check(le, AbortReason::k32BitValueInRegisterIsNotZeroExtended);
 }
 

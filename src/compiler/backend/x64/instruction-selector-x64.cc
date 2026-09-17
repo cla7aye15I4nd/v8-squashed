@@ -1525,9 +1525,7 @@ void VisitStoreCommon(InstructionSelector* selector,
                        : kArchStoreWithWriteBarrier;
       const RecordWriteMode record_write_mode =
           WriteBarrierKindToRecordWriteMode(write_barrier_kind);
-      code |= is_atomic
-                  ? AtomicStoreRecordWriteModeField::encode(record_write_mode)
-                  : RecordWriteModeField::encode(record_write_mode);
+      code |= RecordWriteModeField::encode(record_write_mode);
     }
     code |= AddressingModeField::encode(addressing_mode);
     code |= AccessModeField::encode(access_mode);
@@ -2264,10 +2262,10 @@ void InstructionSelector::VisitInt32Sub(OpIndex node) {
   if (g.CanBeImmediate(right)) {
     int32_t imm = g.GetImmediateIntegerValue(right);
     if (imm == 0) {
-      if (this->Get(left).outputs_rep()[0] ==
-          RegisterRepresentation::Word32()) {
+      if (ZeroExtendsWord32ToWord64(left)) {
         // {EmitIdentity} reuses the virtual register of the first input
-        // for the output. This is exactly what we want here.
+        // for the output. This is only safe if it is known to zero-extend
+        // (as the int32 subtraction advertises itself as zero-extending.)
         EmitIdentity(node);
       } else {
         // Emit "movl" for subtraction of 0.

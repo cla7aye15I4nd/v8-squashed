@@ -112,6 +112,18 @@ class FunctionContextSpecialization final : public AllStatic {
     if (HeapConstant* n = context->TryCast<HeapConstant>()) {
       return n->ref().AsContext().previous(unit->broker(), depth);
     }
+    if (InitialValue* n = context->TryCast<InitialValue>()) {
+      if (!unit->info()->toplevel_is_osr() &&
+          n->source() == interpreter::Register::current_context()) {
+        if (compiler::OptionalContextRef outer =
+                unit->info()->specialization_context()) {
+          if (*depth >= unit->info()->specialization_context_distance()) {
+            *depth -= unit->info()->specialization_context_distance();
+            return outer->previous(unit->broker(), depth);
+          }
+        }
+      }
+    }
     return {};
   }
 };
@@ -765,13 +777,21 @@ ValueNode* MaglevGraphBuilder::GetInlinedArgument(int i) {
 
 void MaglevGraphBuilder::BuildRegisterFrameInitialization(
     ValueNode* context, ValueNode* closure, ValueNode* new_target) {
-  if (closure == nullptr &&
-      compilation_unit_->info()->specialize_to_function_context()) {
-    compiler::JSFunctionRef function = compiler::MakeRefAssumeMemoryFence(
-        broker(), broker()->CanonicalPersistentHandle(
-                      compilation_unit_->info()->toplevel_function()));
-    closure = GetConstant(function);
-    context = GetConstant(function.context(broker()));
+  if (closure == nullptr) {
+    if (compilation_unit_->info()->specialize_to_function_context()) {
+      compiler::JSFunctionRef function = compiler::MakeRefAssumeMemoryFence(
+          broker(), broker()->CanonicalPersistentHandle(
+                        compilation_unit_->info()->toplevel_function()));
+      closure = GetConstant(function);
+      context = GetConstant(function.context(broker()));
+    } else if (!compilation_unit_->info()->toplevel_is_osr() &&
+               compilation_unit_->info()->specialization_context_distance() ==
+                   0) {
+      if (compiler::OptionalContextRef outer =
+              compilation_unit_->info()->specialization_context()) {
+        context = GetConstant(*outer);
+      }
+    }
   }
 
   auto InitializeRegister = [&](interpreter::Register reg,
@@ -8375,10 +8395,18 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceGeneratorPrototypeNext(
   ABORT_IF_EMPTY_TYPE(executing_constant);
   ABORT_IF_EMPTY_TYPE(next_constant);
 
+  // The fast path below asks the generator to store the yielded value into
+  // yielded_value_ rather than allocate a result object, and rebuilds the
+  // object here as a VirtualObject that escape analysis can then elide. A
+  // current try-catch block, either in this function or in a caller we were
+  // inlined into, defeats that as would pay for the protocol and allocate
+  // anyway.
+  const bool can_skip_allocation = GetCurrentTryCatchBlock().ref == nullptr;
+
   MaglevSubGraphBuilder::Label generator_already_closed(&subgraph, 1);
   MaglevSubGraphBuilder::Label generator_finished(&subgraph, 1);
-  MaglevSubGraphBuilder::Label allocation_not_skipped(&subgraph, 1);
-  MaglevSubGraphBuilder::Label done(&subgraph, 4, {&ret_value});
+  MaglevSubGraphBuilder::Label done(&subgraph, can_skip_allocation ? 4 : 3,
+                                    {&ret_value});
 
   RETURN_IF_ABORT(subgraph.GotoIfTrue<BranchIfReferenceEqual>(
       &generator_already_closed, {continuation, closed_constant}));
@@ -8398,13 +8426,14 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceGeneratorPrototypeNext(
             StoreTaggedMode::kDefault)
             .IsDoneWithoutAbort());
 
-  // Tell the generator to skip allocating the result object (if
-  // possible).
-  CHECK(BuildStoreTaggedFieldNoWriteBarrier(
-            receiver, GetRootConstant(RootIndex::kTheHoleValue),
-            offsetof(JSGeneratorObject, yielded_value_),
-            StoreTaggedMode::kDefault)
-            .IsDoneWithoutAbort());
+  // Tell the generator to skip allocating the result object if possible.
+  if (can_skip_allocation) {
+    CHECK(BuildStoreTaggedFieldNoWriteBarrier(
+              receiver, GetRootConstant(RootIndex::kTheHoleValue),
+              offsetof(JSGeneratorObject, yielded_value_),
+              StoreTaggedMode::kDefault)
+              .IsDoneWithoutAbort());
+  }
 
   ValueNode* result;
   {
@@ -8429,36 +8458,36 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceGeneratorPrototypeNext(
             BuildLoadTaggedField(receiver,
                                  offsetof(JSGeneratorObject, continuation_)));
 
-  ValueNode* yielded_value;
-  GET_VALUE(yielded_value,
-            BuildLoadTaggedField(receiver,
-                                 offsetof(JSGeneratorObject, yielded_value_)));
-  // We unconditionally clear yielded_value_ here. If the generator did
-  // not hit the GeneratorYieldResult intrinsic (if it suspended via
-  // yield*), yielded_value_ would still hold TheHole. If it leaked to JS
-  // space (e.g., on a subsequent unoptimized next() call), it could cause
-  // a crash when JS attempts to access its properties.
-  CHECK(BuildStoreTaggedFieldNoWriteBarrier(
-            receiver, GetRootConstant(RootIndex::kUndefinedValue),
-            offsetof(JSGeneratorObject, yielded_value_),
-            StoreTaggedMode::kDefault)
-            .IsDoneWithoutAbort());
-
   CHECK(subgraph
             .GotoIfTrue<BranchIfReferenceEqual>(
                 &generator_finished, {result_continuation, executing_constant})
             .IsDoneWithoutAbort());
 
-  // The generator is not yet finished.
-  // Check whether skipping allocating the result object was successful.
-  CHECK(subgraph
-            .GotoIfFalse<BranchIfRootConstant>(
-                &allocation_not_skipped, {result}, RootIndex::kTheHoleValue)
-            .IsDoneWithoutAbort());
+  if (can_skip_allocation) {
+    MaglevSubGraphBuilder::Label allocation_not_skipped(&subgraph, 1);
+    ValueNode* yielded_value;
+    GET_VALUE(yielded_value,
+              BuildLoadTaggedField(
+                  receiver, offsetof(JSGeneratorObject, yielded_value_)));
+    // We unconditionally clear yielded_value_ here. If the generator did
+    // not hit the GeneratorYieldResult intrinsic (if it suspended via
+    // yield*), yielded_value_ would still hold TheHole. If it leaked to JS
+    // space (e.g., on a subsequent unoptimized next() call), it could cause
+    // a crash when JS attempts to access its properties.
+    CHECK(BuildStoreTaggedFieldNoWriteBarrier(
+              receiver, GetRootConstant(RootIndex::kUndefinedValue),
+              offsetof(JSGeneratorObject, yielded_value_),
+              StoreTaggedMode::kDefault)
+              .IsDoneWithoutAbort());
 
-  // Was able to avoid allocating the result object. Use
-  // yielded_value from the generator object.
-  {
+    // Check whether skipping allocating the result object was successful.
+    CHECK(subgraph
+              .GotoIfFalse<BranchIfRootConstant>(
+                  &allocation_not_skipped, {result}, RootIndex::kTheHoleValue)
+              .IsDoneWithoutAbort());
+
+    // Was able to avoid allocating the result object. Use
+    // yielded_value from the generator object.
     compiler::MapRef map =
         broker()->target_native_context().iterator_result_map(broker());
     VirtualObject* iter_result = reducer_.CreateJSIteratorResult(
@@ -8467,6 +8496,15 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceGeneratorPrototypeNext(
     GET_VALUE(alloc_result, reducer_.BuildInlinedAllocation(
                                 iter_result, AllocationType::kYoung));
     subgraph.set(ret_value, alloc_result);
+    subgraph.Goto(&done);
+
+    subgraph.Bind(&allocation_not_skipped);
+
+    subgraph.set(ret_value, result);
+    subgraph.Goto(&done);
+  } else {
+    // The builtin allocated the result object for us.
+    subgraph.set(ret_value, result);
     subgraph.Goto(&done);
   }
 
@@ -8505,14 +8543,6 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceGeneratorPrototypeNext(
     GET_VALUE(alloc_result, reducer_.BuildInlinedAllocation(
                                 iter_result, AllocationType::kYoung));
     subgraph.set(ret_value, alloc_result);
-    subgraph.Goto(&done);
-  }
-
-  subgraph.Bind(&allocation_not_skipped);
-  {
-    // Was not able to avoid allocating the result object; use
-    // the result object as is.
-    subgraph.set(ret_value, result);
     subgraph.Goto(&done);
   }
 

@@ -4361,6 +4361,10 @@ size_t v8::BackingStore::ByteLength() const {
   return reinterpret_cast<const i::BackingStore*>(this)->byte_length();
 }
 
+std::span<uint8_t> v8::BackingStore::ByteSpan() const {
+  return {static_cast<uint8_t*>(Data()), ByteLength()};
+}
+
 size_t v8::BackingStore::MaxByteLength() const {
   return reinterpret_cast<const i::BackingStore*>(this)->max_byte_length();
 }
@@ -12530,7 +12534,7 @@ bool ValidateFunctionCallbackInfo(const FunctionCallbackInfo<T>& info) {
   CHECK_EQ(i_isolate, Isolate::Current());
   CHECK(!i_isolate->GetIncumbentContext().is_null());
   CHECK(info.This()->IsObject());
-  CHECK(!info.Data().IsEmpty());
+  CHECK(!info.DataV2().IsEmpty());
   CHECK(info.GetReturnValue().Get()->IsValue());
   return true;
 }
