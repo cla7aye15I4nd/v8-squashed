@@ -268,8 +268,7 @@ class WasmOutOfLineTrap : public OutOfLineCode {
     // Just encode the stub index. This will be patched when the code
     // is added to the native module and copied into wasm code space.
     __ Call(static_cast<Address>(trap_id), RelocInfo::WASM_STUB_CALL);
-    ReferenceMap* reference_map = gen_->zone()->New<ReferenceMap>(gen_->zone());
-    gen_->RecordSafepoint(reference_map);
+    gen_->RecordSafepointWithoutTaggedSlots();
     __ AssertUnreachable(AbortReason::kUnexpectedReturnFromWasmTrap);
   }
 
@@ -281,13 +280,6 @@ void RecordTrapInfoIfNeeded(Zone* zone, CodeGenerator* codegen,
                             int pc) {
   const MemoryAccessMode access_mode = AccessModeField::decode(opcode);
   if (access_mode == kMemoryAccessTrapping) {
-    ReferenceMap* reference_map =
-        codegen->zone()->New<ReferenceMap>(codegen->zone());
-    // The safepoint has to be recorded at the return address of a call. Address
-    // we use as the fake return address in the case of the trap handler is the
-    // fault address (here `pc`) + 1. Therefore the safepoint here has to be
-    // recorded at pc + 1;
-    codegen->RecordSafepoint(reference_map, pc + 1);
     codegen->RecordTrappingInstruction(pc);
   }
 }
@@ -1171,8 +1163,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kArchAtomicStoreWithWriteBarrier: {
       DCHECK_EQ(AddressingModeField::decode(instr->opcode()), kMode_MRR);
       MacroAssembler::BlockTrampolinePoolScope block_trampoline_pool(masm());
-      RecordWriteMode mode =
-          AtomicStoreRecordWriteModeField::decode(instr->opcode());
+      RecordWriteMode mode = RecordWriteModeField::decode(instr->opcode());
       // Indirect pointer writes must use a different opcode.
       DCHECK_NE(mode, RecordWriteMode::kValueIsIndirectPointer);
       Register object = i.InputRegister(0);
@@ -5172,8 +5163,7 @@ void CodeGenerator::AssembleConstructFrame() {
         // return in this case.
         // So either way, we can just ignore any references and record an empty
         // safepoint here.
-        ReferenceMap* reference_map = zone()->New<ReferenceMap>(zone());
-        RecordSafepoint(reference_map);
+        RecordSafepointWithoutTaggedSlots();
         __ MultiPopFPUOrLSX(fp_regs_to_save);
         __ MultiPop(regs_to_save);
       } else {
@@ -5181,8 +5171,7 @@ void CodeGenerator::AssembleConstructFrame() {
                 RelocInfo::WASM_STUB_CALL);
         // The call does not return, hence we can ignore any references and just
         // define an empty safepoint.
-        ReferenceMap* reference_map = zone()->New<ReferenceMap>(zone());
-        RecordSafepoint(reference_map);
+        RecordSafepointWithoutTaggedSlots();
         if (v8_flags.debug_code) {
           __ stop();
         }

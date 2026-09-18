@@ -12304,7 +12304,7 @@ void WasmStreaming::SetUrl(const char* url, size_t length) { UNREACHABLE(); }
 
 // static
 std::shared_ptr<WasmStreaming> WasmStreaming::Unpack(Isolate* v8_isolate,
-                                                     Local<Value> value) {
+                                                     Local<Data> data) {
   FATAL("WebAssembly is disabled");
 }
 #endif  // !V8_ENABLE_WEBASSEMBLY
@@ -12551,7 +12551,7 @@ bool ValidatePropertyCallbackInfo(const PropertyCallbackInfo<T>& info) {
         *i::PropertyCallbackArguments::GetPropertyName(info);
     CHECK(i::IsName(name));
   }
-  CHECK(info.Data()->IsValue());
+  CHECK(info.DataV2()->IsValue());
   USE(info.ShouldThrowOnError());
   if (!std::is_same_v<T, void>) {
     CHECK(info.GetReturnValue().Get()->IsValue());

@@ -29,6 +29,8 @@ bool RiscvOperandGenerator::CanBeImmediate(int64_t value,
     case kRiscvShr64:
       return is_uint6(value);
     case kRiscvAdd32:
+    case kRiscvAddOvf32:
+    case kRiscvSubOvf32:
     case kRiscvAnd32:
     case kRiscvAnd:
     case kRiscvAdd64:
@@ -520,7 +522,7 @@ void InstructionSelector::VisitStoreLane(OpIndex node) {
   InstructionCode opcode = kRiscvS128StoreLane;
   opcode |= EncodeElementWidth(ByteSizeToSew(store.lane_size()));
   if (store.kind.with_trap_handler) {
-    opcode |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+    opcode |= AccessModeField::encode(kMemoryAccessTrapping);
   }
 
   RiscvOperandGenerator g(this);
@@ -552,7 +554,7 @@ void InstructionSelector::VisitLoadLane(OpIndex node) {
   InstructionCode opcode = kRiscvS128LoadLane;
   opcode |= EncodeElementWidth(ByteSizeToSew(load.lane_size()));
   if (load.kind.with_trap_handler) {
-    opcode |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+    opcode |= AccessModeField::encode(kMemoryAccessTrapping);
   }
 
   RiscvOperandGenerator g(this);
@@ -704,13 +706,8 @@ void InstructionSelector::VisitLoad(OpIndex node) {
   auto load = load_view(node);
   InstructionCode opcode = kArchNop;
   opcode = GetLoadOpcode(load.ts_loaded_rep(), load.ts_result_rep());
-  bool traps_on_null;
-  if (load.is_trapping(&traps_on_null)) {
-    if (traps_on_null) {
-      opcode |= AccessModeField::encode(kMemoryAccessTrappingNullDereference);
-    } else {
-      opcode |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
-    }
+  if (load.is_trapping()) {
+    opcode |= AccessModeField::encode(kMemoryAccessTrapping);
   }
   EmitLoad(this, node, opcode);
 }
@@ -768,8 +765,8 @@ void InstructionSelector::VisitStore(OpIndex node) {
       code = kArchStoreWithWriteBarrier;
       code |= RecordWriteModeField::encode(record_write_mode);
     }
-    if (store_view.is_store_trap_on_null()) {
-      code |= AccessModeField::encode(kMemoryAccessTrappingNullDereference);
+    if (store_view.access_kind() == MemoryAccessKind::kTrapping) {
+      code |= AccessModeField::encode(kMemoryAccessTrapping);
     }
     Emit(code, 0, nullptr, input_count, inputs, temp_count, temps);
     return;
@@ -792,10 +789,8 @@ void InstructionSelector::VisitStore(OpIndex node) {
     return;
   }
 
-  if (store_view.is_store_trap_on_null()) {
-    code |= AccessModeField::encode(kMemoryAccessTrappingNullDereference);
-  } else if (store_view.access_kind() == MemoryAccessKind::kTrapping) {
-    code |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+  if (store_view.access_kind() == MemoryAccessKind::kTrapping) {
+    code |= AccessModeField::encode(kMemoryAccessTrapping);
   }
 
   if (TryFoldStore(this, node, code, base, index, g.NoOutput(), value)) {
@@ -1592,22 +1587,28 @@ void InstructionSelector::VisitChangeUint32ToUint64(OpIndex node) {
 bool InstructionSelector::ZeroExtendsWord32ToWord64NoPhis(OpIndex node) {
   DCHECK(!this->Get(node).Is<PhiOp>());
   const Operation& op = this->Get(node);
-  if (op.opcode == Opcode::kLoad) {
-    auto load = this->load_view(node);
-    LoadRepresentation load_rep = load.loaded_rep();
-    if (load_rep.IsUnsigned()) {
-      switch (load_rep.representation()) {
-        case MachineRepresentation::kWord8:
-        case MachineRepresentation::kWord16:
-        case MachineRepresentation::kWord32:
-          return true;
-        default:
-          return false;
+  switch (op.opcode) {
+    case Opcode::kProjection:
+      return ZeroExtendsWord32ToWord64NoPhis(op.Cast<ProjectionOp>().input());
+    case Opcode::kLoad: {
+      auto load = this->load_view(node);
+      LoadRepresentation load_rep = load.loaded_rep();
+      if (load_rep.IsUnsigned()) {
+        switch (load_rep.representation()) {
+          case MachineRepresentation::kWord8:
+          case MachineRepresentation::kWord16:
+          case MachineRepresentation::kWord32:
+            return true;
+          default:
+            return false;
+        }
       }
+      return false;
     }
+    default:
+      // All other 32-bit operations sign-extend to the upper 32 bits
+      return false;
   }
-  // All other 32-bit operations sign-extend to the upper 32 bits
-  return false;
 }
 
 void InstructionSelector::VisitTruncateInt64ToInt32(OpIndex node) {
@@ -1876,11 +1877,8 @@ void VisitAtomicLoad(InstructionSelector* selector, OpIndex node,
       UNREACHABLE();
   }
 
-  bool traps_on_null;
-  if (load.is_trapping(&traps_on_null)) {
-    code |= AccessModeField::encode(traps_on_null
-                                        ? kMemoryAccessTrappingNullDereference
-                                        : kMemoryAccessTrappingMemOutOfBounds);
+  if (load.is_trapping()) {
+    code |= AccessModeField::encode(kMemoryAccessTrapping);
   }
 
   if (g.CanBeImmediate(index, code)) {
@@ -1961,10 +1959,8 @@ void VisitAtomicStore(InstructionSelector* selector, OpIndex node,
       code |= RecordWriteModeField::encode(record_write_mode);
     }
 
-    if (store.is_store_trap_on_null()) {
-      code |= AccessModeField::encode(kMemoryAccessTrappingNullDereference);
-    } else if (store_params.kind() == MemoryAccessKind::kTrapping) {
-      code |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+    if (store_params.kind() == MemoryAccessKind::kTrapping) {
+      code |= AccessModeField::encode(kMemoryAccessTrapping);
     }
 
     code |= AddressingModeField::encode(addressing_mode);
@@ -2001,10 +1997,8 @@ void VisitAtomicStore(InstructionSelector* selector, OpIndex node,
     }
     code |= AtomicWidthField::encode(width);
 
-    if (store.is_store_trap_on_null()) {
-      code |= AccessModeField::encode(kMemoryAccessTrappingNullDereference);
-    } else if (store_params.kind() == MemoryAccessKind::kTrapping) {
-      code |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+    if (store_params.kind() == MemoryAccessKind::kTrapping) {
+      code |= AccessModeField::encode(kMemoryAccessTrapping);
     }
     if (g.CanBeImmediate(index, code)) {
       selector->Emit(code | AddressingModeField::encode(kMode_MRI) |
@@ -2056,7 +2050,7 @@ void VisitAtomicBinop(InstructionSelector* selector, OpIndex node,
   InstructionCode code = opcode | AddressingModeField::encode(addressing_mode) |
                          AtomicWidthField::encode(width);
   if (access_kind == MemoryAccessKind::kTrapping) {
-    code |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+    code |= AccessModeField::encode(kMemoryAccessTrapping);
   }
   selector->Emit(code, 1, outputs, input_count, inputs, 4, temps);
 }
@@ -2189,35 +2183,15 @@ void InstructionSelector::VisitWordCompareZero(OpIndex user, OpIndex value,
                 TryCast<OverflowCheckedBinopOp>(node);
             binop && CanDoBranchIfOverflowFusion(node)) {
           const bool is64 = binop->rep == WordRepresentation::Word64();
-          OpIndex right_node = binop->input(1);
-          RiscvOperandGenerator g(this);
-          // Check if the right-hand side operand can be encoded as an immediate
-          // value for a 32-bit operand add/sub. This is used to
-          // determine whether we can utilize the more efficient overflow
-          // checking path specifically designed for 32-bit operations with
-          // immediate operands.
-          const bool use_32 = g.CanBeImmediate(right_node, kRiscvAdd32);
           switch (binop->kind) {
             case OverflowCheckedBinopOp::Kind::kSignedAdd: {
               cont->OverwriteAndNegateIfEqual(kOverflow);
-              ArchOpcode opcode = kRiscvAddOvfWord;
-              if (!is64) {
-                if (use_32)
-                  opcode = kRiscvAdd32;
-                else
-                  opcode = kRiscvAdd64;
-              }
+              ArchOpcode opcode = is64 ? kRiscvAddOvfWord : kRiscvAddOvf32;
               return VisitBinop<Int32BinopMatcher>(this, node, opcode, cont);
             }
             case OverflowCheckedBinopOp::Kind::kSignedSub: {
               cont->OverwriteAndNegateIfEqual(kOverflow);
-              ArchOpcode opcode = kRiscvSubOvfWord;
-              if (!is64) {
-                if (use_32)
-                  opcode = kRiscvSub32;
-                else
-                  opcode = kRiscvSub64;
-              }
+              ArchOpcode opcode = is64 ? kRiscvSubOvfWord : kRiscvSubOvf32;
               return VisitBinop<Int32BinopMatcher>(this, node, opcode, cont);
             }
             case OverflowCheckedBinopOp::Kind::kSignedMul:
@@ -2333,19 +2307,7 @@ void InstructionSelector::VisitInt32AddWithOverflow(OpIndex node) {
   OptionalOpIndex ovf = FindProjection(node, 1);
   if (ovf.valid() && IsUsed(ovf.value())) {
     FlagsContinuation cont = FlagsContinuation::ForSet(kOverflow, ovf.value());
-    const Operation& binop = Get(node);
-    OpIndex right_node = binop.input(1);
-    RiscvOperandGenerator g(this);
-    // Check if the right-hand side operand can be encoded as an immediate
-    // value for a 32-bit operand add/sub. This is used to
-    // determine whether we can utilize the more efficient overflow
-    // checking path specifically designed for 32-bit operations with
-    // immediate operands.
-    // TODO(yahan): Implement the 32-bit overflow fast check with Constant which
-    // don't be encoded into instructions.
-    const bool use_32 = g.CanBeImmediate(right_node, kRiscvAdd32);
-    return VisitBinop<Int32BinopMatcher>(
-        this, node, use_32 ? kRiscvAdd32 : kRiscvAdd64, &cont);
+    return VisitBinop<Int32BinopMatcher>(this, node, kRiscvAddOvf32, &cont);
   }
   FlagsContinuation cont;
   VisitBinop<Int32BinopMatcher>(this, node, kRiscvAdd64, &cont);
@@ -2355,12 +2317,7 @@ void InstructionSelector::VisitInt32SubWithOverflow(OpIndex node) {
   OptionalOpIndex ovf = FindProjection(node, 1);
   if (ovf.valid() && IsUsed(ovf.value())) {
     FlagsContinuation cont = FlagsContinuation::ForSet(kOverflow, ovf.value());
-    const Operation& binop = Get(node);
-    OpIndex right_node = binop.input(1);
-    RiscvOperandGenerator g(this);
-    const bool use_32 = g.CanBeImmediate(right_node, kRiscvSub32);
-    return VisitBinop<Int32BinopMatcher>(
-        this, node, use_32 ? kRiscvSub32 : kRiscvSub64, &cont);
+    return VisitBinop<Int32BinopMatcher>(this, node, kRiscvSubOvf32, &cont);
   }
   FlagsContinuation cont;
   VisitBinop<Int32BinopMatcher>(this, node, kRiscvSub64, &cont);
@@ -2486,7 +2443,7 @@ void VisitAtomicExchange(InstructionSelector* selector, OpIndex node,
   InstructionCode code = opcode | AddressingModeField::encode(addressing_mode) |
                          AtomicWidthField::encode(width);
   if (access_kind == MemoryAccessKind::kTrapping) {
-    code |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+    code |= AccessModeField::encode(kMemoryAccessTrapping);
   }
   selector->Emit(code, 1, outputs, input_count, inputs, 3, temp);
 }
@@ -2527,7 +2484,7 @@ void VisitAtomicCompareExchange(InstructionSelector* selector, OpIndex node,
   InstructionCode code = opcode | AddressingModeField::encode(addressing_mode) |
                          AtomicWidthField::encode(width);
   if (access_kind == MemoryAccessKind::kTrapping) {
-    code |= AccessModeField::encode(kMemoryAccessTrappingMemOutOfBounds);
+    code |= AccessModeField::encode(kMemoryAccessTrapping);
   }
   selector->Emit(code, arraysize(outputs), outputs, input_count, inputs,
                  arraysize(temps), temps);
