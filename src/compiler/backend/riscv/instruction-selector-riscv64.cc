@@ -40,6 +40,9 @@ bool RiscvOperandGenerator::CanBeImmediate(int64_t value,
     case kRiscvTst32:
     case kRiscvXor:
       return is_int12(value);
+    case kRiscvCmp32:
+    case kRiscvCmp32Eq:
+      return is_int12(static_cast<int32_t>(value));
     case kRiscvLb:
     case kRiscvLbu:
     case kRiscvSb:
@@ -1107,7 +1110,8 @@ void VisitWideAddSub(InstructionSelector* selector, OpIndex node, bool is_add) {
   InstructionOperand outputs[2];
   size_t output_count = 0;
 
-  inputs[input_count++] = g.UseRegister(op.left_low());
+  inputs[input_count++] = is_add ? g.UseUniqueRegister(op.left_low())
+                                 : g.UseRegister(op.left_low());
   inputs[input_count++] = g.UseRegister(op.right_low());
 
   inputs[input_count++] = g.UseUniqueRegister(op.left_high());
@@ -1597,8 +1601,9 @@ bool InstructionSelector::ZeroExtendsWord32ToWord64NoPhis(OpIndex node) {
         switch (load_rep.representation()) {
           case MachineRepresentation::kWord8:
           case MachineRepresentation::kWord16:
-          case MachineRepresentation::kWord32:
             return true;
+          case MachineRepresentation::kWord32:
+            return !load.is_atomic();
           default:
             return false;
         }
@@ -1813,6 +1818,30 @@ void VisitFullWord32Compare(InstructionSelector* selector, OpIndex node,
 
 void VisitWord32Compare(InstructionSelector* selector, OpIndex node,
                         FlagsContinuation* cont) {
+  RiscvOperandGenerator g(selector);
+  const Operation& op = selector->Get(node);
+  DCHECK_EQ(op.input_count, 2);
+  // For equality/inequality only the low 32 bits matter. Compute the 32-bit
+  // difference with Sub32 (which sign-extends its result) and compare against
+  // zero. This avoids the two Shl64 normalization instructions emitted by
+  // VisitFullWord32Compare. The reasoning holds regardless of the (possibly
+  // dirty) upper 32 bits of the operands.
+  if (!cont->IsNone() &&
+      (cont->condition() == kEqual || cont->condition() == kNotEqual)) {
+    OpIndex left = op.input(0);
+    OpIndex right = op.input(1);
+    // Make sure an immediate, if any, ends up on the right.
+    if (!g.CanBeImmediate(right, kRiscvCmp32Eq) &&
+        g.CanBeImmediate(left, kRiscvCmp32Eq)) {
+      cont->Commute();
+      std::swap(left, right);
+    }
+    Instruction* instr =
+        VisitCompare(selector, kRiscvCmp32Eq, g.UseRegister(left),
+                     g.UseOperand(right, kRiscvCmp32Eq), cont);
+    selector->UpdateSourcePosition(instr, node);
+    return;
+  }
   VisitFullWord32Compare(selector, node, kRiscvCmp, cont);
 }
 
@@ -2213,7 +2242,12 @@ void InstructionSelector::VisitWordCompareZero(OpIndex user, OpIndex value,
       // Matching IR:
       // 7: Word64And
       // 8: Word64Equal(#7)
-      VisitWordCompare(this, value, kRiscvTst64, cont, true);
+      // For Word32And the operands may have dirty bits in the upper 32 bits
+      // (e.g. from Word32Xor with -1, which lowers to a 64-bit xori), so the
+      // zero test must normalize the 32-bit result before branching.
+      bool is_32 = value_op.Is<Opmask::kWord32BitwiseAnd>();
+      VisitWordCompare(this, value, is_32 ? kRiscvTst32 : kRiscvTst64, cont,
+                       true);
       return;
     }
   }
@@ -2221,27 +2255,25 @@ void InstructionSelector::VisitWordCompareZero(OpIndex user, OpIndex value,
   // Continuation could not be combined with a compare, emit compare against
   // 0.
   const ComparisonOp* comparison = this->Get(user).TryCast<ComparisonOp>();
-#ifdef V8_COMPRESS_POINTERS
-  if ((comparison &&
-       comparison->rep.value() == RegisterRepresentation::Word64()) ||
-      value_op.Is<Opmask::kWord32BitwiseAnd>() ||
-      value_op.Is<Opmask::kTruncateWord64ToWord32>() ||
+  // 32-bit ALU results are not guaranteed to have their upper 32 bits
+  // correctly extended on riscv64 (e.g. Word32Xor with -1 lowers to a
+  // full-width xori), so a Word32 value must use a zero test that normalizes
+  // the upper bits before branching. Note that a null |comparison| means the
+  // branch condition is a Word32 value directly (BranchOp::condition() is
+  // always Word32). Values that are known to be properly extended can use the
+  // cheaper full-width test.
+  bool is_64_bit =
+      comparison &&
+      (comparison->rep.value() == RegisterRepresentation::Word64() ||
+       (!COMPRESS_POINTERS_BOOL &&
+        comparison->rep.value() != RegisterRepresentation::Word32()));
+  if (is_64_bit || value_op.Is<Opmask::kTruncateWord64ToWord32>() ||
       IsLoadWord32OrSmaller(this, value) ||
       IsSignExtendWord32ToWord64(value_op)) {
-    // If the value_op is sign-extended or lw/lhu/lh/lbu/lb, we can use
-    // EmitWordCompareZero to emit a 32-bit compare zero.
     return EmitWordCompareZero(this, value, cont);
   } else {
     return EmitWord32CompareZero(this, value, cont);
   }
-#else
-  if (comparison &&
-      comparison->rep.value() == RegisterRepresentation::Word32()) {
-    return EmitWord32CompareZero(this, value, cont);
-  } else {
-    return EmitWordCompareZero(this, value, cont);
-  }
-#endif
 }
 
 void InstructionSelector::VisitWord32Equal(OpIndex node) {
@@ -2270,8 +2302,8 @@ void InstructionSelector::VisitWord32Equal(OpIndex node) {
       if (RootsTable::IsReadOnly(root_index)) {
         Tagged_t ptr =
             MacroAssemblerBase::ReadOnlyRootPtr(root_index, isolate());
-        if (g.CanBeImmediate(ptr, kRiscvCmp32)) {
-          VisitCompare(this, kRiscvCmp32, g.UseRegister(left),
+        if (g.CanBeImmediate(ptr, kRiscvCmp32Eq)) {
+          VisitCompare(this, kRiscvCmp32Eq, g.UseRegister(left),
                        g.TempImmediate(static_cast<int32_t>(ptr)), &cont);
           return;
         }
