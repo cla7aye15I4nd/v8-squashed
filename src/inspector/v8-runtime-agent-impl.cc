@@ -871,18 +871,20 @@ Response V8RuntimeAgentImpl::getHeapUsage(double* out_usedSize,
   *out_usedSize = stats.used_heap_size();
   *out_totalSize = stats.total_heap_size();
   *out_backingStorageSize = stats.external_memory();
-  if (v8::CppHeap* cppHeap = m_inspector->isolate()->GetCppHeap()) {
-    cppgc::HeapStatistics cppStats =
-        cppHeap->CollectStatistics(cppgc::HeapStatistics::DetailLevel::kBrief);
-    *out_embedderHeapUsedSize = cppStats.used_size_bytes;
-  } else {
-    *out_embedderHeapUsedSize = 0;
-  }
+  v8::CppHeap* cppHeap = m_inspector->isolate()->GetCppHeap();
+  cppgc::HeapStatistics cppStats =
+      cppHeap->CollectStatistics(cppgc::HeapStatistics::DetailLevel::kBrief);
+  *out_embedderHeapUsedSize = cppStats.used_size_bytes;
   return Response::Success();
 }
 
 void V8RuntimeAgentImpl::terminateExecution(
     std::unique_ptr<TerminateExecutionCallback> callback) {
+  if (m_session->clientTrustLevel() != V8Inspector::kFullyTrusted) {
+    callback->sendFailure(Response::ServerError(
+        "Runtime.terminateExecution is not allowed for untrusted clients"));
+    return;
+  }
   v8::HandleScope handles(m_inspector->isolate());
   v8::Local<v8::Context> defaultContext =
       m_inspector->client()->ensureDefaultContextInGroup(
