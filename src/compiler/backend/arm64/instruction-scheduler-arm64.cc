@@ -113,8 +113,6 @@ ArchInstResource InstructionScheduler::GetInstructionResource(
     case kArm64I32x4SConvertF32x4:
     case kArm64I16x8Q15MulRSatS:
     case kArm64I16x8BitMask:
-    case kArm64I8x16SConvertI16x8:
-    case kArm64I8x16UConvertI16x8:
     case kArm64I8x16BitMask:
     case kArm64S128Const:
     case kArm64S128Dup:
@@ -139,13 +137,18 @@ ArchInstResource InstructionScheduler::GetInstructionResource(
     case kArm64S128LowUnzipRight:
     case kArm64Ssra:
     case kArm64Usra:
-    case kArm64S128Tbl1:
+    case kArm64S32x4Shuffle:
+    case kArm64I8x16Swizzle:
     case kArm64I8x16Shuffle:
     case kArm64S128Extract:
     case kArm64S128MoveLane:
     case kArm64S128MoveReg:
     case kArm64V128AnyTrue:
     case kArm64AllTrue:
+    case kArm64Sqxtn:
+    case kArm64Sqxtn2:
+    case kArm64Sqxtun:
+    case kArm64Sqxtun2:
     case kArm64Sxtl:
     case kArm64Sxtl2:
     case kArm64Uxtl:
@@ -179,8 +182,6 @@ ArchInstResource InstructionScheduler::GetInstructionResource(
     case kArm64S128ExtractNarrow:
     case kArm64IExtractLaneU:
     case kArm64IExtractLaneS:
-    case kArm64I16x8SConvertI32x4:
-    case kArm64I16x8UConvertI32x4:
     case kArm64Mla:
     case kArm64Mls:
     case kArm64FAdd:
@@ -657,6 +658,10 @@ int InstructionScheduler::GetTargetInstructionFlags(
     case kArm64IMul:
     case kArm64I64x2BitMask:
     case kArm64I32x4SConvertF32x4:
+    case kArm64Sqxtn:
+    case kArm64Sqxtn2:
+    case kArm64Sqxtun:
+    case kArm64Sqxtun2:
     case kArm64Sxtl:
     case kArm64Sxtl2:
     case kArm64Uxtl:
@@ -673,12 +678,8 @@ int InstructionScheduler::GetTargetInstructionFlags(
     case kArm64I32x4TruncSatF64x2UZero:
     case kArm64IExtractLaneU:
     case kArm64IExtractLaneS:
-    case kArm64I16x8SConvertI32x4:
-    case kArm64I16x8UConvertI32x4:
     case kArm64I16x8Q15MulRSatS:
     case kArm64I16x8BitMask:
-    case kArm64I8x16SConvertI16x8:
-    case kArm64I8x16UConvertI16x8:
     case kArm64I8x16BitMask:
     case kArm64S128Const:
     case kArm64S128Dup:
@@ -705,7 +706,8 @@ int InstructionScheduler::GetTargetInstructionFlags(
     case kArm64Usra:
     case kArm64S128MoveLane:
     case kArm64S128MoveReg:
-    case kArm64S128Tbl1:
+    case kArm64S32x4Shuffle:
+    case kArm64I8x16Swizzle:
     case kArm64I8x16Shuffle:
     case kArm64S128Extract:
     case kArm64S128ExtractNarrow:
@@ -1062,7 +1064,6 @@ int InstructionScheduler::GetInstructionLatency(const Instruction* instr) {
     case kArm64Bcax:
     case kArm64Eor3:
     case kArm64Xar:
-    case kArm64S128Tbl1:
       return kDefaultSimdLatency;
 
     // pmin/pmax lower to compare plus bitselect.
@@ -1122,6 +1123,10 @@ int InstructionScheduler::GetInstructionLatency(const Instruction* instr) {
     case kArm64F32x4DemoteF64x2Zero:
     case kArm64I32x4SConvertF32x4:
     case kArm64I32x4UConvertF32x4:
+    case kArm64Sqxtn:
+    case kArm64Sqxtn2:
+    case kArm64Sqxtun:
+    case kArm64Sqxtun2:
       return kSimdConversionLatency;
 
     // These widen/narrow around the conversion, forming a short dependent
@@ -1130,15 +1135,13 @@ int InstructionScheduler::GetInstructionLatency(const Instruction* instr) {
     case kArm64F64x2ConvertLowI32x4U:
       return kSimdConversionChainLatency;
 
-    case kArm64I8x16UConvertI16x8:
-    case kArm64I8x16SConvertI16x8:
-    case kArm64I16x8SConvertI32x4:
-    case kArm64I16x8UConvertI32x4:
     case kArm64I32x4TruncSatF64x2SZero:
     case kArm64I32x4TruncSatF64x2UZero:
     case kArm64F16x8DemoteF64x2Zero:
     case kArm64I32x4BitMask:
     case kArm64I64x2BitMask:
+    case kArm64I8x16Swizzle:
+    case kArm64S32x4Shuffle:
     case kArm64I8x16Shuffle:
       return kLongSimdLatency;
 

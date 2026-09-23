@@ -70,8 +70,6 @@ namespace compiler {
   V(Arm64I32x4SConvertF32x4)            \
   V(Arm64I16x8Q15MulRSatS)              \
   V(Arm64I16x8BitMask)                  \
-  V(Arm64I8x16SConvertI16x8)            \
-  V(Arm64I8x16UConvertI16x8)            \
   V(Arm64I8x16BitMask)                  \
   V(Arm64S128Const)                     \
   V(Arm64S128Dup)                       \
@@ -96,7 +94,8 @@ namespace compiler {
   V(Arm64S128LowUnzipRight)             \
   V(Arm64Ssra)                          \
   V(Arm64Usra)                          \
-  V(Arm64S128Tbl1)                      \
+  V(Arm64S32x4Shuffle)                  \
+  V(Arm64I8x16Swizzle)                  \
   V(Arm64I8x16Shuffle)                  \
   V(Arm64S128Extract)                   \
   V(Arm64S128ExtractNarrow)             \
@@ -104,6 +103,10 @@ namespace compiler {
   V(Arm64S128MoveReg)                   \
   V(Arm64V128AnyTrue)                   \
   V(Arm64AllTrue)                       \
+  V(Arm64Sqxtn)                         \
+  V(Arm64Sqxtn2)                        \
+  V(Arm64Sqxtun)                        \
+  V(Arm64Sqxtun2)                       \
   V(Arm64Sxtl)                          \
   V(Arm64Sxtl2)                         \
   V(Arm64Uxtl)                          \
@@ -136,8 +139,6 @@ namespace compiler {
   V(Arm64I32x4TruncSatF64x2UZero)       \
   V(Arm64IExtractLaneU)                 \
   V(Arm64IExtractLaneS)                 \
-  V(Arm64I16x8SConvertI32x4)            \
-  V(Arm64I16x8UConvertI32x4)            \
   V(Arm64Mla)                           \
   V(Arm64Mls)                           \
   V(Arm64FAdd)                          \

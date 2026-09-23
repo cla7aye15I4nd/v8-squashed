@@ -20,7 +20,7 @@
 #include "src/handles/handles-inl.h"
 #include "src/heap/heap-write-barrier-inl.h"
 #include "src/objects/abstract-code.h"
-#include "src/objects/contexts-inl.h"
+#include "src/objects/contexts.h"
 #include "src/objects/debug-objects-inl.h"
 #include "src/objects/feedback-vector-inl.h"
 #include "src/objects/function-kind.h"
@@ -382,8 +382,10 @@ void SharedFunctionInfo::SetName(Tagged<String> name) {
 }
 
 bool SharedFunctionInfo::is_script() const {
-  return scope_info(kAcquireLoad)->is_script_scope() &&
-         Cast<Script>(script())->is_host();
+  if (!is_toplevel()) return false;
+  bool result = scope_info(kAcquireLoad)->is_script_scope();
+  DCHECK_IMPLIES(result, Cast<Script>(script())->is_host());
+  return result;
 }
 
 bool SharedFunctionInfo::needs_script_context() const {

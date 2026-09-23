@@ -891,6 +891,71 @@ void CodeGenerator::AssembleDispatchHandleRegisterCheck() {
 
 void CodeGenerator::AssertNotDeoptimized() { __ AssertNotDeoptimized(); }
 
+int32_t GetLaneMask(int32_t lane_count) { return lane_count * 2 - 1; }
+
+void Shuffle4Helper(MacroAssembler* masm, Arm64OperandConverter i,
+                    VectorFormat f) {
+  VRegister dst = VRegister::Create(i.OutputSimd128Register().code(), f);
+  VRegister src0 = VRegister::Create(i.InputSimd128Register(0).code(), f);
+  VRegister src1 = VRegister::Create(i.InputSimd128Register(1).code(), f);
+  // Check for in-place shuffles, as we may need to use a temporary register
+  // to avoid overwriting an input.
+  if (dst == src0 || dst == src1) {
+    UseScratchRegisterScope scope(masm);
+    VRegister temp = scope.AcquireV(f);
+    if (dst == src0) {
+      masm->Mov(temp, src0);
+      src0 = temp;
+    } else if (dst == src1) {
+      masm->Mov(temp, src1);
+      src1 = temp;
+    }
+  }
+  int32_t shuffle = i.InputInt32(2);
+  int32_t lane_count = LaneCountFromFormat(f);
+  int32_t max_src0_lane = lane_count - 1;
+  int32_t lane_mask = GetLaneMask(lane_count);
+
+  DCHECK_EQ(f, kFormat4S);
+  // Check whether we can reduce the number of vmovs by performing a dup
+  // first. So, for [1, 1, 2, 1] we can dup lane zero and then perform
+  // a single lane move for lane two.
+  const std::array<int, 4> input_lanes{
+      shuffle & lane_mask, shuffle >> 8 & lane_mask, shuffle >> 16 & lane_mask,
+      shuffle >> 24 & lane_mask};
+  std::array<int, 8> lane_counts = {0};
+  for (int lane : input_lanes) {
+    ++lane_counts[lane];
+  }
+
+  // Find first duplicate lane, if any, and insert dup.
+  int duplicate_lane = -1;
+  for (size_t lane = 0; lane < lane_counts.size(); ++lane) {
+    if (lane_counts[lane] > 1) {
+      duplicate_lane = static_cast<int>(lane);
+      if (duplicate_lane > max_src0_lane) {
+        masm->Dup(dst, src1, duplicate_lane & max_src0_lane);
+      } else {
+        masm->Dup(dst, src0, duplicate_lane);
+      }
+      break;
+    }
+  }
+
+  // Perform shuffle as a vmov per lane.
+  for (int i = 0; i < 4; i++) {
+    int lane = shuffle & lane_mask;
+    shuffle >>= 8;
+    if (lane == duplicate_lane) continue;
+    VRegister src = src0;
+    if (lane > max_src0_lane) {
+      src = src1;
+      lane &= max_src0_lane;
+    }
+    masm->Mov(dst, i, src, lane);
+  }
+}
+
 // Assembles an instruction after register allocation, producing machine code.
 CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     Instruction* instr) {
@@ -2952,6 +3017,26 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
              i.InputSimd128Register(0).Format(f));                      \
     break;                                                              \
   }
+#define SIMD_LOW_NARROWING_CASE(Op, Instr)                              \
+  case Op: {                                                            \
+    const VectorFormat wide =                                           \
+        VectorFormatFillQ(LaneSizeBits(LaneSizeField::decode(opcode))); \
+    const VectorFormat narrow = VectorFormatHalfWidth(wide);            \
+    __ Instr(i.OutputSimd128Register().Format(narrow),                  \
+             i.InputSimd128Register(0).Format(wide));                   \
+    break;                                                              \
+  }
+#define SIMD_HIGH_NARROWING_CASE(Op, Instr)                             \
+  case Op: {                                                            \
+    const VectorFormat wide =                                           \
+        VectorFormatFillQ(LaneSizeBits(LaneSizeField::decode(opcode))); \
+    const VectorFormat narrow = VectorFormatHalfWidthDoubleLanes(wide); \
+    const VRegister dst = i.OutputSimd128Register().Format(narrow);     \
+    DCHECK_EQ(dst, i.InputSimd128Register(0).Format(narrow));           \
+    DCHECK_NE(dst.code(), i.InputSimd128Register(1).code());            \
+    __ Instr(dst, i.InputSimd128Register(1).Format(wide));              \
+    break;                                                              \
+  }
 #define SIMD_BINOP_CASE(Op, Instr, FORMAT)           \
   case Op:                                           \
     __ Instr(i.OutputSimd128Register().V##FORMAT(),  \
@@ -3059,6 +3144,10 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       SIMD_BINOP_LANE_SIZE_CASE(kArm64IMaxU, Umax);
       SIMD_DESTRUCTIVE_BINOP_LANE_SIZE_CASE(kArm64Mla, Mla);
       SIMD_DESTRUCTIVE_BINOP_LANE_SIZE_CASE(kArm64Mls, Mls);
+      SIMD_LOW_NARROWING_CASE(kArm64Sqxtn, Sqxtn);
+      SIMD_HIGH_NARROWING_CASE(kArm64Sqxtn2, Sqxtn2);
+      SIMD_LOW_NARROWING_CASE(kArm64Sqxtun, Sqxtun);
+      SIMD_HIGH_NARROWING_CASE(kArm64Sqxtun2, Sqxtun2);
     case kArm64Sxtl: {
       VectorFormat wide =
           VectorFormatFillQ(LaneSizeBits(LaneSizeField::decode(opcode)));
@@ -3467,69 +3556,13 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
               i.InputInt8(1));
       break;
     }
-    case kArm64I16x8SConvertI32x4: {
-      VRegister dst = i.OutputSimd128Register(),
-                src0 = i.InputSimd128Register(0),
-                src1 = i.InputSimd128Register(1);
-      UseScratchRegisterScope scope(masm());
-      VRegister temp = scope.AcquireV(kFormat4S);
-      if (dst == src1) {
-        __ Mov(temp, src1.V4S());
-        src1 = temp;
-      }
-      __ Sqxtn(dst.V4H(), src0.V4S());
-      __ Sqxtn2(dst.V8H(), src1.V4S());
-      break;
-    }
       SIMD_BINOP_LANE_SIZE_CASE(kArm64IAddSatS, Sqadd);
       SIMD_BINOP_LANE_SIZE_CASE(kArm64ISubSatS, Sqsub);
-    case kArm64I16x8UConvertI32x4: {
-      VRegister dst = i.OutputSimd128Register(),
-                src0 = i.InputSimd128Register(0),
-                src1 = i.InputSimd128Register(1);
-      UseScratchRegisterScope scope(masm());
-      VRegister temp = scope.AcquireV(kFormat4S);
-      if (dst == src1) {
-        __ Mov(temp, src1.V4S());
-        src1 = temp;
-      }
-      __ Sqxtun(dst.V4H(), src0.V4S());
-      __ Sqxtun2(dst.V8H(), src1.V4S());
-      break;
-    }
       SIMD_BINOP_LANE_SIZE_CASE(kArm64IAddSatU, Uqadd);
       SIMD_BINOP_LANE_SIZE_CASE(kArm64ISubSatU, Uqsub);
       SIMD_BINOP_CASE(kArm64I16x8Q15MulRSatS, Sqrdmulh, 8H);
     case kArm64I16x8BitMask: {
       __ I16x8BitMask(i.OutputRegister32(), i.InputSimd128Register(0));
-      break;
-    }
-    case kArm64I8x16SConvertI16x8: {
-      VRegister dst = i.OutputSimd128Register(),
-                src0 = i.InputSimd128Register(0),
-                src1 = i.InputSimd128Register(1);
-      UseScratchRegisterScope scope(masm());
-      VRegister temp = scope.AcquireV(kFormat8H);
-      if (dst == src1) {
-        __ Mov(temp, src1.V8H());
-        src1 = temp;
-      }
-      __ Sqxtn(dst.V8B(), src0.V8H());
-      __ Sqxtn2(dst.V16B(), src1.V8H());
-      break;
-    }
-    case kArm64I8x16UConvertI16x8: {
-      VRegister dst = i.OutputSimd128Register(),
-                src0 = i.InputSimd128Register(0),
-                src1 = i.InputSimd128Register(1);
-      UseScratchRegisterScope scope(masm());
-      VRegister temp = scope.AcquireV(kFormat8H);
-      if (dst == src1) {
-        __ Mov(temp, src1.V8H());
-        src1 = temp;
-      }
-      __ Sqxtun(dst.V8B(), src0.V8H());
-      __ Sqxtun2(dst.V16B(), src1.V8H());
       break;
     }
     case kArm64I8x16BitMask: {
@@ -3743,6 +3776,10 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       __ Usra(dst, i.InputSimd128Register(1).Format(f), i.InputUint8(2) & mask);
       break;
     }
+    case kArm64S32x4Shuffle: {
+      Shuffle4Helper(masm(), i, kFormat4S);
+      break;
+    }
       SIMD_BINOP_LANE_SIZE_CASE(kArm64S128UnzipLeft, Uzp1);
       SIMD_BINOP_LANE_SIZE_CASE(kArm64S128UnzipRight, Uzp2);
       SIMD_BINOP_LANE_SIZE_CASE(kArm64S128ZipLeft, Zip1);
@@ -3752,7 +3789,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       SIMD_LOW_BINOP_LANE_SIZE_CASE(kArm64S128LowZipRight, Zip2);
       SIMD_LOW_BINOP_LANE_SIZE_CASE(kArm64S128LowUnzipLeft, Uzp1);
       SIMD_LOW_BINOP_LANE_SIZE_CASE(kArm64S128LowUnzipRight, Uzp2);
-    case kArm64S128Tbl1: {
+    case kArm64I8x16Swizzle: {
       __ Tbl(i.OutputSimd128Register().V16B(), i.InputSimd128Register(0).V16B(),
              i.InputSimd128Register(1).V16B());
       break;
@@ -3907,6 +3944,8 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
 
 #undef SIMD_UNOP_CASE
 #undef SIMD_UNOP_LANE_SIZE_CASE
+#undef SIMD_LOW_NARROWING_CASE
+#undef SIMD_HIGH_NARROWING_CASE
 #undef SIMD_BINOP_CASE
 #undef SIMD_BINOP_LANE_SIZE_CASE
 #undef SIMD_LOW_BINOP_LANE_SIZE_CASE
