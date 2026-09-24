@@ -1481,6 +1481,13 @@ class GraphBuildingNodeProcessor {
       return nullptr;
     }
 
+    SBXCHECK_EQ(node->expected_parameter_count(), JSParameterCount(wasm_arity));
+    // WasmInJSInliningReducer requires every argument to be wrapped in a
+    // ProcessWasmArgument node to provide the caller's eager deopt FrameState.
+    for (int i = 0; i < wasm_arity; ++i) {
+      SBXCHECK(node->arg(i).node()->Is<maglev::ProcessWasmArgument>());
+    }
+
     if (!__ data()->TrySetWasmInstanceForInlining(native_module->module(),
                                                   instance_handle)) {
       TRACE_WASM_INLINING(
@@ -1542,8 +1549,8 @@ class GraphBuildingNodeProcessor {
     JSWasmCallParameters* wasm_call_params = nullptr;
 #if V8_ENABLE_WEBASSEMBLY
     SharedFunctionInfoRef shared = node->shared_function_info();
-    Tagged<Code> code = shared.object()->GetCode(isolate_);
-    Tagged<Object> data = shared.object()->GetTrustedData(isolate_);
+    Tagged<Code> code =
+        isolate_->js_dispatch_table().GetCode(node->dispatch_handle());
     // If the code is a JS-to-Wasm wrapper (either the generic builtin or a
     // compiled wrapper), we might be able to inline it.
     bool is_calling_js_to_wasm_wrapper_builtin =
@@ -1552,7 +1559,7 @@ class GraphBuildingNodeProcessor {
     if (v8_flags.wasm_in_js_inlining_wrapper &&
         is_calling_js_to_wasm_wrapper_builtin) {
       Tagged<WasmExportedFunctionData> function_data;
-      if (TryCast(TrustedCast<TrustedObject>(data), &function_data)) {
+      if (TryCast(shared.object()->GetTrustedData(isolate_), &function_data)) {
         Tagged<WasmTrustedInstanceData> instance_data =
             function_data->instance_data();
         wasm::NativeModule* native_module = instance_data->native_module();
@@ -3542,6 +3549,17 @@ class GraphBuildingNodeProcessor {
     }
     return MemoryRepresentation::AnyTagged();
   }
+  // Write barrier kind for tagged stores for which Maglev already established
+  // that no write barrier is needed. With write barrier verification enabled,
+  // such stores are marked as "skipped" rather than as "no barrier", which
+  // makes the backend emit a runtime check.
+  WriteBarrierKind ElidedWriteBarrierKind(MemoryRepresentation mem_repr) {
+    if (!v8_flags.verify_write_barriers ||
+        mem_repr == MemoryRepresentation::TaggedSigned()) {
+      return WriteBarrierKind::kNoWriteBarrier;
+    }
+    return WriteBarrierKind::kSkippedWriteBarrier;
+  }
   WriteBarrierKind WriteBarrierKindFor(MemoryRepresentation mem_repr) {
     if (mem_repr == MemoryRepresentation::TaggedSigned()) {
       return WriteBarrierKind::kNoWriteBarrier;
@@ -3554,11 +3572,11 @@ class GraphBuildingNodeProcessor {
   }
   maglev::ProcessResult Process(maglev::StoreTaggedFieldNoWriteBarrier* node,
                                 const maglev::ProcessingState& state) {
+    MemoryRepresentation mem_repr = TaggedMemoryRepresentation(
+        node->ValueInput().node()->GetStaticType(broker_));
     __ Store(Map(node->ObjectInput()), Map(node->ValueInput()),
-             StoreOp::Kind::TaggedBase(),
-             TaggedMemoryRepresentation(
-                 node->ValueInput().node()->GetStaticType(broker_)),
-             WriteBarrierKind::kNoWriteBarrier, node->offset(),
+             StoreOp::Kind::TaggedBase(), mem_repr,
+             ElidedWriteBarrierKind(mem_repr), node->offset(),
              node->initializing_or_transitioning());
     return maglev::ProcessResult::kContinue;
   }
@@ -3603,7 +3621,8 @@ class GraphBuildingNodeProcessor {
                                 const maglev::ProcessingState& state) {
     __ Store(Map(node->CellInput()), Map(node->ValueInput()),
              StoreOp::Kind::TaggedBase(), MemoryRepresentation::AnyTagged(),
-             WriteBarrierKind::kNoWriteBarrier, node->offset(), false);
+             ElidedWriteBarrierKind(MemoryRepresentation::AnyTagged()),
+             node->offset(), false);
     return maglev::ProcessResult::kContinue;
   }
   maglev::ProcessResult Process(maglev::StoreInt32ContextCell* node,
@@ -3633,10 +3652,11 @@ class GraphBuildingNodeProcessor {
   maglev::ProcessResult Process(
       maglev::StoreFixedArrayElementNoWriteBarrier* node,
       const maglev::ProcessingState& state) {
-    __ StoreFixedArrayElement(Map(node->ElementsInput()),
-                              __ ChangeInt32ToIntPtr(Map(node->IndexInput())),
-                              Map(node->ValueInput()),
-                              WriteBarrierKind::kNoWriteBarrier);
+    __ StoreFixedArrayElement(
+        Map(node->ElementsInput()),
+        __ ChangeInt32ToIntPtr(Map(node->IndexInput())),
+        Map(node->ValueInput()),
+        ElidedWriteBarrierKind(MemoryRepresentation::AnyTagged()));
     return maglev::ProcessResult::kContinue;
   }
   maglev::ProcessResult Process(

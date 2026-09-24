@@ -885,6 +885,10 @@ assert(
     !v8_enable_memory_corruption_api || !is_lsan,
     "The Memory Corruption API cannot be enabled together with LSan as both attach to the d8 process via ptrace")
 
+# ASan sandbox crash filters aren't wired up properly in component builds.
+assert(!v8_enable_memory_corruption_api || !is_component_build,
+       "The Memory Corruption API cannot be enabled in a component build")
+
 assert(!v8_enable_sandbox_hardware_support || v8_enable_sandbox,
        "The sandbox must be enabled to enable sandbox hardware support")
 
@@ -1438,6 +1442,9 @@ config("features") {
   }
   if (v8_enable_temporal_support) {
     defines += [ "V8_TEMPORAL_SUPPORT" ]
+  }
+  if (v8_enable_temporal_systemicu) {
+    defines += [ "V8_ENABLE_TEMPORAL_SYSTEMICU" ]
   }
   if (v8_enable_local_handle_zapping) {
     defines += [ "ENABLE_LOCAL_HANDLE_ZAPPING" ]
@@ -3475,6 +3482,7 @@ generated_file("v8_generate_features_json") {
     v8_enable_hugepage = v8_enable_hugepage
     v8_enable_i18n_support = v8_enable_i18n_support
     v8_enable_temporal_support = v8_enable_temporal_support
+    v8_enable_temporal_systemicu = v8_enable_temporal_systemicu
     v8_enable_javascript_promise_hooks = v8_enable_javascript_promise_hooks
     v8_enable_lite_mode = v8_enable_lite_mode
     v8_enable_map_packing = v8_enable_map_packing
