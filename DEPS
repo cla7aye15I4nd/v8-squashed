@@ -310,15 +310,15 @@ deps = {
     'url': Var('chromium_url') + '/external/github.com/google/benchmark.git' + '@' + '8abf1e701fbd88c8170f48fe0558247e2e5f8e7d',
   },
   'third_party/fuzztest':
-    Var('chromium_url') + '/chromium/src/third_party/fuzztest.git' + '@' + 'd29c05be8dc087806b0d27f07228da5c7e99d8e7',
+    Var('chromium_url') + '/chromium/src/third_party/fuzztest.git' + '@' + '55970ac2863f6b740d3e8247ac0ec48e7acb2113',
   'third_party/fuzztest/src':
-    Var('chromium_url') + '/external/github.com/google/fuzztest.git' + '@' + 'c7efaf2bdfb934e49b515c1db04774480bd6f82c',
+    Var('chromium_url') + '/external/github.com/google/fuzztest.git' + '@' + '7a8e9056de2a4f745082a4b3861a67ada47ced36',
   'third_party/googletest/src':
     Var('chromium_url') + '/external/github.com/google/googletest.git' + '@' + '4fe3307fb2d9f86d19777c7eb0e4809e9694dde7',
   'third_party/highway/src':
     Var('chromium_url') + '/external/github.com/google/highway.git' + '@' + '2607d3b5b0113992fe84d3848859eae13b3b52c1',
   'third_party/icu':
-    Var('chromium_url') + '/chromium/deps/icu.git' + '@' + '6ebb40c594776cc2c21ea14df85a2a89a328b364',
+    Var('chromium_url') + '/chromium/deps/icu.git' + '@' + '5aa526207171ecadf31597f0980a7b7ad8872f33',
   'third_party/instrumented_libs': {
     'url': Var('chromium_url') + '/chromium/third_party/instrumented_libraries.git' + '@' + 'd15c278eed5d38d9acf2d8054cf37baba93cef8e',
     'condition': 'checkout_instrumented_libraries',

@@ -115,25 +115,13 @@ using WasmModule = wasm::WasmModule;
 
 // static
 DirectHandle<WasmModuleObject> WasmModuleObject::New(
-    Isolate* isolate, std::shared_ptr<wasm::NativeModule> native_module,
-    DirectHandle<Script> script) {
-  DirectHandle<CppGCManaged<wasm::NativeModule>> managed_native_module;
-  if (script->type() == Script::Type::kWasm) {
-    managed_native_module = direct_handle(
-        Cast<CppGCManaged<wasm::NativeModule>>(
-            script->wasm_managed_native_module()),
-        isolate);
-  } else {
-    const WasmModule* module = native_module->module();
-    size_t memory_estimate =
-        native_module->committed_code_space() +
-        wasm::WasmCodeManager::EstimateNativeModuleMetaDataSize(module);
-    managed_native_module = CppGCManaged<wasm::NativeModule>::Create(
-        isolate, memory_estimate, std::move(native_module));
-  }
+    Isolate* isolate, DirectHandle<Script> script) {
+  DCHECK_EQ(script->type(), Script::Type::kWasm);
   DirectHandle<WasmModuleObject> module_object = Cast<WasmModuleObject>(
       isolate->factory()->NewJSObject(isolate->wasm_module_constructor()));
-  module_object->set_managed_native_module(*managed_native_module);
+  module_object->set_managed_native_module(
+      Cast<CppGCManaged<wasm::NativeModule>>(
+          script->wasm_managed_native_module()));
   module_object->set_script(*script);
   return module_object;
 }
@@ -642,14 +630,6 @@ void WasmTableObject::UpdateDispatchTable(
 
   SBXCHECK(FunctionSigMatchesTable(sig_id, dispatch_table->table_type()));
 
-  if (v8_flags.wasm_generic_wrapper && IsWasmImportData(*implicit_arg)) {
-    auto import_data = TrustedCast<WasmImportData>(implicit_arg);
-    DirectHandle<WasmImportData> new_import_data =
-        isolate->factory()->NewWasmImportData(import_data);
-    new_import_data->set_call_origin(*dispatch_table);
-    new_import_data->set_table_slot(entry_index);
-    implicit_arg = new_import_data;
-  }
 
   std::optional<std::shared_ptr<wasm::WasmWrapperHandle>> maybe_wrapper =
       target_instance_data->dispatch_table_for_imports()->MaybeGetWrapperHandle(
@@ -1328,11 +1308,6 @@ void ImportedFunctionEntry::SetWasmToWrapper(
       isolate->factory()->NewWasmImportData(callable, suspend,
                                             importing_instance_data_, sig);
 
-  if (!wrapper_handle->has_code()) {
-    import_data->SetIndexInTableAsCallOrigin(
-        importing_instance_data_->dispatch_table_for_imports(), index_);
-  }
-
   DisallowGarbageCollection no_gc;
   Tagged<WasmDispatchTableForImports> dispatch_table =
       importing_instance_data_->dispatch_table_for_imports();
@@ -1573,17 +1548,16 @@ DirectHandle<WasmTrustedInstanceData> WasmTrustedInstanceData::New(
   instance_object->set_module_object(*module_object);
   trusted_data->set_instance_object(*instance_object);
 
-  // Insert the new instance into the scripts weak list of instances. This
+  // Insert the new instance into the script's weak list of instances. This
   // list is used for breakpoints affecting all instances belonging to the
   // script.
-  if (module_object->script()->type() == Script::Type::kWasm) {
-    DirectHandle<WeakArrayList> weak_instance_list(
-        module_object->script()->wasm_weak_instance_list(), isolate);
-    weak_instance_list =
-        WeakArrayList::Append(isolate, weak_instance_list,
-                              MaybeObjectDirectHandle::Weak(instance_object));
-    module_object->script()->set_wasm_weak_instance_list(*weak_instance_list);
-  }
+  DCHECK_EQ(module_object->script()->type(), Script::Type::kWasm);
+  DirectHandle<WeakArrayList> weak_instance_list(
+      module_object->script()->wasm_weak_instance_list(), isolate);
+  weak_instance_list =
+      WeakArrayList::Append(isolate, weak_instance_list,
+                            MaybeObjectDirectHandle::Weak(instance_object));
+  module_object->script()->set_wasm_weak_instance_list(*weak_instance_list);
 
   return trusted_data;
 }
@@ -1854,21 +1828,6 @@ DirectHandle<Code> WasmExportedFunction::GetWrapper(
   DCHECK_EQ(compiled->wrapper(),
             wasm::WasmExportWrapperCache::Get(isolate, sig->index()));
   return compiled;
-}
-
-void WasmImportData::SetIndexInTableAsCallOrigin(
-    Tagged<WasmDispatchTable> table, int entry_index) {
-  set_call_origin(table);
-  set_table_slot(entry_index);
-}
-void WasmImportData::SetIndexInTableAsCallOrigin(
-    Tagged<WasmDispatchTableForImports> table, int entry_index) {
-  set_call_origin(table);
-  set_table_slot(entry_index);
-}
-
-void WasmImportData::SetFuncRefAsCallOrigin(Tagged<WasmInternalFunction> func) {
-  set_call_origin(func);
 }
 
 Address WasmTrustedInstanceData::GetGlobalStorage(
@@ -2593,24 +2552,7 @@ DirectHandle<WasmDispatchTable> WasmDispatchTable::Grow(
   new_table->WriteField<int>(kLengthOffset, new_length);
   for (uint32_t i = 0; i < old_length; ++i) {
     WasmCodePointer call_target = old_table->target(i);
-    // Update any stored call origins, so that future compiled wrappers
-    // get installed into the new dispatch table.
     Tagged<Object> implicit_arg = old_table->implicit_arg(i);
-    if (Is<WasmImportData>(implicit_arg)) {
-      Tagged<WasmImportData> import_data =
-          TrustedCast<WasmImportData>(implicit_arg);
-      // After installing a compiled wrapper, we don't set or update
-      // call origins any more.
-      if (import_data->has_call_origin()) {
-        if (import_data->call_origin() == *old_table) {
-          import_data->set_call_origin(*new_table);
-        } else {
-          DCHECK(v8_flags.wasm_jitless ||
-                 wasm::GetWasmImportWrapperCache()->IsCompiledWrapper(
-                     call_target));
-        }
-      }
-    }
 
     if (implicit_arg == Smi::zero()) {
       DispatchTableClear(*new_table, i, kNewEntry);

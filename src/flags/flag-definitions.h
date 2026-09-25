@@ -2763,14 +2763,6 @@ DEFINE_BOOL(flush_baseline_code, false,
             "flush of baseline code when it has not been executed recently")
 DEFINE_BOOL(flush_bytecode, true,
             "flush of bytecode when it has not been executed recently")
-DEFINE_INT(bytecode_old_age, 6, "number of gcs before we flush code")
-DEFINE_REQUIREMENT(v8_flags.bytecode_old_age >= 0)
-DEFINE_BOOL(flush_code_based_on_time, true,
-            "Use time-base code flushing instead of age.")
-DEFINE_IMPLICATION(flush_code_based_on_time, late_heap_limit_check)
-DEFINE_BOOL(flush_code_based_on_tab_visibility, false,
-            "Flush code when tab goes into the background.")
-DEFINE_IMPLICATION(flush_code_based_on_tab_visibility, late_heap_limit_check)
 DEFINE_INT(bytecode_old_time, 180, "number of seconds before we flush code")
 DEFINE_BOOL(stress_flush_code, false, "stress code flushing")
 DEFINE_WEAK_IMPLICATION(stress_flush_code, flush_baseline_code)
@@ -3253,7 +3245,7 @@ DEFINE_GENERIC_IMPLICATION(
                 v8::tracing::TracingCategoryObserver::ENABLED_BY_NATIVE))
 DEFINE_BOOL_READONLY(fast_map_update, false,
                      "enable fast map update by caching the migration target")
-#define DEFAULT_MAX_POLYMORPHIC_MAP_COUNT 10
+#define DEFAULT_MAX_POLYMORPHIC_MAP_COUNT 4
 DEFINE_INT(max_valid_polymorphic_map_count, DEFAULT_MAX_POLYMORPHIC_MAP_COUNT,
            "maximum number of valid maps to track in POLYMORPHIC state")
 DEFINE_BOOL(
