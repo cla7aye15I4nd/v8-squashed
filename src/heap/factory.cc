@@ -2156,6 +2156,7 @@ DirectHandle<WasmTypeInfo> Factory::NewWasmTypeInfo(
       WasmTypeInfo::SizeFor(actual_supertypes),
       shared ? AllocationType::kSharedOld : AllocationType::kOld, map));
   DisallowGarbageCollection no_gc;
+  SharedObjectConditionalSafePublishGuard publish_guard(result, shared);
   result->set_supertypes_length(actual_supertypes);
   int i = 0;
   if (!opt_parent.is_null()) {
@@ -2379,13 +2380,13 @@ DirectHandle<WasmCapiFunctionData> Factory::NewWasmCapiFunctionData(
 
 Tagged<WasmArray> Factory::NewWasmArrayUninitialized(
     uint32_t length, DirectHandle<Map> map, AllocationType allocation) {
-  DCHECK_LE(length, static_cast<uint32_t>(WasmArray::MaxLength(
-                        WasmArray::DecodeElementSizeFromMap(*map))));
+  int element_size = WasmArray::DecodeElementSizeFromMap(*map);
+  DCHECK_LE(length, static_cast<uint32_t>(WasmArray::MaxLength(element_size)));
   const bool is_shared = allocation == AllocationType::kSharedOld;
-  DCHECK_EQ(is_shared, HeapLayout::InAnySharedSpace(*map));
-  Tagged<HeapObject> raw =
-      AllocateRaw(WasmArray::SizeFor(*map, length), allocation,
-                  is_shared ? kDoubleUnaligned : kTaggedAligned);
+  DCHECK_EQ(is_shared, HeapLayout::InWritableSharedSpace(*map));
+  Tagged<HeapObject> raw = AllocateRaw(
+      WasmArray::SizeFor(element_size, length, SharedFlag{is_shared}),
+      allocation, is_shared ? kDoubleAligned : kTaggedAligned);
   DisallowGarbageCollection no_gc;
   raw->set_map_after_allocation(isolate(), *map);
   Tagged<WasmArray> result = Cast<WasmArray>(raw);

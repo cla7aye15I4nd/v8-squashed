@@ -670,6 +670,7 @@ void LoadOp::PrintOptions(std::ostream& os) const {
     os << ", element size: 2^" << int{element_size_log2};
   }
   if (offset != 0) os << ", offset: " << offset;
+  if (kind.shared_base) os << ", shared_base";
   os << ']';
 }
 
@@ -2176,7 +2177,8 @@ std::ostream& operator<<(std::ostream& os, Simd256UnpackOp::Kind kind) {
 #if V8_ENABLE_WEBASSEMBLY
 
 void WasmAllocateArrayOp::PrintOptions(std::ostream& os) const {
-  os << '[' << array_type->element_type() << ", " << is_shared << ']';
+  os << '[' << array_type->element_type() << ", " << array_type->is_shared()
+     << ']';
 }
 
 void WasmAllocateStructOp::PrintOptions(std::ostream& os) const {
@@ -2220,6 +2222,7 @@ void ArrayGetOp::PrintOptions(std::ostream& os) const {
   } else {
     os << "non-atomic";
   }
+  if (shared_base) os << ", shared-base";
   os << ']';
 }
 

@@ -351,6 +351,7 @@ DEFINE_STRING(icu_datetime_compat_lang, "*",
 DEFINE_BOOL(
     intl_date_time_pattern_generator_cache_eviction, false,
     "enable 9-entry cache eviction in DateTimePatternGeneratorCache")
+DEFINE_BOOL(use_icu4x_normalizer, false, "use ICU4X normalizer")
 #endif
 
 #ifdef V8_ENABLE_DOUBLE_CONST_STORE_CHECK
@@ -560,7 +561,8 @@ DEFINE_BOOL(maglev_inlining, true,
             "enable inlining in the maglev optimizing compiler")
 DEFINE_BOOL(
     maglev_disable_builtin_reducers, false,
-    "disable eager builtin reducers in the maglev graph builder (for testing)")
+    "disable eager builtin reducers in the maglev graph builder to flush out "
+    "production bugs in post-inlining builtin reduction")
 DEFINE_BOOL(maglev_loop_peeling, true,
             "enable loop peeling in the maglev optimizing compiler")
 DEFINE_BOOL(maglev_optimistic_peeled_loops, true,

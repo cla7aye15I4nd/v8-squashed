@@ -619,7 +619,9 @@ V8_OBJECT class V8_EXPORT_PRIVATE WasmTrustedInstanceData
   DECL_ACCESSORS(feedback_vectors, Tagged<FixedArray>)
   DECL_ACCESSORS(well_known_imports, Tagged<FixedArray>)
   DECL_PRIMITIVE_ACCESSORS(memory0_start, uint8_t*)
-  DECL_PRIMITIVE_ACCESSORS(memory0_size, size_t)
+  // For unshared memory, stores the byte size directly. For shared memory,
+  // stores the address of the atomic byte length (std::atomic<size_t>*).
+  DECL_PRIMITIVE_ACCESSORS(memory0_size_or_address, Address)
   DECL_PROTECTED_POINTER_ACCESSORS(managed_native_module,
                                    TrustedManaged<wasm::NativeModule>)
   DECL_PRIMITIVE_ACCESSORS(jump_table_start, Address)
@@ -661,7 +663,7 @@ V8_OBJECT class V8_EXPORT_PRIVATE WasmTrustedInstanceData
   /* Optional padding to align system pointer size fields */              \
   V(kOptionalPaddingOffset, POINTER_SIZE_PADDING(kOptionalPaddingOffset)) \
   V(kMemory0StartOffset, kSystemPointerSize)                              \
-  V(kMemory0SizeOffset, kSizetSize)                                       \
+  V(kMemory0SizeOrAddressOffset, kSystemPointerSize)                      \
   V(kJumpTableStartOffset, kSystemPointerSize)                            \
   /* End of often-accessed fields. */                                     \
   /* Continue with system pointer size fields to maintain alignment. */   \
@@ -767,8 +769,13 @@ V8_OBJECT class V8_EXPORT_PRIVATE WasmTrustedInstanceData
   static_assert(kProtectedFieldOffsets.size() == kProtectedFieldNames.size(),
                 "every protected field offset needs a name");
 
-  void SetRawMemory(uint32_t memory_index, uint8_t* mem_start, size_t mem_size);
-
+  // Sets memory base and size/address for {memory_index}.
+  // For unshared memories, {size_or_address} is the byte length.
+  // For shared memories, it is the Address of the backing store's atomic
+  // byte_length_ (std::atomic<size_t>*). To read the actual byte length,
+  // callers must use memory_size(index).
+  void SetRawMemory(uint32_t memory_index, uint8_t* mem_start,
+                    Address size_or_address);
 
   static DirectHandle<WasmTrustedInstanceData> New(
       Isolate*, DirectHandle<WasmModuleObject>,
@@ -1894,8 +1901,19 @@ V8_OBJECT class WasmArray : public WasmObject {
   inline ObjectSlot ElementSlot(uint32_t index);
   V8_EXPORT_PRIVATE wasm::WasmValue GetElement(uint32_t index);
 
+  // Unshared WasmArrays have a 12-byte header (when kTaggedSize == 4). Shared
+  // WasmArrays are allocated with 8-byte alignment (`kDoubleAligned`, which is
+  // also the only alignment supported by Large Object Space) and pad their
+  // header to a multiple of 8 bytes (`kDoubleSize`, i.e. 16 bytes when
+  // kTaggedSize == 4), so that their elements are 8-byte aligned as required
+  // for atomic 8-byte-wide accesses on some platforms.
+  static constexpr int HeaderSize(SharedFlag is_shared);
+  static inline int HeaderSize(Tagged<Map> map);
+  inline int header_size() const;
+
   static inline int SizeFor(Tagged<Map> map, int length);
-  static constexpr int SizeFor(int element_size, int length);
+  static constexpr int SizeFor(int element_size, int length,
+                               SharedFlag is_shared);
 
   // Returns boxed value of the array's element.
   static inline DirectHandle<Object> GetElement(Isolate* isolate,
@@ -1909,14 +1927,7 @@ V8_OBJECT class WasmArray : public WasmObject {
   inline uint32_t element_offset(uint32_t index);
   inline Address ElementAddress(uint32_t index);
 
-  static constexpr int MaxLength(uint32_t element_size_bytes) {
-    // The total object size must fit into a Smi, for filler objects. To make
-    // the behavior of Wasm programs independent from the Smi configuration,
-    // we hard-code the smaller of the two supported ranges.
-    return RoundDown(
-        (int{SmiTagging<4>::kSmiMaxValue} - kHeaderSize) / element_size_bytes,
-        kTaggedSize);
-  }
+  static constexpr int MaxLength(uint32_t element_size_bytes);
 
   static int MaxLength(const wasm::ArrayType* type) {
     return MaxLength(type->element_type().value_kind_size());
@@ -1930,15 +1941,31 @@ V8_OBJECT class WasmArray : public WasmObject {
 
   class BodyDescriptor;
 
-  static const int kHeaderSize;
-
   uint32_t length_;
 #if TAGGED_SIZE_8_BYTES
   uint32_t optional_padding_;
 #endif
+
+ private:
+  static const int kHeaderSize;  // Use {HeaderSize(...)} instead.
 } V8_OBJECT_END;
 
-inline constexpr int WasmArray::kHeaderSize = sizeof(WasmArray);
+constexpr int WasmArray::HeaderSize(SharedFlag is_shared) {
+  return is_shared ? RoundUp(int{sizeof(WasmArray)}, kDoubleSize)
+                   : sizeof(WasmArray);
+}
+
+constexpr int WasmArray::MaxLength(uint32_t element_size_bytes) {
+  // The total object size must fit into a Smi, for filler objects. To make
+  // the behavior of Wasm programs independent from the Smi configuration,
+  // we hard-code the smaller of the two supported ranges. We use the larger
+  // shared header size so that the maximum length is independent of
+  // sharedness.
+  return RoundDown(
+      (int{SmiTagging<4>::kSmiMaxValue} - HeaderSize(SharedFlag{true})) /
+          element_size_bytes,
+      kTaggedSize);
+}
 
 // The suspender object provides an API to suspend and resume wasm code using
 // promises. See: https://github.com/WebAssembly/js-promise-integration.

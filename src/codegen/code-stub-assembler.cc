@@ -1562,6 +1562,7 @@ void CodeStubAssembler::BranchIfFastIterableToListInterceptor(
     TNode<JSAnyNotSmi> iterable, Label* if_true, Label* if_false) {
   TNode<Map> map = LoadMap(iterable);
   GotoIfNot(HasIndexedInterceptor(map), if_false);
+  GotoIf(IsArrayIteratorProtectorCellInvalid(), if_false);
 
   CSA_DCHECK(this, IsJSInterceptorMap(map));
 
@@ -8537,10 +8538,6 @@ TNode<BoolT> CodeStubAssembler::TaggedIsCode(TNode<Object> object) {
 
 TNode<BoolT> CodeStubAssembler::IsCode(TNode<HeapObject> object) {
   return HasInstanceType(object, CODE_TYPE);
-}
-
-TNode<BoolT> CodeStubAssembler::IsLoadHandler(TNode<HeapObject> object) {
-  return HasInstanceType(object, LOAD_HANDLER_TYPE);
 }
 
 TNode<BoolT> CodeStubAssembler::IsConstructorMap(TNode<Map> map) {

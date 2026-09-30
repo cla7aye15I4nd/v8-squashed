@@ -3316,7 +3316,7 @@ void WasmArray::WasmArrayPrint(std::ostream& os) {
   uint32_t len = length();
   os << "\n - element type: " << element_type.name();
   os << "\n - length: " << len;
-  Address data_ptr = ptr() + WasmArray::kHeaderSize - kHeapObjectTag;
+  Address data_ptr = ElementAddress(0);
   switch (element_type.kind()) {
     case wasm::kI32:
       PrintTypedArrayElements(os, reinterpret_cast<int32_t*>(data_ptr), len,
@@ -3464,7 +3464,7 @@ void WasmTrustedInstanceData::WasmTrustedInstanceDataPrint(std::ostream& os) {
   PRINT_WASM_INSTANCE_FIELD(feedback_vectors, Brief);
   PRINT_WASM_INSTANCE_FIELD(well_known_imports, Brief);
   PRINT_WASM_INSTANCE_FIELD(memory0_start, to_void_ptr);
-  PRINT_WASM_INSTANCE_FIELD(memory0_size, +);
+  PRINT_WASM_INSTANCE_FIELD(memory0_size_or_address, to_void_ptr);
 #if V8_ENABLE_DRUMBRAKE
   PRINT_WASM_INSTANCE_FIELD(imported_function_indices, Brief);
 #endif  // V8_ENABLE_DRUMBRAKE
@@ -3668,6 +3668,13 @@ void PrototypeSharedClosureInfo::PrototypeSharedClosureInfoPrint(
   os << "\n - closure_feedback_cell_array: "
      << Brief(closure_feedback_cell_array());
   os << "\n - context: " << Brief(context());
+  os << '\n';
+}
+
+void UninitializedHeapNumber::UninitializedHeapNumberPrint(std::ostream& os) {
+  PrintHeader(os, "UninitializedHeapNumber");
+  os << "\n - value: ";
+  PrintDouble(os, value());
   os << '\n';
 }
 
@@ -4547,6 +4554,10 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
          << ") preparsed=" << Brief(data->preparse_data()) << ">";
       break;
     }
+
+    case UNINITIALIZED_HEAP_NUMBER_TYPE:
+      os << "<UninitializedHeapNumber>";
+      break;
 
     case SHARED_FUNCTION_INFO_TYPE: {
       Tagged<SharedFunctionInfo> shared = Cast<SharedFunctionInfo>(this);
