@@ -652,11 +652,10 @@ def build_config_content(cpu, icu):
 # Metagen-specific cflags that don't propagate via CcInfo (they're copts on
 # v8_library, not on the `:define_flags` we depend on). Kept tiny on
 # purpose -- everything else comes from the toolchain or CcInfo.
-_METAGEN_USER_COPTS = [
-    "-std=c++20",
-    "-fno-rtti",
-    "-fno-exceptions",
-]
+_METAGEN_USER_COPTS = {
+    "gcc": ["-std=c++20", "-fno-rtti", "-fno-exceptions"],
+    "cl": ["/std:c++20", "/GR-", "/EHs-c-"],
+}
 
 def _run_metagen_impl(ctx):
     v8root = ctx.label.workspace_root
@@ -687,6 +686,10 @@ def _run_metagen_impl(ctx):
         requested_features = ctx.features,
         unsupported_features = ctx.disabled_features + ["module_maps"],
     )
+    driver_mode = (ctx.attr.driver_mode_flag[FlagInfo].value or
+                   ctx.attr.default_driver_mode)
+    if driver_mode not in _METAGEN_USER_COPTS:
+        fail("v8_metagen_driver_mode must be 'gcc' or 'cl', got %r" % driver_mode)
 
     # -I dirs for the generated headers (torque, bytecode_builtins).
     # None of these live in a cc_library CcInfo so they're added directly.
@@ -702,7 +705,7 @@ def _run_metagen_impl(ctx):
         feature_configuration = feature_configuration,
         cc_toolchain = cc_toolchain,
         source_file = "tools/metagen/probe.cc",
-        user_compile_flags = _METAGEN_USER_COPTS,
+        user_compile_flags = _METAGEN_USER_COPTS[driver_mode],
         include_directories = cc_context.includes,
         quote_include_directories = depset(
             extra_quote_includes,
@@ -748,6 +751,7 @@ def _run_metagen_impl(ctx):
     args = ctx.actions.args()
     args.add("--v8-root", v8root)
     args.add("--compile-commands", compile_db.path)
+    args.add("--driver-mode", driver_mode)
     args.add("--driver", ctx.file.driver.path)
     args.add("--out", out_dir)
     args.add("--enable-layout")
@@ -852,6 +856,8 @@ _run_metagen = rule(
     implementation = _run_metagen_impl,
     attrs = {
         "prefix": attr.string(mandatory = True),
+        "default_driver_mode": attr.string(mandatory = True),
+        "driver_mode_flag": attr.label(providers = [FlagInfo], mandatory = True),
         # The checked-in C++ driver, passed straight through as --driver. Its
         # direct includes are staged by extra_sandbox_files, not by this attr.
         "driver": attr.label(allow_single_file = True, mandatory = True),
@@ -907,7 +913,7 @@ _run_metagen = rule(
     toolchains = use_cc_toolchain(),
 )
 
-def run_metagen(name, driver,
+def run_metagen(name, driver, default_driver_mode, driver_mode_flag,
                 python_srcs, tool,
                 cc_compilation_context_from,
                 clang_builtin_headers,
@@ -928,6 +934,10 @@ def run_metagen(name, driver,
     Pass either `libclang_files` (the bundled llvm-libclang package) or
     `libclang_from_python_env = True` (bindings supplied through `tool`'s
     Python deps) -- exactly one, enforced by the rule.
+
+    `default_driver_mode` follows the target OS. The `driver_mode_flag`
+    overrides it for toolchains that use a different flag syntax, such as
+    MinGW or clang-cl cross builds.
     """
     for prefix in ("noicu", "icu"):
         is_icu = prefix == "icu"
@@ -935,6 +945,8 @@ def run_metagen(name, driver,
             name = prefix + "/" + name,
             prefix = prefix,
             driver = driver,
+            default_driver_mode = default_driver_mode,
+            driver_mode_flag = driver_mode_flag,
             libclang_files = libclang_files,
             libclang_from_python_env = libclang_from_python_env,
             clang_builtin_headers = clang_builtin_headers,

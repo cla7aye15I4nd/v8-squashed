@@ -230,8 +230,8 @@ void LiftoffAssembler::PrepareTailCall(int num_callee_stack_params,
 }
 
 void LiftoffAssembler::AlignFrameSize() {
-  int alignment = v8_flags.enforce_x64_16byte_alignment ? 2 * kSystemPointerSize
-                                                        : kSystemPointerSize;
+  int alignment = V8_X64_16BYTE_STACK_ALIGNMENT_BOOL ? 2 * kSystemPointerSize
+                                                     : kSystemPointerSize;
   max_used_spill_offset_ = RoundUp(max_used_spill_offset_, alignment);
 }
 
@@ -247,8 +247,9 @@ void LiftoffAssembler::PatchPrepareStackFrame(
     frame_size -= kSystemPointerSize;
   }
   DCHECK_EQ(0, frame_size % kSystemPointerSize);
-  DCHECK_IMPLIES(v8_flags.enforce_x64_16byte_alignment,
-                 GetTotalFrameSize() % (2 * kSystemPointerSize) == 0);
+#if V8_X64_16BYTE_STACK_ALIGNMENT
+  DCHECK_EQ(0, GetTotalFrameSize() % (2 * kSystemPointerSize));
+#endif
 
   // We can't run out of space when patching, just pass anything big enough to
   // not cause the assembler to try to grow the buffer.
@@ -4701,13 +4702,8 @@ void LiftoffAssembler::emit_f64x2_qfms(LiftoffRegister dst,
 
 bool LiftoffAssembler::emit_f16x8_splat(LiftoffRegister dst,
                                         LiftoffRegister src) {
-  if (!CpuFeatures::IsSupported(F16C) || !CpuFeatures::IsSupported(AVX2)) {
-    return false;
-  }
-  CpuFeatureScope f16c_scope(this, F16C);
-  CpuFeatureScope avx2_scope(this, AVX2);
-  vcvtps2ph(dst.fp(), src.fp(), 0);
-  vpbroadcastw(dst.fp(), dst.fp());
+  if (!CpuFeatures::IsSupported(F16C)) return false;
+  F16x8Splat(dst.fp(), src.fp());
   return true;
 }
 
@@ -4833,16 +4829,12 @@ bool LiftoffAssembler::emit_f16x8_nearest_int(LiftoffRegister dst,
 template <void (Assembler::*avx_op)(YMMRegister, YMMRegister, YMMRegister)>
 bool F16x8CmpOpViaF32(LiftoffAssembler* assm, LiftoffRegister dst,
                       LiftoffRegister lhs, LiftoffRegister rhs) {
-  if (!CpuFeatures::IsSupported(F16C) || !CpuFeatures::IsSupported(AVX) ||
-      !CpuFeatures::IsSupported(AVX2)) {
-    return false;
-  }
+  if (!CpuFeatures::IsSupported(F16C)) return false;
   CpuFeatureScope f16c_scope(assm, F16C);
   CpuFeatureScope avx_scope(assm, AVX);
-  CpuFeatureScope avx2_scope(assm, AVX2);
   YMMRegister ydst = YMMRegister::from_code(dst.fp().code());
-  assm->vcvtph2ps(ydst, lhs.fp());
   assm->vcvtph2ps(kScratchSimd256Reg, rhs.fp());
+  assm->vcvtph2ps(ydst, lhs.fp());
   (assm->*avx_op)(ydst, ydst, kScratchSimd256Reg);
   assm->vextractf128(kScratchDoubleReg, ydst, 1);
   assm->vpackssdw(dst.fp(), dst.fp(), kScratchDoubleReg);
@@ -4912,9 +4904,7 @@ bool LiftoffAssembler::emit_f16x8_div(LiftoffRegister dst, LiftoffRegister lhs,
 
 bool LiftoffAssembler::emit_f16x8_min(LiftoffRegister dst, LiftoffRegister lhs,
                                       LiftoffRegister rhs) {
-  if (!CpuFeatures::IsSupported(F16C) || !CpuFeatures::IsSupported(AVX2)) {
-    return false;
-  }
+  if (!CpuFeatures::IsSupported(F16C)) return false;
   static constexpr RegClass res_rc = reg_class_for(kS128);
   LiftoffRegister tmp =
       GetUnusedRegister(res_rc, LiftoffRegList{dst, lhs, rhs});
@@ -4926,9 +4916,7 @@ bool LiftoffAssembler::emit_f16x8_min(LiftoffRegister dst, LiftoffRegister lhs,
 
 bool LiftoffAssembler::emit_f16x8_max(LiftoffRegister dst, LiftoffRegister lhs,
                                       LiftoffRegister rhs) {
-  if (!CpuFeatures::IsSupported(F16C) || !CpuFeatures::IsSupported(AVX2)) {
-    return false;
-  }
+  if (!CpuFeatures::IsSupported(F16C)) return false;
   static constexpr RegClass res_rc = reg_class_for(kS128);
   LiftoffRegister tmp =
       GetUnusedRegister(res_rc, LiftoffRegList{dst, lhs, rhs});
@@ -4952,14 +4940,7 @@ bool LiftoffAssembler::emit_f16x8_pmax(LiftoffRegister dst, LiftoffRegister lhs,
 
 bool LiftoffAssembler::emit_i16x8_sconvert_f16x8(LiftoffRegister dst,
                                                  LiftoffRegister src) {
-  if (!CpuFeatures::IsSupported(F16C) || !CpuFeatures::IsSupported(AVX) ||
-      !CpuFeatures::IsSupported(AVX2)) {
-    return false;
-  }
-
-  CpuFeatureScope f16c_scope(this, F16C);
-  CpuFeatureScope avx_scope(this, AVX);
-  CpuFeatureScope avx2_scope(this, AVX2);
+  if (!CpuFeatures::IsSupported(F16C)) return false;
 
   YMMRegister ydst = YMMRegister::from_code(dst.fp().code());
   I16x8SConvertF16x8(ydst, src.fp(), kScratchSimd256Reg, kScratchRegister);
@@ -4968,14 +4949,7 @@ bool LiftoffAssembler::emit_i16x8_sconvert_f16x8(LiftoffRegister dst,
 
 bool LiftoffAssembler::emit_i16x8_uconvert_f16x8(LiftoffRegister dst,
                                                  LiftoffRegister src) {
-  if (!CpuFeatures::IsSupported(F16C) || !CpuFeatures::IsSupported(AVX) ||
-      !CpuFeatures::IsSupported(AVX2)) {
-    return false;
-  }
-
-  CpuFeatureScope f16c_scope(this, F16C);
-  CpuFeatureScope avx_scope(this, AVX);
-  CpuFeatureScope avx2_scope(this, AVX2);
+  if (!CpuFeatures::IsSupported(F16C)) return false;
 
   YMMRegister ydst = YMMRegister::from_code(dst.fp().code());
   I16x8TruncF16x8U(ydst, src.fp(), kScratchSimd256Reg);
@@ -4984,35 +4958,17 @@ bool LiftoffAssembler::emit_i16x8_uconvert_f16x8(LiftoffRegister dst,
 
 bool LiftoffAssembler::emit_f16x8_sconvert_i16x8(LiftoffRegister dst,
                                                  LiftoffRegister src) {
-  if (!CpuFeatures::IsSupported(F16C) || !CpuFeatures::IsSupported(AVX) ||
-      !CpuFeatures::IsSupported(AVX2)) {
-    return false;
-  }
+  if (!CpuFeatures::IsSupported(F16C)) return false;
 
-  CpuFeatureScope f16c_scope(this, F16C);
-  CpuFeatureScope avx_scope(this, AVX);
-  CpuFeatureScope avx2_scope(this, AVX2);
-  YMMRegister ydst = YMMRegister::from_code(dst.fp().code());
-  vpmovsxwd(ydst, src.fp());
-  vcvtdq2ps(ydst, ydst);
-  vcvtps2ph(dst.fp(), ydst, 0);
+  F16x8SConvertI16x8(dst.fp(), src.fp(), kScratchSimd256Reg);
   return true;
 }
 
 bool LiftoffAssembler::emit_f16x8_uconvert_i16x8(LiftoffRegister dst,
                                                  LiftoffRegister src) {
-  if (!CpuFeatures::IsSupported(F16C) || !CpuFeatures::IsSupported(AVX) ||
-      !CpuFeatures::IsSupported(AVX2)) {
-    return false;
-  }
+  if (!CpuFeatures::IsSupported(F16C)) return false;
 
-  CpuFeatureScope f16c_scope(this, F16C);
-  CpuFeatureScope avx_scope(this, AVX);
-  CpuFeatureScope avx2_scope(this, AVX2);
-  YMMRegister ydst = YMMRegister::from_code(dst.fp().code());
-  vpmovzxwd(ydst, src.fp());
-  vcvtdq2ps(ydst, ydst);
-  vcvtps2ph(dst.fp(), ydst, 0);
+  F16x8UConvertI16x8(dst.fp(), src.fp(), kScratchSimd256Reg);
   return true;
 }
 
@@ -5022,8 +4978,7 @@ bool LiftoffAssembler::emit_f16x8_demote_f32x4_zero(LiftoffRegister dst,
     return false;
   }
   CpuFeatureScope f16c_scope(this, F16C);
-  YMMRegister ysrc = YMMRegister::from_code(src.fp().code());
-  vcvtps2ph(dst.fp(), ysrc, 0);
+  vcvtps2ph(dst.fp(), src.fp(), 0);
   return true;
 }
 
@@ -5065,8 +5020,7 @@ bool LiftoffAssembler::emit_f32x4_promote_low_f16x8(LiftoffRegister dst,
     return false;
   }
   CpuFeatureScope f16c_scope(this, F16C);
-  YMMRegister ydst = YMMRegister::from_code(dst.fp().code());
-  vcvtph2ps(ydst, src.fp());
+  vcvtph2ps(dst.fp(), src.fp());
   return true;
 }
 
@@ -5074,9 +5028,7 @@ bool LiftoffAssembler::emit_f16x8_qfma(LiftoffRegister dst,
                                        LiftoffRegister src1,
                                        LiftoffRegister src2,
                                        LiftoffRegister src3) {
-  if (!CpuFeatures::IsSupported(F16C) || !CpuFeatures::IsSupported(FMA3)) {
-    return false;
-  }
+  if (!CpuFeatures::IsSupported(F16C)) return false;
 
   YMMRegister ydst = YMMRegister::from_code(dst.fp().code());
   YMMRegister tmp = YMMRegister::from_code(kScratchDoubleReg.code());
@@ -5089,9 +5041,7 @@ bool LiftoffAssembler::emit_f16x8_qfms(LiftoffRegister dst,
                                        LiftoffRegister src1,
                                        LiftoffRegister src2,
                                        LiftoffRegister src3) {
-  if (!CpuFeatures::IsSupported(F16C) || !CpuFeatures::IsSupported(FMA3)) {
-    return false;
-  }
+  if (!CpuFeatures::IsSupported(F16C)) return false;
 
   YMMRegister ydst = YMMRegister::from_code(dst.fp().code());
   YMMRegister tmp = YMMRegister::from_code(kScratchDoubleReg.code());

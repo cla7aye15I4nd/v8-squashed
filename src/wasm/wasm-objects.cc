@@ -901,11 +901,13 @@ void WasmMemoryObject::UseInInstance(
   SetInstanceMemory(*trusted_instance_data, memory->array_buffer(),
                     memory->backing_store().as_shared_ptr(),
                     memory_index_in_instance);
-  DirectHandle<WeakArrayList> instances{memory->instances(), isolate};
-  auto weak_instance_object = MaybeObjectDirectHandle::Weak(
-      trusted_instance_data->instance_object(), isolate);
-  instances = WeakArrayList::Append(isolate, instances, weak_instance_object);
-  memory->set_instances(*instances);
+  if (!memory->backing_store()->is_shared()) {
+    DirectHandle<WeakArrayList> instances{memory->instances(), isolate};
+    auto weak_instance_object = MaybeObjectDirectHandle::Weak(
+        trusted_instance_data->instance_object(), isolate);
+    instances = WeakArrayList::Append(isolate, instances, weak_instance_object);
+    memory->set_instances(*instances);
+  }
 }
 
 // static
@@ -943,6 +945,7 @@ void WasmMemoryObject::SetNewBuffer(Isolate* isolate,
 
 void WasmMemoryObject::UpdateInstances(Isolate* isolate) {
   DisallowGarbageCollection no_gc;
+  DCHECK(!backing_store()->is_shared());
   Tagged<WeakArrayList> instances = this->instances();
   const uint32_t instances_len = instances->length().value();
   for (uint32_t i = 0; i < instances_len; ++i) {
@@ -1050,7 +1053,7 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
   // {BackingStore::CopyWasmMemory}, and is irrelevant for
   // {GrowWasmMemoryInPlace} because memory is never allocated with more
   // capacity than that limit.
-  size_t old_size = backing_store->byte_length();
+  size_t old_size = backing_store->byte_length(std::memory_order_seq_cst);
   DCHECK_EQ(0, old_size % wasm::kWasmPageSize);
   size_t old_pages = old_size / wasm::kWasmPageSize;
   size_t max_pages = memory_object->is_memory64() ? wasm::max_mem64_pages()
@@ -1065,12 +1068,14 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
   const bool must_grow_in_place =
       backing_store->is_shared() || backing_store->has_guard_regions() ||
       backing_store->is_resizable_by_js() || pages == 0;
-  // Disallow growing relocatable (movable) memories during API interrupts
-  // (such as inspector pauses or debugger stepping). Growing and relocating
-  // the memory backing store at this point would invalidate cached memory
-  // base pointers in compiled loop code, leading to a Use-after-Free (or
-  // requiring costly reloads if we would chose to allow growing).
-  if (isolate->is_executing_api_interrupt() && !must_grow_in_place) {
+  // Disallow growing unshared memories during API interrupts (such as
+  // inspector pauses or debugger stepping). Growing and relocating the memory
+  // backing store at this point would invalidate cached memory base pointers in
+  // compiled loop code, leading to a Use-after-Free, and even in-place growth
+  // of unshared memories would invalidate cached memory sizes in compiled loop
+  // code.
+  if (isolate->is_executing_api_interrupt() && !backing_store->is_shared() &&
+      pages != 0) {
     return -1;
   }
   const bool try_grow_in_place =
