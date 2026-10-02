@@ -30,7 +30,6 @@
 #include "src/parsing/scanner.h"
 #include "src/parsing/token.h"
 #include "src/regexp/regexp.h"
-#include "src/zone/zone-chunk-list.h"
 
 namespace v8::internal {
 
@@ -6444,7 +6443,7 @@ typename ParserBase<Impl>::StatementT ParserBase<Impl>::ParseSwitchStatement(
 
   {
     BlockState cases_block_state(zone(), &scope_);
-    scope()->set_start_position(switch_pos);
+    scope()->set_start_position(peek_position());
     scope()->SetNonlinear();
     Target target(this, switch_statement, labels, nullptr,
                   Target::TARGET_FOR_ANONYMOUS);

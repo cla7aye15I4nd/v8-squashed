@@ -5070,7 +5070,6 @@ v8_header_set("v8_internal_headers") {
     "src/zone/accounting-allocator.h",
     "src/zone/type-stats.h",
     "src/zone/zone-allocator.h",
-    "src/zone/zone-chunk-list.h",
     "src/zone/zone-compact-set.h",
     "src/zone/zone-containers.h",
     "src/zone/zone-hashmap.h",
@@ -5172,6 +5171,7 @@ v8_header_set("v8_internal_headers") {
       "src/maglev/maglev-reducer-inl.h",
       "src/maglev/maglev-reducer.h",
       "src/maglev/maglev-regalloc-data.h",
+      "src/maglev/maglev-regalloc-node-info.h",
       "src/maglev/maglev-regalloc.h",
       "src/maglev/maglev-register-frame-array.h",
       "src/maglev/maglev-tracer.h",
@@ -9371,6 +9371,15 @@ if (!build_with_chromium && v8_use_perfetto) {
 }  # if (!build_with_chromium && v8_use_perfetto)
 
 if (v8_fuzzilli) {
+  # The inline flag stores of -fsanitize-coverage=inline-bool-flag cannot
+  # temporarily grant access to the default pkey like the trace-pc-guard
+  # callback does (see src/fuzzilli/cov.cc).
+  assert(!v8_enable_sandbox_hardware_support ||
+             string_replace(sanitizer_coverage_flags, "inline-bool-flag", "") ==
+                 sanitizer_coverage_flags,
+         "inline-bool-flag coverage is not supported with sandbox hardware " +
+             "support, use trace-pc-guard instead")
+
   v8_source_set("fuzzilli_cov") {
     visibility = [ "*" ]
     sources = [
