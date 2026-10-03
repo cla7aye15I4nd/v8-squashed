@@ -7045,6 +7045,7 @@ bool Shell::SetOptions(int argc, char* argv[]) {
   i::v8_flags.flag_processing_mode = "abort-on-error";
   options.d8_path = argv[0];
   bool disallow_unsafe_flags = false;
+  bool disallow_developer_only_features = false;
   bool flag_processing_mode_explicitly_set = false;
   for (int i = 0; i < argc; i++) {
     char* flag_value = nullptr;
@@ -7074,15 +7075,23 @@ bool Shell::SetOptions(int argc, char* argv[]) {
           exit_on_flag_contradictions = false;
         }
       }
+      // LINT.IfChange(FuzzingImplications)
     } else if (FlagMatches("--fuzzing", &argv[i], KeepFlag{true}) ||
-               FlagMatches("--sandbox-fuzzing", &argv[i], KeepFlag{true})) {
-      // Set v8_flags.fuzzing early because this is tested in some locations to
-      // decide how to handle conflicting flags (it would later be set by
-      // implications but we need it being set earlier).
+               FlagMatches("--sandbox-fuzzing", &argv[i], KeepFlag{true}) ||
+               FlagMatches("--sandbox-trap-fuzzing", &argv[i],
+                           KeepFlag{true}) ||
+               FlagMatches("--allow-natives-for-differential-fuzzing", &argv[i],
+                           KeepFlag{true})) {
+      // Match --fuzzing and all V8 flags that imply --fuzzing. V8 flag
+      // implications are only processed later in V8::Initialize(), so we need
+      // to manually mirror those implications (including --fuzzing implying
+      // --disallow-unsafe-flags) here for d8 option processing.
       i::v8_flags.fuzzing = true;
+      disallow_unsafe_flags = true;
       if (!flag_processing_mode_explicitly_set) {
         check_d8_flag_contradictions = false;
       }
+      // LINT.ThenChange(/src/flags/flag-definitions.h:FuzzingImplications)
     } else if (FlagMatches("--run-as-security-poc", &argv[i], KeepFlag{true}) ||
                FlagMatches("--run-as-sandbox-security-poc", &argv[i],
                            KeepFlag{true})) {
@@ -7096,6 +7105,7 @@ bool Shell::SetOptions(int argc, char* argv[]) {
       // Flag implications are only processed much later, so we need to manually
       // establish this link here.
       disallow_unsafe_flags = true;
+      disallow_developer_only_features = true;
       static constexpr char kFlagProcessingMode[] =
           "--flag-processing-mode=exit-on-error";
       i::FlagList::SetFlagsFromString(kFlagProcessingMode,
@@ -7110,6 +7120,9 @@ bool Shell::SetOptions(int argc, char* argv[]) {
     } else if (FlagMatches("--disallow-unsafe-flags", &argv[i],
                            KeepFlag{true})) {
       disallow_unsafe_flags = true;
+    } else if (FlagMatches("--disallow-developer-only-features", &argv[i],
+                           KeepFlag{true})) {
+      disallow_developer_only_features = true;
     } else if (FlagMatches("--version", &argv[i])) {
       printf("V8 version %s\n", V8::GetVersion());
       base::OS::ExitProcess(0);
@@ -7246,7 +7259,13 @@ bool Shell::SetOptions(int argc, char* argv[]) {
       options.quiet_load = true;
     } else if (FlagWithArgMatches("--thread-pool-size", &flag_value, argc, argv,
                                   &i)) {
-      options.thread_pool_size = atoi(flag_value);
+      int requested_size = atoi(flag_value);
+      int clamped_size = std::clamp(requested_size, 0, 16);
+      if (clamped_size != requested_size) {
+        printf("Warning: clamping --thread-pool-size from %d to %d\n",
+               requested_size, clamped_size);
+      }
+      options.thread_pool_size = clamped_size;
     } else if (FlagMatches("--no-can-block", &argv[i])) {
       options.can_block = false;
     } else if (FlagMatches("--stress-delay-tasks", &argv[i])) {
@@ -7318,16 +7337,21 @@ bool Shell::SetOptions(int argc, char* argv[]) {
   DCHECK(options.num_isolates);
 
   if (disallow_unsafe_flags) {
-    const auto check_flag_is_not_specified =
-        [&]<typename T>(const ShellOptions::DisallowReassignment<T>& flag) {
-          if (!flag.WasSpecified()) {
-            return;
-          }
-          ReportFlagError(
-              "Command-line provided flag --%s is prohibited by "
-              "--disallow-unsafe-flags",
-              flag.name());
-        };  // NOLINT(readability/braces)
+    const auto check_flag_is_not_specified = [&](auto& flag) {
+      if (!flag.WasSpecified()) return;
+      if (check_d8_flag_contradictions) {
+        ReportFlagError(
+            "Command-line provided flag --%s is prohibited by "
+            "--disallow-unsafe-flags",
+            flag.name());
+      } else {
+        printf(
+            "Warning: resetting d8 flag --%s due to "
+            "--disallow-unsafe-flags\n",
+            flag.name());
+        flag.Reset();
+      }
+    };
     // The --disallow-unsafe-flags is meant to block known unsafe configurations
     // and mitigate spurious reports due invalid flag combinations/values. To
     // prevent AI agents and/or fuzzers from using a new unsafe flag, add it to
@@ -7335,22 +7359,40 @@ bool Shell::SetOptions(int argc, char* argv[]) {
     check_flag_is_not_specified(options.trace_enabled);
     check_flag_is_not_specified(options.trace_config);
     check_flag_is_not_specified(options.trace_path);
-    // Inspector security bugs must be shown through the embedder (i.e. Chrome,
-    // or content_shell).
-    check_flag_is_not_specified(options.enable_inspector);
     check_flag_is_not_specified(options.lcov_file);
     check_flag_is_not_specified(options.simulate_errors);
     check_flag_is_not_specified(options.enable_os_system);
     check_flag_is_not_specified(options.snapshot_blob);
-    check_flag_is_not_specified(options.thread_pool_size);
-    check_flag_is_not_specified(options.thread_pool_size);
-    check_flag_is_not_specified(options.dump_counters);
-    check_flag_is_not_specified(options.dump_counters_nvp);
 #ifdef V8_OS_LINUX
     check_flag_is_not_specified(options.perf_ctl_fd);
     check_flag_is_not_specified(options.perf_ack_fd);
     check_flag_is_not_specified(options.scope_linux_perf_to_mark_measure);
 #endif
+  }
+
+  if (disallow_developer_only_features) {
+    const auto check_developer_only_flag = [&](auto& flag) {
+      if (!flag.WasSpecified()) return;
+      if (check_d8_flag_contradictions) {
+        ReportFlagError(
+            "Command-line provided flag --%s is prohibited by "
+            "--disallow-developer-only-features",
+            flag.name());
+      } else {
+        printf(
+            "Warning: resetting d8 flag --%s due to "
+            "--disallow-developer-only-features\n",
+            flag.name());
+        flag.Reset();
+      }
+    };
+    // Inspector security bugs must be shown through the embedder (i.e. Chrome,
+    // or content_shell).
+    check_developer_only_flag(options.enable_inspector);
+    // Forbid some d8-only developer-only flags.
+    check_developer_only_flag(options.dump_counters);
+    check_developer_only_flag(options.dump_counters_nvp);
+    check_developer_only_flag(options.dump_system_memory_stats);
   }
 
 #ifdef V8_OS_LINUX
