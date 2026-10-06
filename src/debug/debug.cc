@@ -1044,7 +1044,6 @@ bool Debug::SetBreakPointForScript(Handle<Script> script,
       isolate_->factory()->NewBreakPoint(*id, condition);
 #if V8_ENABLE_WEBASSEMBLY
   if (script->type() == Script::Type::kWasm) {
-    RecordWasmScriptWithBreakpoints(script);
     return WasmScript::SetBreakPoint(script, source_position, break_point);
   }
 #endif  //  V8_ENABLE_WEBASSEMBLY
@@ -1207,7 +1206,6 @@ void Debug::SetInstrumentationBreakpointForWasmScript(
 
   DirectHandle<BreakPoint> break_point = isolate_->factory()->NewBreakPoint(
       *id, isolate_->factory()->empty_string());
-  RecordWasmScriptWithBreakpoints(script);
   WasmScript::SetInstrumentationBreakpoint(script, break_point);
 }
 
@@ -2697,7 +2695,15 @@ void Debug::OnDebugBreak(DirectHandle<FixedArray> break_points_hit,
   HandleScope scope(isolate_);
   DisableBreak no_recursive_break(this);
 
-  if ((lastStepAction == StepAction::StepOver ||
+  // The skip list only applies to stepping. Breakpoints, debugger statements
+  // and scheduled pauses must never be skipped. Note that kStep is only added
+  // to {break_reasons} below, so we can't check for it here.
+  const bool is_pure_step_break =
+      break_points_hit->ulength().value() == 0 &&
+      !break_reasons.contains(debug::BreakReason::kDebuggerStatement) &&
+      !break_reasons.contains(debug::BreakReason::kScheduled);
+  if (is_pure_step_break &&
+      (lastStepAction == StepAction::StepOver ||
        lastStepAction == StepAction::StepInto) &&
       ShouldBeSkipped()) {
     PrepareStep(lastStepAction);

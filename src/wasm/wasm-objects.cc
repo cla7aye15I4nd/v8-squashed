@@ -13,6 +13,7 @@
 #undef MAP_TYPE
 #endif  // V8_TARGET_OS_LINUX
 
+#include <bit>
 #include <optional>
 
 #include "src/base/iterator.h"
@@ -960,7 +961,8 @@ void WasmMemoryObject::SetNewBuffer(Isolate* isolate,
 
 void WasmMemoryObject::UpdateInstances(Isolate* isolate) {
   DisallowGarbageCollection no_gc;
-  SBXCHECK(!backing_store()->is_shared());
+  // SetInstanceMemory has an SBXCHECK for this later.
+  DCHECK(!backing_store()->is_shared());
   Tagged<WeakArrayList> instances = this->instances();
   const uint32_t instances_len = instances->length().value();
   for (uint32_t i = 0; i < instances_len; ++i) {
@@ -1113,21 +1115,23 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
   if (backing_store->is_shared()) {
     DCHECK(result_inplace.has_value());
     backing_store->BroadcastSharedWasmMemoryGrow(isolate);
-    if (has_old_buffer && !maybe_old_buffer->is_resizable_by_js() &&
-        pages > 0) {
-      // Independent of potential concurrent grows in other threads: After we
-      // grew the shared memory, broadcasting should have reset the ArrayBuffer
-      // so we reallocate it on the next access to the `buffer` property of the
-      // Wasm memory.
-      CHECK(IsUndefined(memory_object->array_buffer()));
+    if (pages > 0) {
+      if (has_old_buffer && !maybe_old_buffer->is_resizable_by_js()) {
+        // Independent of potential concurrent grows in other threads: After we
+        // grew the shared memory, broadcasting should have reset the
+        // ArrayBuffer so we reallocate it on the next access to the `buffer`
+        // property of the Wasm memory.
+        CHECK(IsUndefined(memory_object->array_buffer()));
+      }
+      // Report the grown memory size rounded up to the next power of two to
+      // avoid triggering too many GCs when growing memory in a loop.
+      memory_object->managed_backing_store()->UpdateEstimatedSize(
+          std::bit_ceil(backing_store->byte_length()), isolate);
     }
     // As {old_pages} was read racefully, we return here the synchronized
     // value provided by {GrowWasmMemoryInPlace}, to provide the atomic
     // read-modify-write behavior required by the spec.
-    uint32_t result = static_cast<int32_t>(result_inplace.value());
-    memory_object->managed_backing_store()->UpdateEstimatedSize(
-        backing_store->byte_length(), isolate);
-    return result;  // success
+    return static_cast<int32_t>(result_inplace.value());  // success
   }
 
   size_t new_pages = old_pages + pages;
@@ -1144,8 +1148,12 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
     }
     memory_object->UpdateInstances(isolate);
     DCHECK_EQ(result_inplace.value(), old_pages);
-    memory_object->managed_backing_store()->UpdateEstimatedSize(
-        backing_store->byte_length(), isolate);
+    if (pages > 0) {
+      // Report the grown memory size rounded up to the next power of two to
+      // avoid triggering too many GCs when growing memory in a loop.
+      memory_object->managed_backing_store()->UpdateEstimatedSize(
+          std::bit_ceil(backing_store->byte_length()), isolate);
+    }
     return static_cast<int32_t>(result_inplace.value());  // success
   }
   DCHECK(!has_old_buffer || !maybe_old_buffer->is_resizable_by_js());
@@ -1181,8 +1189,10 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
 
   DCHECK_EQ(backing_store.raw(), memory_object->backing_store().raw());
   size_t new_byte_length = new_backing_store->byte_length();
+  // Report the grown memory size rounded up to the next power of two to avoid
+  // triggering too many GCs when growing memory in a loop.
   memory_object->managed_backing_store()->SetManagedObject(
-      std::move(new_backing_store), isolate, new_byte_length);
+      std::move(new_backing_store), isolate, std::bit_ceil(new_byte_length));
 
   if (has_old_buffer) {
     JSArrayBuffer::Detach(maybe_old_buffer, true).Check();

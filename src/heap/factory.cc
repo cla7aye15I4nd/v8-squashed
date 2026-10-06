@@ -5,13 +5,13 @@
 #include "src/heap/factory.h"
 
 #include <algorithm>  // For copy
+#include <bit>
 #include <memory>     // For shared_ptr<>
 #include <optional>
 #include <string>
 #include <utility>  // For move
 
 #include "src/ast/ast-source-ranges.h"
-#include "src/base/bits.h"
 #include "src/base/strong-alias.h"
 #include "src/builtins/accessors.h"
 #include "src/builtins/builtins-promise.h"
@@ -693,8 +693,7 @@ Handle<T> Factory::AllocateSmallOrderedHashTable(DirectHandle<Map> map,
   // to something other than 2, capacity should be stored as another
   // field of this object.
   DCHECK_EQ(T::kLoadFactor, 2);
-  capacity =
-      base::bits::RoundUpToPowerOfTwo32(std::max({T::kMinCapacity, capacity}));
+  capacity = std::bit_ceil<uint32_t>(std::max({T::kMinCapacity, capacity}));
   capacity = std::min({capacity, T::kMaxCapacity});
 
   DCHECK_LT(0, capacity);
@@ -2209,9 +2208,7 @@ DirectHandle<WasmInternalFunction> Factory::NewWasmInternalFunction(
 
   DisallowGarbageCollection no_gc;
   internal->set_call_target(call_target);
-  DCHECK(IsWasmTrustedInstanceData(*implicit_arg) ||
-         IsWasmImportData(*implicit_arg));
-  internal->set_implicit_arg(*implicit_arg);
+  internal->set_implicit_arg(TrustedCast<WasmImplicitArg>(*implicit_arg));
   internal->set_function_index(function_index);
   internal->set_external(*undefined_value());
   internal->set_sig(sig);
@@ -2596,22 +2593,21 @@ Handle<Cell> Factory::NewCell(Tagged<Smi> value) {
   static_assert(sizeof(Cell) <= kMaxRegularHeapObjectSize);
   AllocationWitness witness =
       AllocateWithWitness(sizeof(Cell), AllocationType::kOld);
-  return handle(new (witness) Cell(witness, read_only_roots(), value),
-                isolate());
+  return handle(new (witness) Cell(read_only_roots(), value), isolate());
 }
 
 Handle<Cell> Factory::NewCell() {
   static_assert(sizeof(Cell) <= kMaxRegularHeapObjectSize);
   AllocationWitness witness =
       AllocateWithWitness(sizeof(Cell), AllocationType::kOld);
-  return handle(new (witness) Cell(witness, read_only_roots()), isolate());
+  return handle(new (witness) Cell(read_only_roots()), isolate());
 }
 
 DirectHandle<FeedbackCell> Factory::NewNoClosuresCell() {
   AllocationWitness witness =
       AllocateWithWitness(sizeof(FeedbackCell), AllocationType::kOld);
   return direct_handle(
-      new (witness) FeedbackCell(witness, read_only_roots(),
+      new (witness) FeedbackCell(read_only_roots(),
                                  read_only_roots().no_closures_cell_map()),
       isolate());
 }
@@ -2631,7 +2627,7 @@ DirectHandle<FeedbackCell> Factory::NewManyClosuresCell(
   AllocationWitness witness =
       AllocateWithWitness(sizeof(FeedbackCell), allocation);
   return direct_handle(
-      new (witness) FeedbackCell(witness, read_only_roots(),
+      new (witness) FeedbackCell(read_only_roots(),
                                  read_only_roots().many_closures_cell_map()),
       isolate());
 }

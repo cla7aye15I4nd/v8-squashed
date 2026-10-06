@@ -39,10 +39,9 @@ namespace v8::internal {
       static_cast<intptr_t>(                                             \
           Builtin::kLoadIC##Location##Representation##Kind##Index##Baseline));
 
-FeedbackMetadata::FeedbackMetadata(const AllocationWitness& witness,
-                                   ReadOnlyRoots roots, int32_t slot_count,
+FeedbackMetadata::FeedbackMetadata(ReadOnlyRoots roots, int32_t slot_count,
                                    int32_t create_closure_slot_count)
-    : HeapObject(witness, roots.feedback_metadata_map()),
+    : HeapObject(roots.feedback_metadata_map()),
       slot_count_(slot_count),
       create_closure_slot_count_(create_closure_slot_count) {
   DCHECK_LE(0, slot_count);
@@ -132,7 +131,7 @@ FeedbackVector::FeedbackVector(
     Tagged<SharedFunctionInfo> shared_function_info,
     Tagged<ClosureFeedbackCellArray> closure_feedback_cell_array,
     Tagged<FeedbackCell> parent_feedback_cell)
-    : HeapObject(witness, roots.feedback_vector_map()),
+    : HeapObject(roots.feedback_vector_map()),
       length_(length),
       shared_function_info_(witness, shared_function_info),
       closure_feedback_cell_array_(witness, closure_feedback_cell_array),
@@ -662,11 +661,11 @@ Builtin FeedbackNexus::GetLoadICHandlerForStorageOffset(int storage_offset,
   if (is_double) return Builtin::kLoadICDoubleFieldBaseline;
 
   if (is_inobject) {
-    int in_object_index = storage_offset - JSObject::kHeaderSize / kTaggedSize;
-    DCHECK_GE(in_object_index, 0);
+    uint32_t in_object_index =
+        storage_offset - JSObject::kHeaderSize / kTaggedSize;
     // Currently we have eight handlers that support loading in-object field
     // with fixed index 0~7.
-    int kMaxIndex = 7;
+    uint32_t kMaxIndex = 7;
     if (in_object_index > kMaxIndex) {
       return Builtin::kLoadICInObjectNonDoubleFieldBaseline;
     }
@@ -678,12 +677,11 @@ Builtin FeedbackNexus::GetLoadICHandlerForStorageOffset(int storage_offset,
         in_object_index + 1;
     return static_cast<Builtin>(builtin_id);
   } else {
-    int out_of_object_index =
+    uint32_t out_of_object_index =
         storage_offset - OFFSET_OF_DATA_START(FixedArray) / kTaggedSize;
-    DCHECK_GE(out_of_object_index, 0);
     // Currently we have four handlers that support loading out-of-object
     // field with fixed index 0~3.
-    int kMaxIndex = 3;
+    uint32_t kMaxIndex = 3;
     if (out_of_object_index > kMaxIndex) {
       return Builtin::kLoadICOutOfObjectNonDoubleFieldBaseline;
     }
