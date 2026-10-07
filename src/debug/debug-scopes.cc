@@ -45,6 +45,18 @@ DirectHandle<Object> ScopeIterator::GetFunctionDebugName() const {
     return JSFunction::GetDebugName(isolate_, function_);
   }
 
+  if (HasScope()) {
+    // If the enclosing function has no context, `context_->closure_context()`
+    // belongs to some further outer function and can't be used for the name.
+    std::optional<DebugScriptScope> scope = current_scope();
+    while (scope.has_value() && !scope->is_function_scope()) {
+      scope = scope->parent();
+    }
+    if (!scope.has_value() || !scope->needs_context()) {
+      return isolate_->factory()->undefined_value();
+    }
+  }
+
   if (!IsNativeContext(*context_)) {
     DisallowGarbageCollection no_gc;
     Tagged<ScopeInfo> closure_info = context_->closure_context()->scope_info();
@@ -254,11 +266,12 @@ ScopeIterator::VariableInfo ScopeIterator::GetVariableInfo(Mode mode) const {
 }
 
 bool ScopeIterator::ShouldIgnore() const {
-  if (Type() == ScopeTypeLocal ||
-      (Type() == ScopeTypeModule && InInnerScope())) {
-    return false;
-  }
-  return !DeclaresLocals(Mode::ALL);
+  // Empty scopes are reported (e.g. so that they can be matched against
+  // source maps), except for an empty script scope or eval scope. The latter
+  // is also the root scope of wrapped functions and Function() functions.
+  return (Type() == ScopeTypeScript ||
+          (HasScope() && current_scope().scope_type() == EVAL_SCOPE)) &&
+         !DeclaresLocals(Mode::ALL);
 }
 
 bool ScopeIterator::AdvanceToScopeNumber(int scope_number) {
@@ -331,7 +344,12 @@ void ScopeIterator::AdvanceScope() {
       AdvanceOneContext();
     }
 
-    CHECK(AdvanceOneScope());
+    if (!AdvanceOneScope()) {
+      // We left the root of the scope tree (e.g. an eval scope). Continue
+      // with the runtime context chain.
+      current_scope_index_ = -1;
+      break;
+    }
   } while (current_scope().is_hidden());
 }
 
@@ -353,32 +371,16 @@ void ScopeIterator::Next() {
   bool leaving_closure = current_scope_index_ == closure_scope_index_;
 
   if (scope_type == ScopeTypeScript) {
-    DCHECK_IMPLIES(InInnerScope() && !leaving_closure,
-                   current_scope().is_script_scope());
+    DCHECK_IMPLIES(HasScope(), current_scope().is_script_scope());
     seen_script_scope_ = true;
     if (context_->IsScriptContext()) {
       context_ = handle(context_->previous(), isolate_);
     }
-    if (leaving_closure) {
-      current_scope_index_ = -1;
-    }
-  } else if (!InInnerScope()) {
-    AdvanceContext();
+    current_scope_index_ = -1;
+  } else if (HasScope()) {
+    AdvanceScope();
   } else {
-    DCHECK_NE(current_scope_index_, -1);
-    if (leaving_closure) {
-      // DebugScriptScope represents the entire script's scope tree, so calling
-      // AdvanceScope() here would step into the enclosing outer scope. Outside
-      // the paused closure, ScopeIterator iterates purely via runtime context_
-      // (!InInnerScope()). Consume the closure's context if it had one and
-      // reset the scope cursor.
-      if (NeedsAndHasContext()) {
-        AdvanceOneContext();
-      }
-      current_scope_index_ = -1;
-    } else {
-      AdvanceScope();
-    }
+    AdvanceContext();
   }
 
   UnwrapEvaluationContext();
@@ -739,7 +741,7 @@ bool ScopeIterator::VisitLocals(const Visitor& visitor, Mode mode,
         function_value = indirect_handle(
             Context::Get(context_, fn_index, isolate_), isolate_);
       } else {
-        function_value = isolate_->factory()->the_hole_value();
+        function_value = isolate_->factory()->optimized_out();
       }
     }
     if (visitor(name, function_value, scope_type)) return true;
@@ -770,7 +772,7 @@ bool ScopeIterator::VisitLocals(const Visitor& visitor, Mode mode,
 
       case VariableLocation::PARAMETER: {
         if (!InInnerScope()) {
-          value = isolate_->factory()->the_hole_value();
+          value = isolate_->factory()->optimized_out();
         } else if (frame_inspector_ == nullptr) {
           // Get the variable from the suspended generator.
           DCHECK(!generator_.is_null());
@@ -797,7 +799,7 @@ bool ScopeIterator::VisitLocals(const Visitor& visitor, Mode mode,
 
       case VariableLocation::LOCAL:
         if (!InInnerScope()) {
-          value = isolate_->factory()->the_hole_value();
+          value = isolate_->factory()->optimized_out();
         } else if (frame_inspector_ == nullptr) {
           // Get the variable from the suspended generator.
           DCHECK(!generator_.is_null());

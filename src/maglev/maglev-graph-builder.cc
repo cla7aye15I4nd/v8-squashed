@@ -2694,6 +2694,7 @@ MaglevGraphBuilder::TrySpecializeLoadContextSlotToFunctionContext(
 
 ValueNode* MaglevGraphBuilder::TrySpecializeLoadContextCell(
     ValueNode* context_node, int index, MaybeAssignedFlag assigned) {
+  DCHECK(v8_flags.script_context_cells || v8_flags.function_context_cells);
   if (!context_node->Is<HeapConstant>()) return {};
   compiler::ContextRef context =
       context_node->Cast<HeapConstant>()->ref().AsContext();
@@ -3238,7 +3239,8 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildScriptContextStore(
   auto script_context = GetConstant(global_access_feedback.script_context());
   return StoreAndCacheContextSlot(
       script_context, global_access_feedback.slot_index(), GetAccumulator(),
-      ContextMode::kHasContextCells,
+      v8_flags.script_context_cells ? ContextMode::kHasContextCells
+                                    : ContextMode::kNoContextCells,
       global_access_feedback.script_context().scope_info(broker()));
 }
 
@@ -3326,7 +3328,9 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildScriptContextLoad(
   auto script_context = GetConstant(script_context_ref);
   return LoadAndCacheContextSlot(
       script_context, global_access_feedback.slot_index(),
-      ContextMode::kHasContextCells, script_context_ref.scope_info(broker()));
+      v8_flags.script_context_cells ? ContextMode::kHasContextCells
+                                    : ContextMode::kNoContextCells,
+      script_context_ref.scope_info(broker()));
 }
 
 MaybeReduceResult MaglevGraphBuilder::TryBuildPropertyCellLoad(
@@ -14443,12 +14447,14 @@ ReduceResult MaglevGraphBuilder::VisitCreateClosure() {
 
   if (interpreter::CreateClosureFlags::FastNewClosureBit::decode(flags)) {
     return SetAccumulator(AddNewNode<FastCreateClosure>(
-        {GetContext()}, shared_function_info, feedback_cell));
+        {GetContext()}, shared_function_info, feedback_cell,
+        compilation_unit_->specialization_context(), GetCurrentScopeInfo()));
   } else {
     bool pretenured =
         interpreter::CreateClosureFlags::PretenuredBit::decode(flags);
     return SetAccumulator(AddNewNode<CreateClosure>(
-        {GetContext()}, shared_function_info, feedback_cell, pretenured));
+        {GetContext()}, shared_function_info, feedback_cell, pretenured,
+        compilation_unit_->specialization_context(), GetCurrentScopeInfo()));
   }
 }
 

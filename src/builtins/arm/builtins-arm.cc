@@ -2917,7 +2917,12 @@ void Generate_WasmDebugBreakOrTrap(MacroAssembler* masm, DebugBreakKind kind) {
     FrameAndConstantPoolScope scope(masm, StackFrame::WASM_DEBUG_BREAK);
 
     // Save all parameter registers. They might hold live values, we restore
-    // them after the runtime call.
+    // them after the runtime call (for kBreak), or allow DevTools to inspect
+    // them at trap sites (for kTrap).
+    // Note: For non-debug execution, saving registers and creating a
+    // WASM_DEBUG_BREAK frame for trap handler traps might be redundant, but
+    // traps are cold exceptional paths so this negligible overhead is fine to
+    // keep the landing pad and trap handling unified.
     constexpr DwVfpRegister first =
         WasmDebugBreakFrameConstants::kPushedFpRegs.first();
     constexpr DwVfpRegister last =
@@ -2959,7 +2964,7 @@ void Builtins::Generate_WasmDebugBreak(MacroAssembler* masm) {
   Generate_WasmDebugBreakOrTrap(masm, DebugBreakKind::kBreak);
 }
 
-void Builtins::Generate_WasmDebugTrap(MacroAssembler* masm) {
+void Builtins::Generate_WasmTrapHandlerThrowTrap(MacroAssembler* masm) {
   Generate_WasmDebugBreakOrTrap(masm, DebugBreakKind::kTrap);
 }
 
@@ -4305,21 +4310,23 @@ void Builtins::Generate_WasmHandleStackOverflow(MacroAssembler* masm) {
   using ER = ExternalReference;
   Register frame_base = WasmHandleStackOverflowDescriptor::FrameBaseRegister();
   Register gap = WasmHandleStackOverflowDescriptor::GapRegister();
+  Register parameter_slots_size =
+      WasmHandleStackOverflowDescriptor::ParameterSlotsSizeRegister();
   {
     DCHECK_NE(kCArgRegs[1], frame_base);
     DCHECK_NE(kCArgRegs[3], frame_base);
     __ mov(kCArgRegs[3], gap);
+    __ sub(kCArgRegs[0], frame_base, sp);
     __ mov(kCArgRegs[1], sp);
-    __ sub(kCArgRegs[2], frame_base, kCArgRegs[1]);
-    // On Arm we need preserve rbp value somewhere before entering
-    // INTERNAL frame later. It will be placed on the stack as an argument.
-    __ mov(kCArgRegs[0], fp);
     FrameScope scope(masm, StackFrame::INTERNAL);
     __ push(kCArgRegs[3]);
-    __ PrepareCallCFunction(5);
-    __ str(kCArgRegs[0], MemOperand(sp, 0 * kPointerSize));  // current_fp.
+    __ PrepareCallCFunction(6);
+    __ str(parameter_slots_size, MemOperand(sp, 1 * kPointerSize));
+    __ ldr(kCArgRegs[2], MemOperand(fp, CommonFrameConstants::kCallerFPOffset));
+    __ str(kCArgRegs[2], MemOperand(sp, 0 * kPointerSize));
+    __ mov(kCArgRegs[2], kCArgRegs[0]);
     __ Move(kCArgRegs[0], ER::isolate_address());
-    __ CallCFunction(ER::wasm_grow_stack(), 5);
+    __ CallCFunction(ER::wasm_grow_stack(), 6);
     __ pop(gap);
     DCHECK_NE(kReturnRegister0, gap);
   }
@@ -4332,13 +4339,6 @@ void Builtins::Generate_WasmHandleStackOverflow(MacroAssembler* masm) {
   __ sub(fp, fp, sp);
   __ add(fp, fp, kReturnRegister0);
   __ mov(sp, kReturnRegister0);
-  {
-    UseScratchRegisterScope temps(masm);
-    Register scratch = temps.Acquire();
-    __ mov(scratch,
-           Operand(StackFrame::TypeToMarker(StackFrame::WASM_SEGMENT_START)));
-    __ str(scratch, MemOperand(fp, TypedFrameConstants::kFrameTypeOffset));
-  }
   __ Ret();
 
   __ bind(&call_runtime);
@@ -4358,6 +4358,34 @@ void Builtins::Generate_WasmHandleStackOverflow(MacroAssembler* masm) {
     __ LeaveFrame(StackFrame::INTERNAL);
     __ Ret();
   }
+}
+
+void Builtins::Generate_WasmReturnFromSegment(MacroAssembler* masm) {
+  RegList gp_saves;
+  for (Register r : wasm::kGpReturnRegisters) gp_saves.set(r);
+  DoubleRegList fp_saves;
+  for (DoubleRegister r : wasm::kFpReturnRegisters) fp_saves.set(r);
+
+  __ PushAll(gp_saves);
+  __ PushAll(fp_saves);
+
+  {
+    FrameScope scope(masm, StackFrame::MANUAL);
+    int saved_size =
+        gp_saves.Count() * kSystemPointerSize + fp_saves.Count() * kDoubleSize;
+    __ Move(kCArgRegs[0], ExternalReference::isolate_address());
+    __ add(kCArgRegs[1], sp, Operand(saved_size));
+    __ PrepareCallCFunction(2);
+    __ CallCFunction(ExternalReference::wasm_shrink_stack(), 2);
+  }
+  __ mov(fp, kReturnRegister0);
+
+  __ PopAll(fp_saves);
+  __ PopAll(gp_saves);
+
+  __ mov(sp, fp);
+  __ ldm(ia_w, sp, {fp, lr});
+  __ Jump(lr);
 }
 #endif  // V8_ENABLE_WEBASSEMBLY
 

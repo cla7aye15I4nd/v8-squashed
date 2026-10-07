@@ -3635,9 +3635,8 @@ class AssemblerOpInterface : public Next {
     return Parameter(index, V<T>::rep, debug_name);
   }
   V<Object> OsrValue(int index) { return ReduceIfReachableOsrValue(index); }
-  void Return(V<Word32> pop_count, base::Vector<const OpIndex> return_values,
-              bool spill_caller_frame_slots = false) {
-    ReduceIfReachableReturn(pop_count, return_values, spill_caller_frame_slots);
+  void Return(V<Word32> pop_count, base::Vector<const OpIndex> return_values) {
+    ReduceIfReachableReturn(pop_count, return_values);
   }
   void Return(OpIndex result) {
     Return(Word32Constant(0), base::VectorOf({result}));
@@ -4151,7 +4150,8 @@ class AssemblerOpInterface : public Next {
   // where appropriate.
   OpIndex WasmCallRuntime(Zone* zone, Runtime::FunctionId f,
                           std::initializer_list<const OpIndex> args,
-                          V<Context> context) {
+                          V<Context> context,
+                          CanThrow can_throw = CanThrow{true}) {
     const Runtime::Function* fun = Runtime::FunctionForId(f);
     OpIndex isolate_root = __ LoadRootRegister();
     DCHECK_EQ(1, fun->result_size);
@@ -4172,8 +4172,8 @@ class AssemblerOpInterface : public Next {
             __ graph_zone(), f, fun->nargs, Operator::kNoProperties,
             CallDescriptor::kNoFlags);
     const TSCallDescriptor* ts_call_descriptor = TSCallDescriptor::Create(
-        call_descriptor, compiler::CanThrow{true},
-        compiler::LazyDeoptOnThrow{false}, __ graph_zone());
+        call_descriptor, can_throw, compiler::LazyDeoptOnThrow{false},
+        __ graph_zone());
     return __ Call(centry_stub, OpIndex::Invalid(), base::VectorOf(centry_args),
                    ts_call_descriptor);
   }

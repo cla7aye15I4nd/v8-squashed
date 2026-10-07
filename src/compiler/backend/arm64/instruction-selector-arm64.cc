@@ -67,9 +67,6 @@ class Arm64OperandGenerator final : public OperandGenerator {
             selector()->Get(node).TryCast<ConstantOp>()) {
       if (constant->IsRelocatable()) return false;
       if (constant->IsIntegral() && constant->integral() == 0) return true;
-      if (constant->kind == ConstantOp::Kind::kSmi) {
-        return constant->smi().value() == 0;
-      }
       if (constant->kind == ConstantOp::Kind::kFloat32) {
         return constant->float32().get_bits() == 0;
       }
@@ -3262,16 +3259,6 @@ void InstructionSelector::EmitPrepareArguments(
     }
   }
 
-  // Zero-valued constants (e.g. Smi zero) can be stored through the zero
-  // register, but only for non-FP parameters: the code generator dispatches
-  // FP pokes on the operand being an FP register.
-  auto poke_value = [&](const PushParameter& input) {
-    if (IsFloatingPoint(input.location.GetType().representation())) {
-      return g.UseRegister(input.node);
-    }
-    return g.UseRegisterOrImmediateZero(input.node);
-  };
-
   // Poke the arguments into the stack.
   while (slot >= 0) {
     PushParameter input0 = (*arguments)[slot];
@@ -3286,11 +3273,12 @@ void InstructionSelector::EmitPrepareArguments(
     // TODO(arm): Support consecutive Simd128 parameters.
     if (input1.node.valid() &&
         input0.location.GetType() == input1.location.GetType()) {
-      Emit(kArm64PokePair, g.NoOutput(), poke_value(input0), poke_value(input1),
-           g.TempImmediate(slot));
+      Emit(kArm64PokePair, g.NoOutput(), g.UseRegister(input0.node),
+           g.UseRegister(input1.node), g.TempImmediate(slot));
       slot -= 2;
     } else {
-      Emit(kArm64Poke, g.NoOutput(), poke_value(input0), g.TempImmediate(slot));
+      Emit(kArm64Poke, g.NoOutput(), g.UseRegister(input0.node),
+           g.TempImmediate(slot));
       slot--;
     }
   }
@@ -5779,6 +5767,29 @@ bool ShraHelper(InstructionSelector* selector, OpIndex node, LaneSize lane_size,
   int64_t constant;
   if (!selector->MatchSignedIntegralConstant(shiftop.shift(), &constant)) {
     return false;
+  }
+
+  // Matches (a & b) + ((a ^ b) >> 1) or (a & b) + ((b ^ a) >> 1)
+  // Since a + b = 2 x (a & b) + (a ^ b), right shift for a half-add
+  // floor((a + b) / 2) = (a & b) + ((a ^ b) >> 1)
+  if (lane_size != LaneSize::kL64 &&
+      (constant & (LaneSizeBits(lane_size) - 1)) == 1 &&
+      selector->Get(m.other_input()).Is<turboshaft::Opmask::kSimd128And>() &&
+      selector->Get(shiftop.input()).Is<turboshaft::Opmask::kSimd128Xor>() &&
+      selector->CanCover(node, m.other_input()) &&
+      selector->CanCover(m.matched_input(), shiftop.input())) {
+    const auto& and_op = selector->Get(m.other_input()).Cast<Simd128BinopOp>();
+    const auto& xor_op = selector->Get(shiftop.input()).Cast<Simd128BinopOp>();
+
+    if ((and_op.left() == xor_op.left() && and_op.right() == xor_op.right()) ||
+        (and_op.left() == xor_op.right() && and_op.right() == xor_op.left())) {
+      const InstructionCode half_add_code =
+          shra_code == kArm64Ssra ? kArm64Shadd : kArm64Uhadd;
+      selector->Emit(half_add_code | LaneSizeField::encode(lane_size),
+                     g.DefineAsRegister(node), g.UseRegister(and_op.left()),
+                     g.UseRegister(and_op.right()));
+      return true;
+    }
   }
 
   // If shifting by zero, just do the addition

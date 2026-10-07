@@ -25,7 +25,6 @@ extern runtime WasmFunctionTableSet(
 extern runtime ThrowRangeError(Context, Smi): never;
 extern runtime ThrowWasmError(Context, Smi): never;
 extern runtime WasmThrowRangeError(Context, Smi): never;
-extern runtime TrapHandlerThrowWasmError(Context): never;
 extern runtime WasmThrowTypeError(Context, Smi, JSAny): never;
 extern runtime WasmThrowDataViewTypeError(Context, Smi, JSAny): never;
 extern runtime WasmThrowDataViewDetachedError(Context, Smi): never;
@@ -475,15 +474,20 @@ builtin WasmTriggerTierUp(): JSAny {
   tail runtime::WasmTriggerTierUp(LoadContextFromFrame(), trustedData);
 }
 
-extern builtin WasmHandleStackOverflow(RawPtr, uint32): JSAny;
+extern builtin WasmHandleStackOverflow(RawPtr, uint32, intptr): JSAny;
 
-// {paramSlotsSize} is the size of the incoming stack parameters of the
-// currently-executing function, which have to be copied along with its
-// stack frame if the stack needs to be grown.
-builtin WasmGrowableStackGuard(paramSlotsSize: intptr, gap: intptr): JSAny {
+// {stackParamAndReturnSlotsSize} is the combined size of the incoming stack
+// parameters and stack return slots of the currently-executing function, which
+// have to be copied along with its stack frame if the stack needs to be grown.
+// {parameterSlotsSize} is the size of incoming stack parameters (which is also
+// the distance from the current FP to the relocated partial frame).
+builtin WasmGrowableStackGuard(
+    stackParamAndReturnSlotsSize: intptr, gap: intptr,
+    parameterSlotsSize: intptr): JSAny {
   tail WasmHandleStackOverflow(
-      LoadParentFramePointer() + paramSlotsSize + kFixedFrameSizeAboveFp,
-      Unsigned(Convert<int32>(gap)));
+      LoadParentFramePointer() + stackParamAndReturnSlotsSize +
+          kFixedFrameSizeAboveFp,
+      Unsigned(Convert<int32>(gap)), parameterSlotsSize);
 }
 
 builtin WasmStackGuard(gap: intptr): JSAny {
@@ -869,10 +873,6 @@ builtin WasmTrap(error: Smi): JSAny {
 
 builtin ThrowWasmTrapUnreachable(): JSAny {
   tail WasmTrap(SmiConstant(MessageTemplate::kWasmTrapUnreachable));
-}
-
-builtin WasmTrapHandlerThrowTrap(): JSAny {
-  tail runtime::TrapHandlerThrowWasmError(LoadContextFromWasmOrJsFrame());
 }
 
 builtin WasmPropagateException(): JSAny {

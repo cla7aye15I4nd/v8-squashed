@@ -1775,8 +1775,8 @@ inline compiler::BytecodeArrayRef DeoptFrame::GetBytecodeArray() const {
 
 class DeoptInfo {
  protected:
-  DeoptInfo(Zone* zone, DeoptFrame* top_frame,
-            compiler::FeedbackSource feedback_to_update);
+  V8_EXPORT_PRIVATE DeoptInfo(Zone* zone, DeoptFrame* top_frame,
+                              compiler::FeedbackSource feedback_to_update);
 
  public:
   DeoptFrame& top_frame() { return *top_frame_; }
@@ -2732,7 +2732,7 @@ class ValueNode : public Node {
   // HoleyFloat64 gives a meaning to. Only false if that is provably not the
   // case, so that whoever writes those bits somewhere they would regain that
   // meaning (a double array, mainly) can skip canonicalizing them.
-  bool MayBeHoleOrUndefinedNan() const;
+  V8_EXPORT_PRIVATE bool MayBeHoleOrUndefinedNan() const;
 
 #ifdef V8_COMPRESS_POINTERS
   constexpr bool decompresses_tagged_result() const {
@@ -2795,8 +2795,8 @@ class ValueNode : public Node {
   compiler::OptionalHeapObjectRef TryGetConstant(
       compiler::JSHeapBroker* broker);
 
-  NodeType GetStaticType(compiler::JSHeapBroker* broker);
-  Range GetStaticRange() const;
+  V8_EXPORT_PRIVATE NodeType GetStaticType(compiler::JSHeapBroker* broker);
+  V8_EXPORT_PRIVATE Range GetStaticRange() const;
 
   bool StaticTypeIs(compiler::JSHeapBroker* broker, NodeType type) {
     return NodeTypeIs(GetStaticType(broker), type);
@@ -6823,15 +6823,23 @@ class FastCreateClosure : public FixedInputValueNodeT<1, FastCreateClosure> {
  public:
   explicit FastCreateClosure(
       uint64_t bitfield, compiler::SharedFunctionInfoRef shared_function_info,
-      compiler::FeedbackCellRef feedback_cell)
+      compiler::FeedbackCellRef feedback_cell,
+      compiler::OptionalContextRef specialization_context,
+      ContextScopeInfo context_scope_info)
       : Base(bitfield),
         shared_function_info_(shared_function_info),
-        feedback_cell_(feedback_cell) {}
+        feedback_cell_(feedback_cell),
+        specialization_context_(specialization_context),
+        context_scope_info_(context_scope_info) {}
 
   compiler::SharedFunctionInfoRef shared_function_info() const {
     return shared_function_info_;
   }
   compiler::FeedbackCellRef feedback_cell() const { return feedback_cell_; }
+  compiler::OptionalContextRef specialization_context() const {
+    return specialization_context_;
+  }
+  ContextScopeInfo context_scope_info() const { return context_scope_info_; }
 
   // The implementation currently calls runtime.
   static constexpr OpProperties kProperties =
@@ -6850,6 +6858,8 @@ class FastCreateClosure : public FixedInputValueNodeT<1, FastCreateClosure> {
  private:
   const compiler::SharedFunctionInfoRef shared_function_info_;
   const compiler::FeedbackCellRef feedback_cell_;
+  const compiler::OptionalContextRef specialization_context_;
+  const ContextScopeInfo context_scope_info_;
 };
 
 class CreateRegExpLiteral
@@ -6884,17 +6894,25 @@ class CreateClosure : public FixedInputValueNodeT<1, CreateClosure> {
   explicit CreateClosure(uint64_t bitfield,
                          compiler::SharedFunctionInfoRef shared_function_info,
                          compiler::FeedbackCellRef feedback_cell,
-                         bool pretenured)
+                         bool pretenured,
+                         compiler::OptionalContextRef specialization_context,
+                         ContextScopeInfo context_scope_info)
       : Base(bitfield),
         shared_function_info_(shared_function_info),
         feedback_cell_(feedback_cell),
-        pretenured_(pretenured) {}
+        pretenured_(pretenured),
+        specialization_context_(specialization_context),
+        context_scope_info_(context_scope_info) {}
 
   compiler::SharedFunctionInfoRef shared_function_info() const {
     return shared_function_info_;
   }
   compiler::FeedbackCellRef feedback_cell() const { return feedback_cell_; }
   bool pretenured() const { return pretenured_; }
+  compiler::OptionalContextRef specialization_context() const {
+    return specialization_context_;
+  }
+  ContextScopeInfo context_scope_info() const { return context_scope_info_; }
 
   // The implementation currently calls runtime.
   static constexpr OpProperties kProperties = OpProperties::Call() |
@@ -6914,6 +6932,8 @@ class CreateClosure : public FixedInputValueNodeT<1, CreateClosure> {
   const compiler::SharedFunctionInfoRef shared_function_info_;
   const compiler::FeedbackCellRef feedback_cell_;
   const bool pretenured_;
+  const compiler::OptionalContextRef specialization_context_;
+  const ContextScopeInfo context_scope_info_;
 };
 
 #define ASSERT_CONDITION(V) \
@@ -10205,8 +10225,8 @@ class Phi : public ValueNodeT<Phi> {
   // Records a use hint for this Phi. If {force_same_loop} is true, the hint
   // is recorded as a same-loop use, which is important for loop-related
   // optimizations like Phi untagging.
-  void RecordUseReprHint(UseRepresentationSet repr_mask,
-                         bool force_same_loop = false);
+  V8_EXPORT_PRIVATE void RecordUseReprHint(UseRepresentationSet repr_mask,
+                                           bool force_same_loop = false);
 
   UseRepresentationSet use_repr_hints() { return use_repr_hints_; }
   UseRepresentationSet same_loop_use_repr_hints() {
