@@ -3205,6 +3205,8 @@ void ParserBase<Impl>::ParseArguments(
               scanner()->peek_location(), MessageTemplate::kParamAfterRest);
         }
       }
+    } else {
+      accumulation_scope.ValidateExpression();
     }
     if (is_spread) {
       *has_spread = true;
@@ -3461,7 +3463,7 @@ ParserBase<Impl>::ParseYieldExpression() {
         // Delegating yields require an RHS; fall through.
         [[fallthrough]];
       default:
-        expression = ParseAssignmentExpressionCoverGrammar();
+        expression = ParseAssignmentExpression();
         break;
     }
   }
@@ -4260,7 +4262,7 @@ ParserBase<Impl>::ParseImportExpressions() {
   }
 
   AcceptINScope scope(this, true);
-  ExpressionT specifier = ParseAssignmentExpressionCoverGrammar();
+  ExpressionT specifier = ParseAssignmentExpression();
 
   DCHECK_IMPLIES(phase == ModuleImportPhase::kSource,
                  v8_flags.js_source_phase_imports);
@@ -4272,7 +4274,7 @@ ParserBase<Impl>::ParseImportExpressions() {
       // A trailing comma allowed after the specifier.
       return factory()->NewImportCallExpression(specifier, phase, pos);
     } else {
-      ExpressionT import_options = ParseAssignmentExpressionCoverGrammar();
+      ExpressionT import_options = ParseAssignmentExpression();
       Check(Token::kComma);  // A trailing comma is allowed after the import
                              // attributes.
       Expect(Token::kRightParen);
@@ -5172,11 +5174,16 @@ ParserBase<Impl>::ParseArrowFunctionLiteral(
           if (has_error()) return impl()->FailureExpression();
 
           DeclarationScope* function_scope = next_arrow_function_info_.scope;
+          function_scope->set_start_position(
+              formal_parameters.scope->start_position());
           FunctionState inner_function_state(&function_state_, &scope_,
                                              function_scope);
           Scanner::Location loc(function_scope->start_position(),
                                 end_position());
           FormalParametersT parameters(function_scope);
+          parameters.set_strict_parameter_error(
+              next_arrow_function_info_.strict_parameter_error_location,
+              next_arrow_function_info_.strict_parameter_error_message);
           parameters.is_simple = function_scope->has_simple_parameters();
           impl()->DeclareArrowFunctionFormalParameters(&parameters, expression,
                                                        loc);

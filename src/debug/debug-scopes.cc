@@ -93,6 +93,9 @@ void ScopeIterator::Restart() {
   DCHECK_NOT_NULL(frame_inspector_);
   function_ = frame_inspector_->GetFunction();
   context_ = Cast<Context>(frame_inspector_->GetContext());
+  // Iteration may have moved on to the caller's script of a direct eval.
+  script_ = frame_inspector_->GetScript();
+  debug_scope_info_ = EnsureDebugScriptScopeInfo(isolate_, script_);
   current_scope_index_ = start_scope_index_;
   DCHECK_NE(current_scope_index_, -1);
   UnwrapEvaluationContext();
@@ -102,7 +105,6 @@ void ScopeIterator::Restart() {
 void ScopeIterator::TryParseAndRetrieveScopes() {
   // Catch the case when the debugger stops in an internal function.
   DirectHandle<SharedFunctionInfo> shared_info(function_->shared(), isolate_);
-  DirectHandle<ScopeInfo> scope_info(shared_info->scope_info(), isolate_);
   if (IsUndefined(shared_info->script())) {
     current_scope_index_ = closure_scope_index_ = start_scope_index_ = -1;
     context_ = handle(function_->context(), isolate_);
@@ -137,15 +139,8 @@ void ScopeIterator::TryParseAndRetrieveScopes() {
     return;
   }
 
-  // For a FUNCTION_SCOPE we locate the paused function's scope in the
-  // serialized tree. For top-level scopes (EVAL_SCOPE, SCRIPT_SCOPE,
-  // MODULE_SCOPE) the closure scope is the root scope (index 0).
   std::optional<DebugScriptScope> debug_closure_scope =
-      scope_info->scope_type() == FUNCTION_SCOPE
-          ? FindClosureScope(debug_scope_info_, shared_info->StartPosition(),
-                             shared_info->EndPosition(),
-                             scope_info->scope_type())
-          : DebugScriptScope::FromIndex(debug_scope_info_, 0);
+      FindClosureScope(debug_scope_info_, *shared_info);
   if (!debug_closure_scope.has_value()) {
     context_ = Handle<Context>();
     return;
@@ -322,10 +317,19 @@ bool ScopeIterator::NeedsContext() const {
 
 bool ScopeIterator::AdvanceOneScope() {
   if (!HasScope()) return false;
-  std::optional<DebugScriptScope> parent = current_scope().parent();
-  if (!parent.has_value()) return false;
-  current_scope_index_ = parent->scope_index();
-  return true;
+  if (std::optional<DebugScriptScope> parent = current_scope().parent()) {
+    current_scope_index_ = parent->scope_index();
+    return true;
+  }
+  if (std::optional<DebugScriptScope> outer =
+          FindEvalOuterScope(isolate_, script_)) {
+    script_ =
+        handle(Cast<Script>(script_->eval_from_shared()->script()), isolate_);
+    debug_scope_info_ = handle(*outer->info(), isolate_);
+    current_scope_index_ = outer->scope_index();
+    return true;
+  }
+  return false;
 }
 
 void ScopeIterator::AdvanceOneContext() {
@@ -345,8 +349,9 @@ void ScopeIterator::AdvanceScope() {
     }
 
     if (!AdvanceOneScope()) {
-      // We left the root of the scope tree (e.g. an eval scope). Continue
-      // with the runtime context chain.
+      // We left the root of the outermost scope tree we can reach (e.g. the
+      // root of an indirect eval, a `new Function` or a wrapped function).
+      // Continue with the runtime context chain.
       current_scope_index_ = -1;
       break;
     }
@@ -751,10 +756,14 @@ bool ScopeIterator::VisitLocals(const Visitor& visitor, Mode mode,
   auto [args_alloc, args_index] = scope.arguments_info();
   for (int i = 0; i < scope.variable_count(); ++i) {
     DebugVariableInfo var = scope.variable(i);
+    // Create a handle for the name right away: computing the value below can
+    // allocate (e.g. Context::Get boxing a double ContextCell), and the GC may
+    // move the string.
+    DirectHandle<InternalizedString> name(var.name, isolate_);
     if (var.is_synthetic) {
       // We want to materialize "new.target" for debug-evaluate.
       if (mode != Mode::STACK ||
-          !var.name->Equals(*isolate_->factory()->dot_new_target_string())) {
+          !name->Equals(*isolate_->factory()->dot_new_target_string())) {
         continue;
       }
     }
@@ -845,7 +854,7 @@ bool ScopeIterator::VisitLocals(const Visitor& visitor, Mode mode,
           value = isolate_->factory()->tdz_hole_value();
           break;
         }
-        DCHECK_EQ(context_->scope_info()->ContextSlotIndex(var.name), index);
+        DCHECK_EQ(context_->scope_info()->ContextSlotIndex(*name), index);
         value =
             indirect_handle(Context::Get(context_, index, isolate_), isolate_);
         break;
@@ -859,7 +868,7 @@ bool ScopeIterator::VisitLocals(const Visitor& visitor, Mode mode,
       }
     }
 
-    if (visitor(direct_handle(var.name, isolate_), value, scope_type)) {
+    if (visitor(name, value, scope_type)) {
       return true;
     }
   }

@@ -387,8 +387,9 @@ class Heap final {
   }
 
   // Copy block of memory from src to dst. Size of block should be aligned
-  // by pointer size.
-  static inline void CopyBlock(Address dst, Address src, size_t byte_size);
+  // by tagged size.
+  static inline void CopyBlock(Address dst, Address src,
+                               SafeHeapObjectSize byte_size);
 
   perfetto::NamedTrack tracing_track() const { return tracing_track_; }
 
@@ -1215,12 +1216,6 @@ class Heap final {
 
   // Registers an external string.
   inline void RegisterExternalString(Tagged<String> string);
-
-  // Called when a string's resource is changed. The size of the payload is sent
-  // as argument of the method.
-  V8_EXPORT_PRIVATE void UpdateExternalString(Tagged<String> string,
-                                              size_t old_payload,
-                                              size_t new_payload);
 
   // Finalizes an external string by deleting the associated external
   // data and clearing the resource pointer.

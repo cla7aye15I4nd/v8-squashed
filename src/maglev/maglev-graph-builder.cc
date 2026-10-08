@@ -6495,11 +6495,46 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildProxyPropertyAccess(
   CallArguments args(ConvertReceiverMode::kNotNullOrUndefined,
                      {proxy_handler, proxy_target, argument_name, receiver});
 
-  RETURN_IF_DONE(
-      TryReduceCallForConstant(trap_js_function_ref, args, feedback_source));
+  ValueNode* result;
+  {
+    LazyDeoptFrameScope deopt_continuation(
+        &reducer_, GetContext(),
+        Builtin::kProxyGetPropertyTrapResultLazyDeoptContinuation, {},
+        base::VectorOf<ValueNode*>(
+            {proxy_target, lookup_start_object, argument_name}));
+    MaybeReduceResult call_result =
+        TryReduceCallForConstant(trap_js_function_ref, args, feedback_source);
+    if (!call_result.IsDone()) {
+      call_result = BuildGenericCall(actual_trap, Call::TargetType::kJSFunction,
+                                     args, feedback_source);
+    }
+    GET_VALUE_OR_ABORT(result, call_result);
+  }
 
-  return BuildGenericCall(actual_trap, Call::TargetType::kJSFunction, args,
-                          feedback_source);
+  // 4. Verify that the proxy target map didn't change during the trap call.
+  const NodeInfo* target_info =
+      known_node_aspects().TryGetInfoWithFreshMaps(proxy_target);
+  if (target_info == nullptr || target_info->possible_maps().size() != 1 ||
+      target_info->possible_maps().at(0) != expected_target_map) {
+    ValueNode* target_map;
+    GET_VALUE_OR_ABORT(
+        target_map,
+        BuildLoadTaggedField(proxy_target, offsetof(HeapObject, map_)));
+    return Select(
+        [&](BranchBuilder& builder) {
+          return BuildBranchIfReferenceEqual(builder, target_map,
+                                             GetConstant(expected_target_map));
+        },
+        [&]() -> ReduceResult { return result; },
+        [&]() -> ReduceResult {
+          RETURN_IF_ABORT(BuildCallRuntime(Runtime::kCheckProxyGetSetTrapResult,
+                                           {argument_name, proxy_target, result,
+                                            GetSmiConstant(JSProxy::kGet)}));
+          return result;
+        });
+  }
+
+  return result;
 }
 
 template <typename GenericAccessFunc>
@@ -9167,16 +9202,21 @@ MaglevGraphBuilder::BuildJSArrayBuiltinMapSwitchOnElementsKind(
         sub_graph.GotoOrTrim(&*object_case);
         sub_graph.Bind(&*object_case);
       }
-      any_successful |= (!build_kind_specific(kind).IsDoneWithAbort());
+      ReduceResult result = build_kind_specific(kind);
       if (IsSmiElementsKind(kind) && make_smi_fallthrough_to_object) {
         // After building the SMI specific parts (see build_kind_specific call
         // above), jump to the beginning of the case for the object elements
         // kind.
         DCHECK(object_case.has_value());
         sub_graph.GotoOrTrim(&*object_case);
+
+        // Whether the Smi case is successful depends on whether the object case
+        // is successful, so don't update any_successful here.
       } else {
         DCHECK(do_return.has_value());
         sub_graph.GotoOrTrim(&*do_return);
+
+        any_successful |= !result.IsDoneWithAbort();
       }
       sub_graph.Bind(&check_next_map);
     } else {
@@ -17039,11 +17079,11 @@ void MaglevGraphBuilder::ProcessMergePointPredecessors(
   ResetBuilderCachedState();
 
   if (merge_state.is_loop()) {
-    DCHECK_EQ(merge_state.predecessors_so_far(),
-              merge_state.predecessor_count() - 1);
+    CHECK_EQ(merge_state.predecessors_so_far(),
+             merge_state.predecessor_count() - 1);
   } else {
-    DCHECK_EQ(merge_state.predecessors_so_far(),
-              merge_state.predecessor_count());
+    CHECK_EQ(merge_state.predecessors_so_far(),
+             merge_state.predecessor_count());
   }
 
   if (merge_state.predecessor_count() == 1) {

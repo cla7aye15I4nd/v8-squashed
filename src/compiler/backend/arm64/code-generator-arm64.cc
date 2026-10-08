@@ -2063,7 +2063,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
         __ PokePair(i.InputFloat64Register(1), i.InputFloat64Register(0),
                     slot * kSystemPointerSize);
       } else {
-        __ PokePair(i.InputRegister(1), i.InputRegister(0),
+        __ PokePair(i.InputOrZeroRegister64(1), i.InputOrZeroRegister64(0),
                     slot * kSystemPointerSize);
       }
       break;
@@ -2986,6 +2986,27 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     __ Instr(dst, i.InputSimd128Register(1).Format(wide));              \
     break;                                                              \
   }
+#define SIMD_LOW_NARROWING_BINOP_CASE(Op, Instr)                        \
+  case Op: {                                                            \
+    const VectorFormat wide =                                           \
+        VectorFormatFillQ(LaneSizeBits(LaneSizeField::decode(opcode))); \
+    const VectorFormat narrow = VectorFormatHalfWidth(wide);            \
+    __ Instr(i.OutputSimd128Register().Format(narrow),                  \
+             i.InputSimd128Register(0).Format(wide),                    \
+             i.InputSimd128Register(1).Format(wide));                   \
+    break;                                                              \
+  }
+#define SIMD_HIGH_NARROWING_BINOP_CASE(Op, Instr)                       \
+  case Op: {                                                            \
+    const VectorFormat wide =                                           \
+        VectorFormatFillQ(LaneSizeBits(LaneSizeField::decode(opcode))); \
+    const VectorFormat narrow = VectorFormatHalfWidthDoubleLanes(wide); \
+    const VRegister dst = i.OutputSimd128Register().Format(narrow);     \
+    DCHECK_EQ(dst, i.InputSimd128Register(0).Format(narrow));           \
+    __ Instr(dst, i.InputSimd128Register(1).Format(wide),               \
+             i.InputSimd128Register(2).Format(wide));                   \
+    break;                                                              \
+  }
 #define SIMD_SHIFT_LEFT_LONG_CASE(Op, Instr, SrcFormat, Shift)          \
   case Op: {                                                            \
     const VectorFormat dst_f =                                          \
@@ -3109,6 +3130,10 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       SIMD_HIGH_NARROWING_CASE(kArm64Sqxtn2, Sqxtn2);
       SIMD_LOW_NARROWING_CASE(kArm64Sqxtun, Sqxtun);
       SIMD_HIGH_NARROWING_CASE(kArm64Sqxtun2, Sqxtun2);
+      SIMD_LOW_NARROWING_BINOP_CASE(kArm64Addhn, Addhn);
+      SIMD_HIGH_NARROWING_BINOP_CASE(kArm64Addhn2, Addhn2);
+      SIMD_LOW_NARROWING_BINOP_CASE(kArm64Subhn, Subhn);
+      SIMD_HIGH_NARROWING_BINOP_CASE(kArm64Subhn2, Subhn2);
     case kArm64Sxtl: {
       VectorFormat wide =
           VectorFormatFillQ(LaneSizeBits(LaneSizeField::decode(opcode)));
@@ -3313,6 +3338,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       VectorFormat s_f =
           ScalarFormatFromLaneSize(LaneSizeBits(LaneSizeField::decode(opcode)));
       VectorFormat v_f = VectorFormatFillQ(s_f);
+      DCHECK(v_f == kFormat4S || v_f == kFormat2D);
       __ Fmul(i.OutputSimd128Register().Format(v_f),
               i.InputSimd128Register(0).Format(v_f),
               i.InputSimd128Register(1).Format(s_f), i.InputInt8(2));
@@ -3836,6 +3862,8 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
 #undef SIMD_UNOP_LANE_SIZE_CASE
 #undef SIMD_LOW_NARROWING_CASE
 #undef SIMD_HIGH_NARROWING_CASE
+#undef SIMD_LOW_NARROWING_BINOP_CASE
+#undef SIMD_HIGH_NARROWING_BINOP_CASE
 #undef SIMD_SHIFT_LEFT_LONG_CASE
 #undef SIMD_BINOP_CASE
 #undef SIMD_BINOP_LANE_SIZE_CASE
@@ -4845,10 +4873,19 @@ void CodeGenerator::AssembleMove(InstructionOperand* source,
       Constant src = g.ToConstant(source);
       MemOperand dst = g.ToMemOperand(destination, masm());
       if (destination->IsStackSlot()) {
-        UseScratchRegisterScope scope(masm());
-        Register temp = scope.AcquireX();
-        MoveConstantToRegister(temp, src);
-        __ Str(temp, dst);
+        // A relocatable constant (e.g. a Wasm canonical signature id) is a
+        // placeholder that is patched later, so it must be materialized
+        // through the literal pool even when its value is zero.
+        if (RelocInfo::IsNoInfo(src.rmode()) &&
+            ((src.type() == Constant::kInt32 && src.ToInt32() == 0) ||
+             (src.type() == Constant::kInt64 && src.ToInt64() == 0))) {
+          __ Str(xzr, dst);
+        } else {
+          UseScratchRegisterScope scope(masm());
+          Register temp = scope.AcquireX();
+          MoveConstantToRegister(temp, src);
+          __ Str(temp, dst);
+        }
       } else if (destination->IsFloatStackSlot()) {
         if (base::bit_cast<int32_t>(src.ToFloat32()) == 0) {
           __ Str(wzr, dst);
