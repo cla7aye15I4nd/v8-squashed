@@ -4,6 +4,7 @@
 
 #include <optional>
 
+#include "src/base/unique-array.h"
 #include "src/builtins/builtins-inl.h"
 #include "src/builtins/data-view-ops.h"
 #include "src/common/assert-scope.h"
@@ -1150,6 +1151,10 @@ RUNTIME_FUNCTION(Runtime_WasmAllocateDescriptorStruct) {
   DirectHandle<Map> map{Cast<Map>(args[1]), isolate};
   wasm::ModuleTypeIndex type_index{args.positive_smi_value_at(2)};
   DirectHandle<Object> first_field{args[3], isolate};
+  if (v8_flags.wasm_merged_descriptors) {
+    return *WasmCustomMap::AllocateUninitialized(isolate, trusted_data,
+                                                 type_index, map, first_field);
+  }
   return *WasmStruct::AllocateDescriptorUninitialized(
       isolate, trusted_data, type_index, map, first_field);
 }
@@ -2165,9 +2170,9 @@ RUNTIME_FUNCTION(Runtime_WasmConfigureAllPrototypes) {
   // Arrays on the heap can move on GC, so we create an immovable copy of
   // the data we'll need to decode.
   uint32_t length = data->length();
-  base::OwnedVector<uint8_t> immovable_data;
+  base::UniqueArray<uint8_t> immovable_data;
   if (length) {
-    immovable_data = base::OwnedCopyOf(
+    immovable_data = base::UniqueCopyOf(
         reinterpret_cast<const uint8_t*>(data->ElementAddress(0)), length);
   }
 

@@ -614,8 +614,13 @@ using JSDispatchHandle =
 
 constexpr JSDispatchHandle kNullJSDispatchHandle(0);
 
+#if V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
+constexpr int kJSDispatchTableEntrySize = 32;
+constexpr int kJSDispatchTableEntrySizeLog2 = 5;
+#else
 constexpr int kJSDispatchTableEntrySize = 16;
 constexpr int kJSDispatchTableEntrySizeLog2 = 4;
+#endif  // V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
 
 // The size of the virtual memory reservation for the JSDispatchTable.
 // As with the other tables, a maximum table size in combination with shifted
@@ -628,7 +633,7 @@ constexpr int kJSDispatchTableEntrySizeLog2 = 4;
 constexpr size_t kJSDispatchTableReservationSize = 128 * MB;
 #else
 constexpr size_t kJSDispatchTableReservationSize =
-    (V8_LOWER_LIMITS_MODE_BOOL ? 16 : 256) * MB;
+    (V8_LOWER_LIMITS_MODE_BOOL ? 1 : 16) * kJSDispatchTableEntrySize * MB;
 #endif  // defined(V8_TARGET_OS_IOS) &&
         // !defined(V8_ENABLE_BUILTINS_OPTIMIZATION)
 // The maximum number of entries in a JSDispatchTable.
@@ -2803,10 +2808,12 @@ class TypeOfFeedback {
 // at different points by performing an 'OR' operation. Type feedback moves
 // to a more generic type when we combine feedback.
 // kNone -> kEnumCacheKeysAndIndices -> kEnumCacheKeys -> kAny
+// kNone -> kEnumeratorHolder -> kAny
 enum class ForInFeedback : uint8_t {
   kNone = 0x0,
   kEnumCacheKeysAndIndices = 0x1,
   kEnumCacheKeys = 0x3,
+  kEnumeratorHolder = 0x6,
   kAny = 0x7
 };
 static_assert((static_cast<int>(ForInFeedback::kNone) |
@@ -2816,6 +2823,18 @@ static_assert((static_cast<int>(ForInFeedback::kEnumCacheKeysAndIndices) |
                static_cast<int>(ForInFeedback::kEnumCacheKeys)) ==
               static_cast<int>(ForInFeedback::kEnumCacheKeys));
 static_assert((static_cast<int>(ForInFeedback::kEnumCacheKeys) |
+               static_cast<int>(ForInFeedback::kAny)) ==
+              static_cast<int>(ForInFeedback::kAny));
+static_assert((static_cast<int>(ForInFeedback::kNone) |
+               static_cast<int>(ForInFeedback::kEnumeratorHolder)) ==
+              static_cast<int>(ForInFeedback::kEnumeratorHolder));
+static_assert((static_cast<int>(ForInFeedback::kEnumCacheKeysAndIndices) |
+               static_cast<int>(ForInFeedback::kEnumeratorHolder)) ==
+              static_cast<int>(ForInFeedback::kAny));
+static_assert((static_cast<int>(ForInFeedback::kEnumCacheKeys) |
+               static_cast<int>(ForInFeedback::kEnumeratorHolder)) ==
+              static_cast<int>(ForInFeedback::kAny));
+static_assert((static_cast<int>(ForInFeedback::kEnumeratorHolder) |
                static_cast<int>(ForInFeedback::kAny)) ==
               static_cast<int>(ForInFeedback::kAny));
 

@@ -4,6 +4,7 @@
 
 #include "src/heap/heap.h"
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -28,6 +29,7 @@
 #include "src/api/api-inl.h"
 #include "src/base/bounded-page-allocator.h"
 #include "src/base/strings.h"
+#include "src/base/unique-array.h"
 #include "src/builtins/builtins-inl.h"
 #include "src/codegen/assembler-inl.h"
 #include "src/codegen/compilation-cache.h"
@@ -2423,7 +2425,7 @@ TEST_F(HeapTest, OptimizedPretenuringNestedDoubleLiterals) {
   static const int kPretenureCreationCount =
       PretenuringHandler::GetMinMementoCountForTesting() + 1;
 
-  auto source = base::OwnedVector<char>::NewForOverwrite(1024);
+  auto source = base::UniqueArray<char>::NewForOverwrite(1024);
   base::SNPrintF(source.as_vector(),
                  "var number_elements = %d;"
                  "var elements = new Array(number_elements);"
@@ -2473,7 +2475,7 @@ TEST_F(HeapTest, OptimizedPretenuringNestedInObjectProperties) {
   static const int kPretenureCreationCount =
       PretenuringHandler::GetMinMementoCountForTesting() + 1;
 
-  auto source = base::OwnedVector<char>::NewForOverwrite(1024);
+  auto source = base::UniqueArray<char>::NewForOverwrite(1024);
   base::SNPrintF(
       source.as_vector(),
       "let number_elements = %d;"
@@ -2516,7 +2518,7 @@ TEST_F(HeapTest, OptimizedPretenuringNestedObjectLiterals) {
   static const int kPretenureCreationCount =
       PretenuringHandler::GetMinMementoCountForTesting() + 1;
 
-  auto source = base::OwnedVector<char>::NewForOverwrite(1024);
+  auto source = base::UniqueArray<char>::NewForOverwrite(1024);
   base::SNPrintF(source.as_vector(),
                  "var number_elements = %d;"
                  "var elements = new Array(number_elements);"
@@ -2566,7 +2568,7 @@ TEST_F(HeapTest, OptimizedPretenuringMixedInObjectProperties) {
   static const int kPretenureCreationCount =
       PretenuringHandler::GetMinMementoCountForTesting() + 1;
 
-  auto source = base::OwnedVector<char>::NewForOverwrite(1024);
+  auto source = base::UniqueArray<char>::NewForOverwrite(1024);
   base::SNPrintF(source.as_vector(),
                  "var number_elements = %d;"
                  "var elements = new Array(number_elements);"
@@ -2617,7 +2619,7 @@ TEST_F(HeapTest, OptimizedPretenuringDoubleArrayLiterals) {
   static const int kPretenureCreationCount =
       PretenuringHandler::GetMinMementoCountForTesting() + 1;
 
-  auto source = base::OwnedVector<char>::NewForOverwrite(1024);
+  auto source = base::UniqueArray<char>::NewForOverwrite(1024);
   base::SNPrintF(source.as_vector(),
                  "var number_elements = %d;"
                  "var elements = new Array(number_elements);"
@@ -2660,7 +2662,7 @@ TEST_F(HeapTest, OptimizedPretenuringNestedMixedArrayLiterals) {
   static const int kPretenureCreationCount =
       PretenuringHandler::GetMinMementoCountForTesting() + 1;
 
-  auto source = base::OwnedVector<char>::NewForOverwrite(1024);
+  auto source = base::UniqueArray<char>::NewForOverwrite(1024);
   base::SNPrintF(source.as_vector(),
                  "var number_elements = %d;"
                  "var elements = new Array(number_elements);"
@@ -3511,9 +3513,9 @@ TEST_F(HeapTest, TransitionArrayShrinksDuringAllocToZero) {
   {
     AlwaysAllocateScopeForTesting always_allocate(heap());
     for (int i = 0; i < transitions_count; i++) {
-      base::EmbeddedVector<char, 64> buffer;
+      std::array<char, 64> buffer;
       base::SNPrintF(buffer, "var o = new F; o.prop%d = %d;", i, i);
-      RunJS(buffer.begin());
+      RunJS(buffer.data());
     }
   }
   RunJS("var root = new F;");
@@ -3562,9 +3564,9 @@ TEST_F(HeapTest, TransitionArrayShrinksDuringAllocToOne) {
   {
     AlwaysAllocateScopeForTesting always_allocate(heap());
     for (int i = 0; i < transitions_count; i++) {
-      base::EmbeddedVector<char, 64> buffer;
+      std::array<char, 64> buffer;
       base::SNPrintF(buffer, "var o = new F; o.prop%d = %d;", i, i);
-      RunJS(buffer.begin());
+      RunJS(buffer.data());
     }
   }
   RunJS("var root = new F;");
@@ -3608,9 +3610,9 @@ TEST_F(HeapTest, TransitionArrayShrinksDuringAllocToOnePropertyFound) {
   {
     AlwaysAllocateScopeForTesting always_allocate(heap());
     for (int i = 0; i < transitions_count; i++) {
-      base::EmbeddedVector<char, 64> buffer;
+      std::array<char, 64> buffer;
       base::SNPrintF(buffer, "var o = new F; o.prop%d = %d;", i, i);
-      RunJS(buffer.begin());
+      RunJS(buffer.data());
     }
   }
   RunJS("var root = new F;");
@@ -4460,7 +4462,7 @@ TEST_F(HeapTest, EnsureAllocationSiteDependentCodesProcessed) {
 namespace {
 void OptimizeEmptyFunction(TestWithHeapInternals* test, const char* name) {
   HandleScope inner_scope(test->i_isolate());
-  base::EmbeddedVector<char, 256> source;
+  std::array<char, 256> source;
   base::SNPrintF(source,
                  "function %s() { return 0; }"
                  "%%PrepareFunctionForOptimization(%s);"
@@ -4468,7 +4470,7 @@ void OptimizeEmptyFunction(TestWithHeapInternals* test, const char* name) {
                  "%%OptimizeFunctionOnNextCall(%s);"
                  "%s();",
                  name, name, name, name, name, name);
-  test->RunJS(source.begin());
+  test->RunJS(source.data());
 }
 
 // Count the number of native contexts in the weak list of native contexts.

@@ -1387,7 +1387,8 @@ MaybeHandle<Code> GetOrCompileOptimized(
 void SpawnDuplicateConcurrentJobForStressTesting(
     Isolate* isolate, DirectHandle<JSFunction> function, ConcurrencyMode mode,
     CodeKind code_kind) {
-  // TODO(v8:7700): Support Maglev.
+  // TODO(v8:7700): Support Maglev (--maglev-as-top-tier currently explicitly
+  // disables --stress-concurrent-inlining).
   if (code_kind == CodeKind::MAGLEV) return;
 
   if (function->ActiveTierIsTurbofan(isolate)) return;
@@ -2875,8 +2876,8 @@ void BackgroundDeserializeTask::Run() {
   LocalHandleScope handle_scope(&isolate);
 
   DirectHandle<SharedFunctionInfo> inner_result;
-  off_thread_data_ =
-      CodeSerializer::StartDeserializeOffThread(&isolate, &cached_data_);
+  CodeSerializer::StartDeserializeOffThread(&isolate, &cached_data_,
+                                            &off_thread_data_);
   if (off_thread_data_.HasResult()) {
     Tagged<Script> script = *off_thread_data_.GetOnlyScript(isolate.heap());
     script_type_timer.set_histogram(
@@ -2898,6 +2899,11 @@ void BackgroundDeserializeTask::SourceTextAvailable(
     Isolate* isolate, Handle<String> source_text,
     const ScriptDetails& script_details) {
   DCHECK_EQ(isolate, isolate_for_local_isolate_);
+  if (!CodeSerializer::NotifySourceTextAvailable(isolate, &off_thread_data_,
+                                                 &cached_data_, source_text,
+                                                 script_details)) {
+    return;
+  }
   LanguageMode language_mode = construct_language_mode(v8_flags.use_strict);
   background_merge_task_.SetUpOnMainThread(isolate, source_text, script_details,
                                            language_mode);

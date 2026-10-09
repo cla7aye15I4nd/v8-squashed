@@ -4,6 +4,7 @@
 
 #include "src/compiler/backend/register-allocator.h"
 
+#include <array>
 #include <iomanip>
 #include <optional>
 
@@ -278,7 +279,7 @@ bool LiveRange::RegisterFromFirstHint(int* register_index) {
     return false;
   }
   DCHECK_GE(positions_span_[current_hint_position_index_]->pos(),
-            positions_span_.first()->pos());
+            positions_span_.front()->pos());
   DCHECK_LE(positions_span_[current_hint_position_index_]->pos(), End());
 
   bool needs_revisit = false;
@@ -531,8 +532,8 @@ bool LiveRange::ShouldBeAllocatedBefore(const LiveRange* other) const {
     }
     if (positions_span_.empty()) return false;
     if (other->positions_span_.empty()) return true;
-    UsePosition* pos = positions_span_.first();
-    UsePosition* other_pos = other->positions_span_.first();
+    UsePosition* pos = positions_span_.front();
+    UsePosition* other_pos = other->positions_span_.front();
     // To make the order total, handle the case where both positions are equal.
     if (pos->pos() == other_pos->pos()) {
       return TopLevel()->vreg() < other->TopLevel()->vreg();
@@ -1053,8 +1054,8 @@ AreUseIntervalsIntersectingVector(base::Vector<const UseInterval> a,
                                   base::Vector<const UseInterval> b) {
   SLOW_DCHECK(std::is_sorted(a.begin(), a.end()) &&
               std::is_sorted(b.begin(), b.end()));
-  if (a.empty() || b.empty() || a.last().end() <= b.first().start() ||
-      b.last().end() <= a.first().start()) {
+  if (a.empty() || b.empty() || a.back().end() <= b.front().start() ||
+      b.back().end() <= a.front().start()) {
     return {};
   }
 
@@ -1065,7 +1066,7 @@ AreUseIntervalsIntersectingVector(base::Vector<const UseInterval> a,
 
   auto a_it = a.begin();
   // Advance `b` already to the interval that ends at or after `a_start`.
-  LifetimePosition a_start = a.first().start();
+  LifetimePosition a_start = a.front().start();
   auto b_it = std::lower_bound(
       b.begin(), b.end(), a_start,
       [](const UseInterval& interval, LifetimePosition position) {
@@ -1283,8 +1284,8 @@ bool RegisterAllocationData::ExistsUseWithoutDefinition() {
            operand_index);
     LiveRange* range = GetLiveRangeFor(operand_index);
     PrintF("  (first use is at position %d in instruction %d)\n",
-           range->positions().first()->pos().value(),
-           range->positions().first()->pos().ToInstructionIndex());
+           range->positions().front()->pos().value(),
+           range->positions().front()->pos().ToInstructionIndex());
     if (debug_name() == nullptr) {
       PrintF("\n");
     } else {
@@ -1477,6 +1478,19 @@ void ConstraintBuilder::AllocateFixed(UnallocatedOperand* operand, int pos,
     rep = data()->RepresentationFor(virtual_register);
   }
   if (operand->HasFixedSlotPolicy()) {
+#ifdef V8_TARGET_ARCH_X64
+    // A fixed slot is only ever used for ABI-visible locations (e.g. a wasm
+    // return value spilled to its caller frame slot), and Simd256 is never
+    // an ABI-visible type. So a Simd256 representation here can only come
+    // from an ExtractF128 node with lane 0 that got elided and aliased to
+    // its Simd256 input (see VisitExtractF128 on x64). Narrow it back to
+    // Simd128 so the move only writes the low 128 bits into the fixed slot,
+    // instead of overwriting the adjacent stack slot with the upper 128
+    // bits of the aliased Simd256 value.
+    if (rep == MachineRepresentation::kSimd256) {
+      rep = MachineRepresentation::kSimd128;
+    }
+#endif
     allocated = AllocatedOperand(AllocatedOperand::STACK_SLOT, rep,
                                  operand->fixed_slot_index());
   } else if (operand->HasFixedRegisterPolicy()) {
@@ -4108,7 +4122,7 @@ void LinearScanAllocator::FindFreeRegistersForRange(
 // which are expensive.
 void LinearScanAllocator::ProcessCurrentRange(LiveRange* current,
                                               SpillMode spill_mode) {
-  base::EmbeddedVector<LifetimePosition, RegisterConfiguration::kMaxRegisters>
+  std::array<LifetimePosition, RegisterConfiguration::kMaxRegisters>
       free_until_pos;
   FindFreeRegistersForRange(current, free_until_pos);
   if (!TryAllocatePreferredReg(current, free_until_pos)) {
@@ -4257,10 +4271,10 @@ void LinearScanAllocator::AllocateBlockedReg(LiveRange* current,
   // use_pos keeps track of positions a register/alias is used at.
   // block_pos keeps track of positions where a register/alias is blocked
   // from.
-  base::EmbeddedVector<LifetimePosition, RegisterConfiguration::kMaxRegisters>
-      use_pos(LifetimePosition::MaxPosition());
-  base::EmbeddedVector<LifetimePosition, RegisterConfiguration::kMaxRegisters>
-      block_pos(LifetimePosition::MaxPosition());
+  std::array<LifetimePosition, RegisterConfiguration::kMaxRegisters> use_pos;
+  use_pos.fill(LifetimePosition::MaxPosition());
+  std::array<LifetimePosition, RegisterConfiguration::kMaxRegisters> block_pos;
+  block_pos.fill(LifetimePosition::MaxPosition());
 
   for (LiveRange* range : active_live_ranges()) {
     int cur_reg = range->assigned_register();

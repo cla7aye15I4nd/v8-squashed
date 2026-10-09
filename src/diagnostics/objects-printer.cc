@@ -9,6 +9,7 @@
 #include "include/v8-internal.h"
 #include "src/api/api-arguments.h"
 #include "src/base/logging.h"
+#include "src/base/unique-array.h"
 #include "src/common/assert-scope.h"
 #include "src/common/globals.h"
 #include "src/diagnostics/disasm.h"
@@ -2311,7 +2312,7 @@ void JSDate::JSDatePrint(std::ostream& os) {
     os << "\n - time = NaN\n";
   } else {
     // TODO(svenpanne) Add some basic formatting to our streams.
-    auto buf = base::OwnedVector<char>::NewForOverwrite(100);
+    auto buf = base::UniqueArray<char>::NewForOverwrite(100);
     SNPrintF(buf.as_vector(), "\n - time = %s %04d/%02d/%02d %02d:%02d:%02d\n",
              weekdays[IsSmi(weekday()) ? Smi::ToInt(weekday()) + 1 : 0],
              IsSmi(year()) ? Smi::ToInt(year()) : -1,
@@ -3692,6 +3693,15 @@ void Tuple2::Tuple2Print(std::ostream& os) {
   os << '\n';
 }
 
+void ForInEnumeratorHolder::ForInEnumeratorHolderPrint(std::ostream& os) {
+  this->PrintHeader(os, "ForInEnumeratorHolder");
+  os << "\n - enum_cache_map: " << Brief(this->enum_cache_map());
+  os << "\n - named_keys: " << Brief(this->named_keys());
+  os << "\n - elements_length: " << this->elements_length();
+  os << "\n - cache_length: " << this->cache_length();
+  os << '\n';
+}
+
 void AliasedArgumentsEntry::AliasedArgumentsEntryPrint(std::ostream& os) {
   PrintHeader(os, "AliasedArgumentsEntry");
   os << "\n - aliased_context_slot: " << aliased_context_slot();
@@ -4714,6 +4724,11 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
       break;
     }
 #if V8_ENABLE_WEBASSEMBLY
+    case WASM_CUSTOM_MAP_TYPE:
+      os << "<WasmCustomMap [canonical type "
+         << Cast<WasmCustomMap>(this)->wasm_type_info()->type_index().index
+         << "]>";
+      break;
     case WASM_DISPATCH_TABLE_TYPE:
       os << "<WasmDispatchTable["
          << TrustedCast<WasmDispatchTable>(this)->length() << "]>";
@@ -4786,7 +4801,7 @@ void Map::MapPrint(std::ostream& os) {
   bool is_meta_map = IsMetaMap(this);
   bool is_extended_map = Is<ExtendedMap>(this);
 #if V8_ENABLE_WEBASSEMBLY
-  bool is_wasm_map = IsWasmObjectMap(this);
+  bool is_wasm_map = IsAnyWasmObjectMap(this);
 #else
   constexpr bool is_wasm_map = false;
 #endif  // V8_ENABLE_WEBASSEMBLY

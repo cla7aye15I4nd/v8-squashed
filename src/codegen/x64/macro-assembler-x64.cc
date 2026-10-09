@@ -905,8 +905,10 @@ void MacroAssembler::ResolveIndirectPointerHandle(
     xorq(destination, destination);
     bind(&done);
 
-    shlq(destination, Immediate(16));
-    shrq(destination, Immediate(16));
+    constexpr int kUntagShift =
+        kBitsPerSystemPointer - (kTrustedPointerTableTagShift - 1);
+    shlq(destination, Immediate(kUntagShift));
+    shrq(destination, Immediate(kUntagShift));
   }
 }
 
@@ -936,7 +938,7 @@ void MacroAssembler::LoadParameterCountFromJSDispatchTable(
   shll(destination, Immediate(kJSDispatchTableEntrySizeLog2));
   static_assert(JSDispatchEntry::kParameterCountMask == 0xffff);
   movzxwq(destination, Operand(kScratchRegister, destination, times_1,
-                               JSDispatchEntry::kCodeObjectOffset));
+                               JSDispatchEntry::kParameterCountOffset));
 }
 
 void MacroAssembler::LoadEntrypointAndParameterCountFromJSDispatchTable(
@@ -954,7 +956,7 @@ void MacroAssembler::LoadEntrypointAndParameterCountFromJSDispatchTable(
                            JSDispatchEntry::kEntrypointOffset));
   static_assert(JSDispatchEntry::kParameterCountMask == 0xffff);
   movzxwq(parameter_count, Operand(kScratchRegister, offset, times_1,
-                                   JSDispatchEntry::kCodeObjectOffset));
+                                   JSDispatchEntry::kParameterCountOffset));
 }
 
 void MacroAssembler::PushDispatchHandle(Register dispatch_handle,

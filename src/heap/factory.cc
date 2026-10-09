@@ -13,6 +13,7 @@
 
 #include "src/ast/ast-source-ranges.h"
 #include "src/base/strong-alias.h"
+#include "src/base/unique-array.h"
 #include "src/builtins/accessors.h"
 #include "src/builtins/builtins-promise.h"
 #include "src/builtins/constants-table-builder.h"
@@ -308,7 +309,7 @@ Tagged<HeapObject> Factory::AllocateRaw(int size, AllocationType allocation,
 
 Tagged<HeapObject> Factory::AllocateRawWithAllocationSite(
     DirectHandle<Map> map, AllocationType allocation,
-    DirectHandle<AllocationSite> allocation_site) {
+    MaybeDirectHandle<AllocationSite> allocation_site) {
   DCHECK(!InstanceTypeChecker::IsMap(map->instance_type()));
   const auto [write_barrier_mode, should_allocate_memento] =
       allocation == AllocationType::kYoung
@@ -329,7 +330,8 @@ Tagged<HeapObject> Factory::AllocateRawWithAllocationSite(
     const int aligned_size = ALIGN_TO_ALLOCATION_ALIGNMENT(instance_size);
     Tagged<AllocationMemento> alloc_memento = UncheckedCast<AllocationMemento>(
         Tagged<Object>(result.ptr() + aligned_size));
-    InitializeAllocationMemento(alloc_memento, *allocation_site);
+    InitializeAllocationMemento(alloc_memento,
+                                *allocation_site.ToHandleChecked());
   }
   return result;
 }
@@ -435,6 +437,20 @@ DirectHandle<Tuple2> Factory::NewTuple2(DirectHandle<Object> value1,
   DisallowGarbageCollection no_gc;
   result->set_value1(*value1, tag);
   result->set_value2(*value2, tag);
+  return direct_handle(result, isolate());
+}
+
+DirectHandle<ForInEnumeratorHolder> Factory::NewForInEnumeratorHolder(
+    DirectHandle<Map> enum_cache_map, DirectHandle<FixedArray> named_keys,
+    Tagged<Smi> elements_length, Tagged<Smi> cache_length,
+    AllocationType allocation) {
+  auto result = NewStructInternal<ForInEnumeratorHolder>(
+      FOR_IN_ENUMERATOR_HOLDER_TYPE, allocation, false);
+  DisallowGarbageCollection no_gc;
+  result->set_enum_cache_map(*enum_cache_map);
+  result->set_named_keys(*named_keys);
+  result->set_elements_length(elements_length);
+  result->set_cache_length(cache_length);
   return direct_handle(result, isolate());
 }
 
@@ -957,18 +973,18 @@ MaybeHandle<String> NewStringFromUtf8Variant(Isolate* isolate,
   UNREACHABLE();
 }
 
-inline base::OwnedVector<uint8_t> CopyBytes(const base::Atomic8* src,
+inline base::UniqueArray<uint8_t> CopyBytes(const base::Atomic8* src,
                                             size_t length) {
-  auto copy = base::OwnedVector<uint8_t>::NewForOverwrite(length);
+  auto copy = base::UniqueArray<uint8_t>::NewForOverwrite(length);
   base::Relaxed_Memcpy(reinterpret_cast<base::Atomic8*>(copy.data()), src,
                        length);
   return copy;
 }
 
 #if V8_ENABLE_WEBASSEMBLY
-inline base::OwnedVector<uint16_t> CopyCodeUnits(const base::Atomic16* src,
+inline base::UniqueArray<uint16_t> CopyCodeUnits(const base::Atomic16* src,
                                                  size_t length) {
-  auto copy = base::OwnedVector<uint16_t>::NewForOverwrite(length);
+  auto copy = base::UniqueArray<uint16_t>::NewForOverwrite(length);
   for (size_t i = 0; i < length; i++) {
     auto dest = reinterpret_cast<base::Atomic16*>(copy.data() + i);
     base::Relaxed_Store(dest, base::Relaxed_Load(src + i));
@@ -987,7 +1003,7 @@ MaybeHandle<String> Factory::NewStringFromUtf8(
     // strings from them anyway.
     THROW_NEW_ERROR(isolate(), NewInvalidStringLengthError());
   }
-  base::OwnedVector<uint8_t> private_copy;
+  base::UniqueArray<uint8_t> private_copy;
   if (config.source_shared()) {
     private_copy = CopyBytes(
         reinterpret_cast<const base::Atomic8*>(string.data()), string.size());
@@ -1022,7 +1038,7 @@ MaybeDirectHandle<String> Factory::NewStringFromUtf8(
   static_assert(WasmArray::MaxLength(sizeof(uint8_t)) <= kMaxInt);
 
   uint32_t length = end - start;
-  base::OwnedVector<uint8_t> private_copy;
+  base::UniqueArray<uint8_t> private_copy;
   if (config.source_shared()) {
     private_copy = CopyBytes(
         reinterpret_cast<const base::Atomic8*>(array->ElementAddress(start)),
@@ -1090,7 +1106,7 @@ MaybeDirectHandle<String> Factory::NewStringFromUtf16(
   static_assert(WasmArray::MaxLength(sizeof(uint16_t)) <= kMaxInt);
 
   uint32_t length = end - start;
-  base::OwnedVector<uint16_t> private_copy;
+  base::UniqueArray<uint16_t> private_copy;
   if (config.source_shared()) {
     private_copy = CopyCodeUnits(
         reinterpret_cast<const base::Atomic16*>(array->ElementAddress(start)),
@@ -1213,7 +1229,7 @@ MaybeDirectHandle<String> Factory::NewStringFromTwoByteLittleEndian(
   if (str.size() > String::kMaxLength) {
     THROW_NEW_ERROR(isolate(), NewInvalidStringLengthError());
   }
-  base::OwnedVector<uint16_t> private_copy;
+  base::UniqueArray<uint16_t> private_copy;
   if (config.source_shared()) {
     private_copy = CopyCodeUnits(
         reinterpret_cast<const base::Atomic16*>(str.data()), str.size());
@@ -3665,7 +3681,7 @@ void Factory::InitializeJSObjectBody(Tagged<JSObject> obj, Tagged<Map> map,
 
 Handle<JSObject> Factory::NewJSObjectFromMap(
     DirectHandle<Map> map, AllocationType allocation,
-    DirectHandle<AllocationSite> allocation_site,
+    MaybeDirectHandle<AllocationSite> allocation_site,
     NewJSObjectType new_js_object_type) {
   // JSFunctions should be allocated using AllocateFunction to be
   // properly initialized.
@@ -3694,7 +3710,7 @@ Handle<JSObject> Factory::NewJSObjectFromMap(
 
 Handle<JSObject> Factory::NewSlowJSObjectFromMap(
     DirectHandle<Map> map, int capacity, AllocationType allocation,
-    DirectHandle<AllocationSite> allocation_site,
+    MaybeDirectHandle<AllocationSite> allocation_site,
     NewJSObjectType new_js_object_type) {
   DCHECK(map->is_dictionary_map());
   DirectHandle<HeapObject> object_properties;
@@ -4914,8 +4930,8 @@ DirectHandle<String> Factory::ToPrimitiveHintString(ToPrimitiveHint hint) {
 DirectHandle<Map> Factory::CreateSloppyFunctionMap(
     FunctionMode function_mode,
     MaybeDirectHandle<JSFunction> maybe_empty_function) {
-  // TODO(syg): Does sloppy/strict function map distinction need to exist
-  // anymore after V8_FUNCTION_ARGUMENTS_CALLER_ARE_OWN_PROPS is removed?
+  // TODO(https://crbug.com/414525205): Merge sloppy and strict function maps
+  // now that legacy .arguments and .caller are no longer own properties.
   bool has_prototype = IsFunctionModeWithPrototype(function_mode);
   InstanceType instance_type;
   int header_size;
@@ -4927,9 +4943,6 @@ DirectHandle<Map> Factory::CreateSloppyFunctionMap(
     header_size = JSFunctionWithoutPrototype::kHeaderSize;
   }
   int descriptors_count = has_prototype ? 3 : 2;
-#ifdef V8_FUNCTION_ARGUMENTS_CALLER_ARE_OWN_PROPS
-  descriptors_count += 2;
-#endif
   int inobject_properties_count = 0;
   if (IsFunctionModeWithName(function_mode)) ++inobject_properties_count;
 
@@ -4991,18 +5004,6 @@ DirectHandle<Map> Factory::CreateSloppyFunctionMap(
         name_string(), function_name_accessor(), roc_attribs);
     map->AppendDescriptor(isolate(), &d);
   }
-#ifdef V8_FUNCTION_ARGUMENTS_CALLER_ARE_OWN_PROPS
-  {  // Add arguments accessor.
-    Descriptor d = Descriptor::AccessorConstant(
-        arguments_string(), function_arguments_accessor(), ro_attribs);
-    map->AppendDescriptor(isolate(), &d);
-  }
-  {  // Add caller accessor.
-    Descriptor d = Descriptor::AccessorConstant(
-        caller_string(), function_caller_accessor(), ro_attribs);
-    map->AppendDescriptor(isolate(), &d);
-  }
-#endif  // V8_FUNCTION_ARGUMENTS_CALLER_ARE_OWN_PROPS
   if (IsFunctionModeWithPrototype(function_mode)) {
     // Add prototype accessor.
     PropertyAttributes attribs =

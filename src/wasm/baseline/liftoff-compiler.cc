@@ -4,9 +4,11 @@
 
 #include "src/wasm/baseline/liftoff-compiler.h"
 
+#include <array>
 #include <optional>
 
 #include "src/base/enum-set.h"
+#include "src/base/unique-array.h"
 #include "src/codegen/assembler-inl.h"
 // TODO(clemensb): Remove dependences on compiler stuff.
 #include "src/codegen/external-reference.h"
@@ -899,7 +901,8 @@ class LiftoffCompiler {
         safepoint_table_builder_(zone_),
         next_breakpoint_ptr_(options.breakpoints.begin()),
         next_breakpoint_end_(options.breakpoints.end()),
-        dead_breakpoint_(options.dead_breakpoint),
+        next_dead_breakpoint_ptr_(options.dead_breakpoints.begin()),
+        next_dead_breakpoint_end_(options.dead_breakpoints.end()),
         handlers_(zone),
         max_steps_(options.max_steps),
         deopt_info_bytecode_offset_(options.deopt_info_bytecode_offset),
@@ -916,6 +919,9 @@ class LiftoffCompiler {
     DCHECK_IMPLIES(
         next_breakpoint_ptr_ == next_breakpoint_end_,
         next_breakpoint_ptr_ == nullptr && next_breakpoint_end_ == nullptr);
+    DCHECK_IMPLIES(next_dead_breakpoint_ptr_ == next_dead_breakpoint_end_,
+                   next_dead_breakpoint_ptr_ == nullptr &&
+                       next_dead_breakpoint_end_ == nullptr);
     DCHECK_IMPLIES(!for_debugging_, debug_sidetable_builder_ == nullptr);
 
     if (v8_flags.wasm_code_coverage) {
@@ -942,12 +948,12 @@ class LiftoffCompiler {
     return std::move(frame_description_);
   }
 
-  base::OwnedVector<uint8_t> GetSourcePositionTable() {
+  base::UniqueArray<uint8_t> GetSourcePositionTable() {
     return source_position_table_builder_.ToSourcePositionTableVector();
   }
 
-  base::OwnedVector<uint8_t> GetTrappingInstructionsData() const {
-    return base::OwnedCopyOf(base::Vector<const uint8_t>::cast(
+  base::UniqueArray<uint8_t> GetTrappingInstructionsData() const {
+    return base::UniqueCopyOf(base::Vector<const uint8_t>::cast(
         base::VectorOf(trapping_instructions_)));
   }
 
@@ -998,9 +1004,9 @@ class LiftoffCompiler {
       default:
         UNREACHABLE();
     }
-    base::EmbeddedVector<char, 128> buffer;
-    SNPrintF(buffer, "%s %s", name(kind), context);
-    unsupported(decoder, bailout_reason, buffer.begin());
+    std::array<char, 128> buffer;
+    base::SNPrintF(buffer, "%s %s", name(kind), context);
+    unsupported(decoder, bailout_reason, buffer.data());
     return false;
   }
 
@@ -1596,6 +1602,7 @@ class LiftoffCompiler {
     // The previous calls may have also generated a bailout.
     DidAssemblerBailout(decoder);
     DCHECK_EQ(num_exceptions_, 0);
+    DCHECK_NULL(next_dead_breakpoint_ptr_);
 
     if (v8_flags.wasm_inlining && !encountered_call_instructions_.empty()) {
       // Update the call targets stored in the WasmModule.
@@ -1604,10 +1611,10 @@ class LiftoffCompiler {
       FunctionTypeFeedback& function_feedback =
           type_feedback.feedback_for_function[func_index_];
       function_feedback.liftoff_frame_size = __ GetTotalFrameSize();
-      base::OwnedVector<uint32_t>& call_targets =
+      base::UniqueArray<uint32_t>& call_targets =
           function_feedback.call_targets;
       if (call_targets.empty()) {
-        call_targets = base::OwnedCopyOf(encountered_call_instructions_);
+        call_targets = base::UniqueCopyOf(encountered_call_instructions_);
       } else {
         DCHECK_EQ(call_targets.as_vector(),
                   base::VectorOf(encountered_call_instructions_));
@@ -1763,16 +1770,26 @@ class LiftoffCompiler {
       }
     }
 
+    bool has_dead_breakpoint = false;
+    if (next_dead_breakpoint_ptr_) {
+      DCHECK_LE(decoder->position(), *next_dead_breakpoint_ptr_);
+      if (*next_dead_breakpoint_ptr_ == decoder->position()) {
+        DCHECK(!has_breakpoint);
+        has_dead_breakpoint = true;
+        if (++next_dead_breakpoint_ptr_ == next_dead_breakpoint_end_) {
+          next_dead_breakpoint_ptr_ = next_dead_breakpoint_end_ = nullptr;
+        }
+      }
+    }
+
     if (has_breakpoint) {
       CODE_COMMENT("breakpoint");
       EmitBreakpoint(decoder);
-    } else if (dead_breakpoint_ == decoder->position()) {
-      DCHECK(!next_breakpoint_ptr_ ||
-             *next_breakpoint_ptr_ != dead_breakpoint_);
-      // The top frame is paused at this position, but the breakpoint was
-      // removed. Adding a dead breakpoint here ensures that the source
-      // position exists, and that the offset to the return address is the
-      // same as in the old code.
+    } else if (has_dead_breakpoint) {
+      // A frame is paused at this position, but the breakpoint was removed.
+      // Adding a dead breakpoint here ensures that the source position exists,
+      // and that the offset to the return address is the same as in the old
+      // code.
       CODE_COMMENT("dead breakpoint");
       Label cont;
       __ emit_jump(&cont);
@@ -2221,7 +2238,7 @@ class LiftoffCompiler {
     // There is an extra copy of the exception at this point, below the unpacked
     // values (if any). It will be dropped in the branch below.
     BrOrRet(decoder, catch_case.br_imm.depth);
-    bool is_last = &catch_case == &block->catch_cases.last();
+    bool is_last = &catch_case == &block->catch_cases.back();
     if (is_last && !decoder->HasCatchAll(block)) {
       __ bind(&block->try_info->catch_label);
       __ cache_state()->Steal(block->try_info->catch_state);
@@ -4892,11 +4909,11 @@ class LiftoffCompiler {
     }
   }
 
-  base::OwnedVector<ValueType> GetStackValueTypesForDebugging(
+  base::UniqueArray<ValueType> GetStackValueTypesForDebugging(
       FullDecoder* decoder) {
     DCHECK(for_debugging_);
     auto stack_value_types =
-        base::OwnedVector<ValueType>::NewForOverwrite(decoder->stack_size());
+        base::UniqueArray<ValueType>::NewForOverwrite(decoder->stack_size());
 
     int depth = 0;
     for (ValueType& type : base::Reversed(stack_value_types)) {
@@ -4905,7 +4922,7 @@ class LiftoffCompiler {
     return stack_value_types;
   }
 
-  base::OwnedVector<DebugSideTable::Entry::Value>
+  base::UniqueArray<DebugSideTable::Entry::Value>
   GetCurrentDebugSideTableEntries(
       FullDecoder* decoder,
       DebugSideTableBuilder::AssumeSpilling assume_spilling) {
@@ -4924,7 +4941,7 @@ class LiftoffCompiler {
 #endif
 
     auto values =
-        base::OwnedVector<DebugSideTable::Entry::Value>::NewForOverwrite(
+        base::UniqueArray<DebugSideTable::Entry::Value>::NewForOverwrite(
             stack_state.size());
 
     int index = 0;
@@ -11432,7 +11449,7 @@ class LiftoffCompiler {
   compiler::CallDescriptor* const descriptor_;
   CompilationEnv* const env_;
   DebugSideTableBuilder* const debug_sidetable_builder_;
-  base::OwnedVector<ValueType> stack_value_types_for_debugging_;
+  base::UniqueArray<ValueType> stack_value_types_for_debugging_;
   const ForDebugging for_debugging_;
   LiftoffBailoutReason bailout_reason_ = kNoReason;
   const int func_index_;
@@ -11462,9 +11479,11 @@ class LiftoffCompiler {
   std::unique_ptr<WasmCoverageInstrumentation<FullDecoder>>
       coverage_instrumentation_;
 
-  // Introduce a dead breakpoint to ensure that the calculation of the return
-  // address in OSR is correct.
-  int dead_breakpoint_ = 0;
+  // Introduce dead breakpoints to ensure that the calculation of the return
+  // address in OSR is correct when active frames are paused at removed
+  // breakpoints.
+  const int* next_dead_breakpoint_ptr_ = nullptr;
+  const int* next_dead_breakpoint_end_ = nullptr;
 
   // Remember whether the did function-entry break checks (for "hook on function
   // call" and "break on entry" a.k.a. instrumentation breakpoint). This happens

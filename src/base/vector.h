@@ -6,6 +6,7 @@
 #define V8_BASE_VECTOR_H_
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -54,18 +55,28 @@ class Vector final {
 
   template <typename U, size_t n>
     requires std::is_convertible_v<std::span<U, n>, std::span<T>>
+  // NOLINTNEXTLINE(runtime/explicit)
   constexpr Vector(std::span<U, n> span) : span_(span) {}
+
+  template <typename U, size_t n>
+    requires std::is_convertible_v<std::span<U, n>, std::span<T>>
+  // NOLINTNEXTLINE(runtime/explicit)
+  constexpr Vector(std::array<U, n>& arr V8_LIFETIME_BOUND) : span_(arr) {}
+
+  template <typename U, size_t n>
+    requires std::is_convertible_v<std::span<const U, n>, std::span<T>>
+  // NOLINTNEXTLINE(runtime/explicit)
+  constexpr Vector(const std::array<U, n>& arr V8_LIFETIME_BOUND)
+      : span_(arr) {}
 
   // Returns a vector using the same backing storage as this one,
   // spanning from and including 'from', to but not including 'to'.
   constexpr Vector<T> SubVector(size_t from, size_t to) const {
     DCHECK_LE(from, to);
-    DCHECK_LE(to, size());
-    return Vector<T>(span_.subspan(from, to - from));
+    return subspan(from, to - from);
   }
   constexpr Vector<T> SubVectorFrom(size_t from) const {
-    DCHECK_LE(from, size());
-    return Vector<T>(span_.subspan(from));
+    return subspan(from);
   }
 
   template <class U>
@@ -101,16 +112,31 @@ class Vector final {
 
   const T& at(size_t index) const { return operator[](index); }
 
-  T& first() { return span_.front(); }
-  const T& first() const { return span_.front(); }
+  constexpr T& front() const {
+    DCHECK_LT(0, size());
+    return span_.front();
+  }
 
-  T& last() {
+  constexpr T& back() const {
     DCHECK_LT(0, size());
     return span_.back();
   }
-  const T& last() const {
-    DCHECK_LT(0, size());
-    return span_.back();
+
+  constexpr Vector<T> first(size_t count) const {
+    DCHECK_LE(count, size());
+    return Vector<T>(span_.first(count));
+  }
+
+  constexpr Vector<T> last(size_t count) const {
+    DCHECK_LE(count, size());
+    return Vector<T>(span_.last(count));
+  }
+
+  constexpr Vector<T> subspan(size_t offset,
+                              size_t count = std::dynamic_extent) const {
+    DCHECK_LE(offset, size());
+    DCHECK(count == std::dynamic_extent || count <= size() - offset);
+    return Vector<T>(span_.subspan(offset, count));
   }
 
   // Returns a pointer to the start of the data in the vector.
@@ -157,6 +183,8 @@ class Vector final {
     return {span_.data(), span_.size()};
   }
 
+  explicit constexpr operator std::span<T>() const noexcept { return span_; }
+
   template <typename S>
   static Vector<T> cast(Vector<S> input) {
     // Casting is potentially dangerous, so be really restrictive here. This
@@ -187,125 +215,6 @@ template <typename T>
 V8_INLINE size_t hash_value(base::Vector<T> v) {
   return hash_range(v.begin(), v.end());
 }
-
-template <typename T>
-class OwnedVector final {
- public:
-  OwnedVector() = default;
-
-  OwnedVector(std::unique_ptr<T[]> data, size_t length)
-      : data_(std::move(data)), length_(length) {
-    DCHECK_IMPLIES(length_ > 0, data_ != nullptr);
-  }
-
-  // Disallow copying.
-  OwnedVector(const OwnedVector&) = delete;
-  OwnedVector& operator=(const OwnedVector&) = delete;
-
-  // Move construction and move assignment from {OwnedVector<U>} to
-  // {OwnedVector<T>}, instantiable if {std::unique_ptr<U>} can be converted to
-  // {std::unique_ptr<T>}. Can also be used to convert {OwnedVector<T>} to
-  // {OwnedVector<const T>}.
-  // These also function as the standard move construction/assignment operator.
-  // {other} is left as an empty vector.
-  template <typename U>
-    requires std::is_convertible_v<std::unique_ptr<U>, std::unique_ptr<T>>
-  OwnedVector(OwnedVector<U>&& other) V8_NOEXCEPT {
-    *this = std::move(other);
-  }
-
-  template <typename U>
-    requires std::is_convertible_v<std::unique_ptr<U>, std::unique_ptr<T>>
-  OwnedVector& operator=(OwnedVector<U>&& other) V8_NOEXCEPT {
-    static_assert(sizeof(U) == sizeof(T));
-    data_ = std::move(other.data_);
-    length_ = other.length_;
-    DCHECK_NULL(other.data_);
-    other.length_ = 0;
-    return *this;
-  }
-
-  // Returns the length of the vector as a size_t.
-  constexpr size_t size() const { return length_; }
-
-  // Returns whether or not the vector is empty.
-  constexpr bool empty() const { return length_ == 0; }
-
-  constexpr T* begin() const V8_LIFETIME_BOUND {
-    DCHECK_IMPLIES(length_ > 0, data_ != nullptr);
-    return data_.get();
-  }
-
-  constexpr T* end() const V8_LIFETIME_BOUND { return begin() + length_; }
-
-  // In addition to {begin}, do provide a {data()} accessor for API
-  // compatibility with other sequential containers.
-  constexpr T* data() const V8_LIFETIME_BOUND { return begin(); }
-
-  constexpr std::reverse_iterator<T*> rbegin() const V8_LIFETIME_BOUND {
-    return std::make_reverse_iterator(end());
-  }
-  constexpr std::reverse_iterator<T*> rend() const V8_LIFETIME_BOUND {
-    return std::make_reverse_iterator(begin());
-  }
-
-  // Access individual vector elements - checks bounds in debug mode.
-  T& operator[](size_t index) const V8_LIFETIME_BOUND {
-    DCHECK_LT(index, length_);
-    return data_[index];
-  }
-
-  // Returns a {Vector<T>} view of the data in this vector.
-  Vector<T> as_vector() const V8_LIFETIME_BOUND { return {begin(), size()}; }
-
-  // Releases the backing data from this vector and transfers ownership to the
-  // caller. This vector will be empty afterwards.
-  std::unique_ptr<T[]> ReleaseData() {
-    length_ = 0;
-    return std::move(data_);
-  }
-
-  // Allocates a new vector of the specified size via the default allocator.
-  // Elements in the new vector are value-initialized.
-  static OwnedVector<T> New(size_t size) {
-    if (size == 0) return {};
-    return OwnedVector<T>(std::make_unique<T[]>(size), size);
-  }
-
-  // Allocates a new vector of the specified size via the default allocator and
-  // initializes all elements by assigning from `init`.
-  template <typename U>
-  static OwnedVector<T> New(size_t size, U init) {
-    if (size == 0) return {};
-    OwnedVector<T> vec = NewForOverwrite(size);
-    std::fill_n(vec.begin(), size, init);
-    return vec;
-  }
-
-  // Allocates a new vector of the specified size via the default allocator.
-  // Elements in the new vector are default-initialized.
-  static OwnedVector<T> NewForOverwrite(size_t size) {
-    if (size == 0) return {};
-    return OwnedVector<T>(std::make_unique_for_overwrite<T[]>(size), size);
-  }
-
-  // Allocates a new vector containing the specified collection of values.
-  template <typename U>
-  static OwnedVector<U> NewByCopying(const U* data, size_t size) {
-    auto result = OwnedVector<U>::NewForOverwrite(size);
-    base::Copy(data, data + size, result.begin());
-    return result;
-  }
-
-  bool operator==(std::nullptr_t) const { return data_ == nullptr; }
-
- private:
-  template <typename U>
-  friend class OwnedVector;
-
-  std::unique_ptr<T[]> data_;
-  size_t length_ = 0;
-};
 
 // The vectors returned by {StaticCharVector}, {CStrVector}, or {OneByteVector}
 // do not contain a null-termination byte. If you want the null byte, use
@@ -374,87 +283,6 @@ inline constexpr Vector<const T> VectorOf(
     std::initializer_list<T> list V8_LIFETIME_BOUND) {
   return VectorOf(list.begin(), list.size());
 }
-
-// Construct an OwnedVector from a start pointer and a size.
-// The data will be copied.
-template <typename T>
-inline OwnedVector<T> OwnedCopyOf(const T* data, size_t size) {
-  return OwnedVector<T>::NewByCopying(data, size);
-}
-
-// Construct an OwnedVector from anything compatible with std::data and
-// std::size (e.g. an array, or a container providing a {data()} and {size()}
-// accessor). The data will be copied.
-template <typename Container>
-inline auto OwnedCopyOf(const Container& c)
-    -> decltype(OwnedCopyOf(std::data(c), std::size(c))) {
-  return OwnedCopyOf(std::data(c), std::size(c));
-}
-
-// Container with a fixed storage for `kSize` elements.
-template <typename T, size_t kSize>
-class EmbeddedVector final {
- public:
-  constexpr EmbeddedVector() = default;
-  constexpr explicit EmbeddedVector(const T& initial_value) {
-    std::fill_n(buffer_, kSize, initial_value);
-  }
-  EmbeddedVector(const EmbeddedVector&) = delete;
-  EmbeddedVector& operator=(const EmbeddedVector&) = delete;
-
-  constexpr Vector<T> SubVector(size_t from, size_t to) V8_LIFETIME_BOUND {
-    DCHECK_LE(from, to);
-    DCHECK_LE(to, length_);
-    return Vector<T>(buffer_ + from, to - from);
-  }
-
-  constexpr Vector<T> SubVectorFrom(size_t from) V8_LIFETIME_BOUND {
-    return SubVector(from, length_);
-  }
-
-  constexpr size_t size() const { return length_; }
-
-  constexpr T& operator[](size_t index) V8_LIFETIME_BOUND {
-    DCHECK_LT(index, length_);
-    return buffer_[index];
-  }
-
-  constexpr const T& operator[](size_t index) const V8_LIFETIME_BOUND {
-    DCHECK_LT(index, length_);
-    return buffer_[index];
-  }
-
-  constexpr T* begin() V8_LIFETIME_BOUND { return buffer_; }
-  constexpr const T* begin() const V8_LIFETIME_BOUND { return buffer_; }
-
-  constexpr T* data() V8_LIFETIME_BOUND { return buffer_; }
-
-  constexpr T* end() V8_LIFETIME_BOUND { return buffer_ + length_; }
-  constexpr const T* end() const V8_LIFETIME_BOUND { return buffer_ + length_; }
-
-  constexpr void Truncate(size_t length) {
-    DCHECK_LE(length, length_);
-    length_ = length;
-  }
-
-  constexpr const Vector<T> operator+(size_t offset) V8_LIFETIME_BOUND {
-    return SubVectorFrom(offset);
-  }
-
-  constexpr operator Vector<T>() V8_LIFETIME_BOUND {
-    return Vector<T>(buffer_, length_);
-  }
-
-  template <typename U>
-    requires std::is_convertible_v<T*, const U*> && (sizeof(U) == sizeof(T))
-  constexpr operator Vector<const U>() const V8_LIFETIME_BOUND {
-    return Vector<const U>(buffer_, length_);
-  }
-
- private:
-  T buffer_[kSize];
-  size_t length_ = kSize;
-};
 
 }  // namespace v8::base
 

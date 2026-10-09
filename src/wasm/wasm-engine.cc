@@ -4,11 +4,13 @@
 
 #include "src/wasm/wasm-engine.h"
 
+#include <array>
 #include <optional>
 
 #include "src/base/hashing.h"
 #include "src/base/platform/time.h"
 #include "src/base/small-vector.h"
+#include "src/base/unique-array.h"
 #include "src/codegen/cpu-features.h"
 #include "src/common/assert-scope.h"
 #include "src/common/globals.h"
@@ -647,7 +649,7 @@ bool WasmEngine::SyncValidate(Isolate* isolate, WasmEnabledFeatures enabled,
 MaybeDirectHandle<WasmModuleObject> WasmEngine::SyncCompile(
     Isolate* isolate, WasmEnabledFeatures enabled_features,
     CompileTimeImports compile_imports, ErrorThrower* thrower,
-    base::OwnedVector<const uint8_t> bytes,
+    base::UniqueArray<const uint8_t> bytes,
     base::Vector<const char> source_url) {
   int compilation_id = next_compilation_id_.fetch_add(1);
   TRACE_EVENT("v8.wasm", "wasm.SyncCompile", "id", compilation_id);
@@ -764,7 +766,7 @@ void WasmEngine::AsyncCompile(
     Isolate* isolate, WasmEnabledFeatures enabled,
     CompileTimeImports compile_imports,
     std::shared_ptr<CompilationResultResolver> resolver,
-    base::OwnedVector<const uint8_t> bytes,
+    base::UniqueArray<const uint8_t> bytes,
     const char* api_method_name_for_errors) {
   int compilation_id = next_compilation_id_.fetch_add(1);
   TRACE_EVENT("v8.wasm", "wasm.AsyncCompile", "id", compilation_id);
@@ -940,18 +942,19 @@ DirectHandle<Script> CreateWasmScript(
   } else {
     // Limit the printed hash to 8 characters.
     uint32_t hash = static_cast<uint32_t>(GetWireBytesHash(wire_bytes));
-    base::EmbeddedVector<char, 32> buffer;
+    std::array<char, 32> buffer;
     if (module->name.is_empty()) {
       // Build the URL in the form "wasm://wasm/<hash>".
-      int url_len = SNPrintF(buffer, "wasm://wasm/%08x", hash);
+      int url_len = base::SNPrintF(buffer, "wasm://wasm/%08x", hash);
       DCHECK(url_len >= 0 && static_cast<size_t>(url_len) < buffer.size());
-      url_str = isolate->factory()
-                    ->NewStringFromUtf8(buffer.SubVector(0, url_len),
-                                        AllocationType::kOld)
-                    .ToHandleChecked();
+      url_str =
+          isolate->factory()
+              ->NewStringFromUtf8(base::VectorOf(buffer).SubVector(0, url_len),
+                                  AllocationType::kOld)
+              .ToHandleChecked();
     } else {
       // Build the URL in the form "wasm://wasm/<module name>-<hash>".
-      int hash_len = SNPrintF(buffer, "-%08x", hash);
+      int hash_len = base::SNPrintF(buffer, "-%08x", hash);
       DCHECK(hash_len >= 0 && static_cast<size_t>(hash_len) < buffer.size());
       DirectHandle<String> prefix =
           isolate->factory()->NewStringFromStaticChars("wasm://wasm/");
@@ -960,7 +963,7 @@ DirectHandle<Script> CreateWasmScript(
               isolate, wire_bytes, module->name, kNoInternalize);
       DirectHandle<String> hash_str =
           isolate->factory()
-              ->NewStringFromUtf8(buffer.SubVector(0, hash_len))
+              ->NewStringFromUtf8(base::VectorOf(buffer).SubVector(0, hash_len))
               .ToHandleChecked();
       // Concatenate the three parts.
       url_str = isolate->factory()
@@ -1049,7 +1052,7 @@ MaybeDirectHandle<WasmModuleObject> WasmEngine::ImportNativeModule(
     ErrorThrower thrower(isolate, "WasmEngine::ImportNativeModule");
     return SyncCompile(
         isolate, native_module->enabled_features(), target_imports, &thrower,
-        base::OwnedCopyOf(native_module->wire_bytes()), source_url);
+        base::UniqueCopyOf(native_module->wire_bytes()), source_url);
   }
   ModuleWireBytes wire_bytes(native_module->wire_bytes());
   DirectHandle<Script> script =
@@ -1127,7 +1130,7 @@ CodeTracer* WasmEngine::GetCodeTracer() {
 
 AsyncCompileJob* WasmEngine::CreateAsyncCompileJob(
     WasmEnabledFeatures enabled, CompileTimeImports compile_imports,
-    base::OwnedVector<const uint8_t> bytes, const char* api_method_name,
+    base::UniqueArray<const uint8_t> bytes, const char* api_method_name,
     std::shared_ptr<CompilationResultResolver> resolver, int compilation_id) {
   AsyncCompileJob* job =
       new AsyncCompileJob(enabled, std::move(compile_imports), std::move(bytes),
