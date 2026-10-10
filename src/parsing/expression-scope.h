@@ -234,7 +234,7 @@ class ExpressionScope {
   }
 
   int SetInitializers(int variable_index, int peek_position) {
-    if (CanBeExpression()) {
+    if (CanBeArrowParameterDeclaration()) {
       return AsExpressionParsingScope()->SetInitializers(variable_index,
                                                          peek_position);
     }
@@ -243,6 +243,11 @@ class ExpressionScope {
 
   bool has_possible_arrow_parameter_in_scope_chain() const {
     return has_possible_arrow_parameter_in_scope_chain_;
+  }
+
+  bool CanBeArrowParameterDeclaration() const {
+    return base::IsInRange(type_, kMaybeArrowParameterDeclaration,
+                           kMaybeAsyncArrowParameterDeclaration);
   }
 
  protected:
@@ -340,10 +345,6 @@ class ExpressionScope {
   bool CanBeParameterDeclaration() const {
     return base::IsInRange(type_, kMaybeArrowParameterDeclaration,
                            kParameterDeclaration);
-  }
-  bool CanBeArrowParameterDeclaration() const {
-    return base::IsInRange(type_, kMaybeArrowParameterDeclaration,
-                           kMaybeAsyncArrowParameterDeclaration);
   }
   bool IsCertainlyParameterDeclaration() const {
     return type_ == kParameterDeclaration;
@@ -590,15 +591,12 @@ class ExpressionParsingScope : public ExpressionScope<Types> {
     if (len == 0) return 0;
 
     int end = len - 1;
-    // Loop backwards and abort as soon as we see one that's already set to
-    // avoid a loop on expressions like a,b,c,d,e,f,g (outside of an arrowhead).
-    // TODO(delphick): Look into removing this loop.
     for (int i = end; i >= first_variable_index &&
                       variable_list_.at(i).second == kNoSourcePosition;
          --i) {
       variable_list_.at(i).second = position;
     }
-    return end;
+    return len;
   }
 
   ScopedList<std::pair<VariableProxy*, int>>* variable_list() {
@@ -863,6 +861,7 @@ class ArrowHeadParsingScope : public ExpressionParsingScope<Types> {
   void RecordDeclarationError(const Scanner::Location& loc,
                               MessageTemplate message) {
     DCHECK_IMPLIES(!this->has_error(), loc.IsValid());
+    if (declaration_error_location.IsValid()) return;
     declaration_error_location = loc;
     declaration_error_message = message;
   }

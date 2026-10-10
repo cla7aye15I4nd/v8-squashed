@@ -98,6 +98,11 @@ struct NewCodeOptions {
 template <typename Impl>
 class FactoryBase {
  public:
+  template <typename T, typename... Args>
+  inline DirectHandle<T> New(AllocationType allocation, Args&&... args);
+  template <typename T, AllocationType kAllocation, typename... Args>
+  inline DirectHandle<T> New(Args&&... args);
+
   Handle<Code> NewCode(const NewCodeOptions& options);
 
   DirectHandle<CodeWrapper> NewCodeWrapper();
@@ -135,9 +140,6 @@ class FactoryBase {
 
   template <AllocationType allocation = AllocationType::kYoung>
   inline Handle<UninitializedHeapNumber> NewUninitializedHeapNumber();
-
-  Handle<Struct> NewStruct(InstanceType type,
-                           AllocationType allocation = AllocationType::kYoung);
 
   // Create a pre-tenured empty AccessorPair.
   Handle<AccessorPair> NewAccessorPair();
@@ -401,11 +403,11 @@ class FactoryBase {
   Handle<ClassPositions> NewClassPositions(int start, int end);
 
   Handle<SwissNameDictionary> NewSwissNameDictionary(
-      int at_least_space_for = kSwissNameDictionaryInitialCapacity,
+      uint32_t at_least_space_for = kSwissNameDictionaryInitialCapacity,
       AllocationType allocation = AllocationType::kYoung);
 
   Handle<SwissNameDictionary> NewSwissNameDictionaryWithCapacity(
-      int capacity, AllocationType allocation);
+      uint32_t capacity, AllocationType allocation);
 
   DirectHandle<FunctionTemplateRareData> NewFunctionTemplateRareData();
 
@@ -432,14 +434,6 @@ class FactoryBase {
                                            AllocationType allocation);
   Tagged<HeapObject> AllocateRawWeakArrayList(uint32_t length,
                                               AllocationType allocation);
-
-  template <typename StructType>
-  inline Tagged<StructType> NewStructInternal(InstanceType type,
-                                              AllocationType allocation,
-                                              bool initialize_fields = true);
-  inline Tagged<Struct> NewStructInternal(ReadOnlyRoots roots, Tagged<Map> map,
-                                          int size, AllocationType allocation,
-                                          bool initialize_fields);
 
   AllocationWitness AllocateWithWitness(
       int size, AllocationType allocation,

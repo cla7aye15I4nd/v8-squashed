@@ -150,6 +150,7 @@ class ConsoleHelper {
             m_inspector->client()->currentTimeMS(), type, arguments,
             consoleContextToString(isolate(), m_consoleContext),
             std::move(stackTrace));
+    if (!groupId()) return;
     consoleMessageStorage()->addMessage(std::move(message));
   }
 
@@ -378,6 +379,7 @@ void V8Console::Assert(const v8::debug::ConsoleCallArguments& info,
     arguments.push_back(toV8String(isolate, String16("console.assert")));
   }
   helper.reportCall(ConsoleAPIType::kAssert, arguments);
+  if (!helper.groupId()) return;
   m_inspector->debugger()->breakProgramOnAssert(helper.groupId());
 }
 

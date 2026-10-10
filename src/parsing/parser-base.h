@@ -1174,7 +1174,8 @@ class ParserBase {
                 original_scope_) &&
             IsModule(function_state_->kind())));
     return IsAsyncFunction(kind) ||
-           IsClassStaticInitializerFunction(kind);
+           (IsClassStaticInitializerFunction(kind) &&
+            GetDeclarationScope()->scope_type() == BLOCK_SCOPE);
   }
   bool is_using_allowed() const {
     // UsingDeclaration and AwaitUsingDeclaration are Syntax Errors if the goal
@@ -1342,7 +1343,8 @@ class ParserBase {
   // a pattern.
   V8_INLINE ExpressionT ParseExpression();
   V8_INLINE ExpressionT ParseAssignmentExpression();
-  V8_INLINE ExpressionT ParseConditionalChainAssignmentExpression();
+  V8_INLINE ExpressionT
+  ParseConditionalChainAssignmentExpression(bool* else_found);
 
   // These methods do not wrap the parsing of the expression inside a new
   // expression_scope; they use the outer expression_scope instead. They should
@@ -1355,7 +1357,8 @@ class ParserBase {
   ExpressionT ParseAssignmentExpressionCoverGrammar();
   ExpressionT ParseAssignmentExpressionCoverGrammarContinuation(
       int lhs_beg_pos, ExpressionT expression);
-  ExpressionT ParseConditionalChainAssignmentExpressionCoverGrammar();
+  ExpressionT ParseConditionalChainAssignmentExpressionCoverGrammar(
+      bool* else_found);
 
   ExpressionT ParseArrowParametersWithRest(ExpressionListT* list,
                                            AccumulationScope* scope,
@@ -1885,7 +1888,7 @@ bool ParserBase<Impl>::ClassifyPropertyIdentifier(
   if (next == Token::kAwait) {
     DCHECK(!is_async_function());
     expression_scope()->RecordAsyncArrowParametersError(
-        scanner()->peek_location(), MessageTemplate::kAwaitBindingIdentifier);
+        scanner()->location(), MessageTemplate::kAwaitBindingIdentifier);
   }
   return true;
 }
@@ -2109,12 +2112,6 @@ typename ParserBase<Impl>::ExpressionT ParserBase<Impl>::ParseBindingPattern() {
 
   if (Token::IsAnyIdentifier(token)) {
     IdentifierT name = ParseAndClassifyIdentifier(Next());
-    if (V8_UNLIKELY(is_strict(language_mode()) &&
-                    impl()->IsEvalOrArguments(name))) {
-      impl()->ReportMessageAt(scanner()->location(),
-                              MessageTemplate::kStrictEvalArguments);
-      return impl()->FailureExpression();
-    }
     return impl()->ExpressionFromIdentifier(name, beg_pos);
   }
 
@@ -2314,9 +2311,10 @@ typename ParserBase<Impl>::ExpressionT ParserBase<Impl>::ParseExpression() {
 
 template <typename Impl>
 typename ParserBase<Impl>::ExpressionT
-ParserBase<Impl>::ParseConditionalChainAssignmentExpression() {
+ParserBase<Impl>::ParseConditionalChainAssignmentExpression(bool* else_found) {
   ExpressionParsingScope expression_scope(impl());
-  ExpressionT result = ParseConditionalChainAssignmentExpressionCoverGrammar();
+  ExpressionT result =
+      ParseConditionalChainAssignmentExpressionCoverGrammar(else_found);
   expression_scope.ValidateExpression();
   return result;
 }
@@ -2342,7 +2340,8 @@ ParserBase<Impl>::ParseExpressionCoverGrammar() {
   AccumulationScope accumulation_scope(expression_scope());
   int variable_index = 0;
   while (true) {
-    if (V8_UNLIKELY(peek() == Token::kEllipsis)) {
+    if (V8_UNLIKELY(peek() == Token::kEllipsis &&
+                    expression_scope()->CanBeArrowParameterDeclaration())) {
       return ParseArrowParametersWithRest(&list, &accumulation_scope,
                                           variable_index);
     }
@@ -2351,14 +2350,16 @@ ParserBase<Impl>::ParseExpressionCoverGrammar() {
     expression = ParseAssignmentExpressionCoverGrammar();
 
     ClassifyArrowParameter(&accumulation_scope, expr_pos, expression);
+    if (V8_UNLIKELY(expression_scope()->CanBeArrowParameterDeclaration())) {
+      variable_index =
+          expression_scope()->SetInitializers(variable_index, peek_position());
+    }
     list.Add(expression);
-
-    variable_index =
-        expression_scope()->SetInitializers(variable_index, peek_position());
 
     if (!Check(Token::kComma)) break;
 
-    if (peek() == Token::kRightParen && PeekAhead() == Token::kArrow) {
+    if (expression_scope()->CanBeArrowParameterDeclaration() &&
+        peek() == Token::kRightParen && PeekAhead() == Token::kArrow) {
       // a trailing comma is allowed at the end of an arrow parameter list
       break;
     }
@@ -3213,6 +3214,8 @@ void ParserBase<Impl>::ParseArguments(
               scanner()->peek_location(), MessageTemplate::kParamAfterRest);
         }
       }
+      variable_index =
+          expression_scope()->SetInitializers(variable_index, peek_position());
     } else {
       accumulation_scope.ValidateExpression();
     }
@@ -3221,9 +3224,6 @@ void ParserBase<Impl>::ParseArguments(
       argument = factory()->NewSpread(argument, start_pos, expr_pos);
     }
     args->Add(argument);
-
-    variable_index =
-        expression_scope()->SetInitializers(variable_index, peek_position());
 
     if (!Check(Token::kComma)) break;
   }
@@ -3241,7 +3241,8 @@ void ParserBase<Impl>::ParseArguments(
 
 template <typename Impl>
 typename ParserBase<Impl>::ExpressionT
-ParserBase<Impl>::ParseConditionalChainAssignmentExpressionCoverGrammar() {
+ParserBase<Impl>::ParseConditionalChainAssignmentExpressionCoverGrammar(
+    bool* else_found) {
   // AssignmentExpression ::
   //   ArrowFunction
   //   YieldExpression
@@ -3249,6 +3250,7 @@ ParserBase<Impl>::ParseConditionalChainAssignmentExpressionCoverGrammar() {
   int lhs_beg_pos = peek_position();
 
   if (peek() == Token::kYield && is_generator()) {
+    *else_found = true;
     return ParseYieldExpression();
   }
 
@@ -3260,10 +3262,12 @@ ParserBase<Impl>::ParseConditionalChainAssignmentExpressionCoverGrammar() {
 
   Token::Value op = peek();
 
-  if (!Token::IsArrowOrAssignmentOp(op) || peek() == Token::kConditional) {
+  if (!Token::IsArrowOrAssignmentOp(op)) {
+    *else_found = (op != Token::kConditional);
     return expression;
   }
 
+  *else_found = true;
   return ParseAssignmentExpressionCoverGrammarContinuation(lhs_beg_pos,
                                                            expression);
 }
@@ -3384,6 +3388,7 @@ ParserBase<Impl>::ParseAssignmentExpressionCoverGrammarContinuation(
                                           end_position());
   } else {
     DCHECK(!IsValidReferenceExpression(expression));
+    expression_scope()->ValidateAsExpression();
     // For web compatibility reasons, throw early errors only for logical
     // assignment, not for regular assignment.
     const bool early_error = Token::IsLogicalAssignmentOp(op);
@@ -3608,10 +3613,8 @@ ParserBase<Impl>::ParseConditionalChainExpression(ExpressionT condition,
                                                      &condition_or_else_range);
       Expect(Token::kColon);
       condition_or_else_expression =
-          ParseConditionalChainAssignmentExpression();
+          ParseConditionalChainAssignmentExpression(&else_found);
     }
-
-    else_found = (peek() != Token::kConditional);
 
     if (else_found) {
       else_expression = condition_or_else_expression;
@@ -3781,6 +3784,7 @@ ParserBase<Impl>::ParseUnaryOrPrefixExpression() {
       expression_scope()->MarkIdentifierAsAssigned();
     }
   } else {
+    expression_scope()->ValidateAsExpression();
     const bool early_error = false;
     expression = RewriteInvalidReferenceExpression(
         expression, expression_position, end_position(),
@@ -3870,6 +3874,7 @@ typename ParserBase<Impl>::ExpressionT
 ParserBase<Impl>::ParsePostfixContinuation(ExpressionT expression,
                                            int lhs_beg_pos) {
   if (V8_UNLIKELY(!IsValidReferenceExpression(expression))) {
+    expression_scope()->ValidateAsExpression();
     const bool early_error = false;
     expression = RewriteInvalidReferenceExpression(
         expression, lhs_beg_pos, end_position(),
@@ -4285,14 +4290,14 @@ ParserBase<Impl>::ParseSuperExpression() {
         impl()->ReportMessage(MessageTemplate::kUnexpectedPrivateField);
         return impl()->FailureExpression();
       }
-      if (peek() == Token::kQuestionPeriod) {
-        Consume(Token::kQuestionPeriod);
-        impl()->ReportMessage(MessageTemplate::kOptionalChainingNoSuper);
-        return impl()->FailureExpression();
-      }
       scope->RecordSuperPropertyUsage();
       UseThis();
       return impl()->NewSuperPropertyReference(pos);
+    }
+    if (peek() == Token::kQuestionPeriod) {
+      Consume(Token::kQuestionPeriod);
+      impl()->ReportMessage(MessageTemplate::kOptionalChainingNoSuper);
+      return impl()->FailureExpression();
     }
     // super() is only allowed in derived constructor. new super() is never
     // allowed; it's reported as an error by
@@ -4922,6 +4927,10 @@ void ParserBase<Impl>::ParseFunctionBody(
         UseThis();
         expression_scope.ValidateExpression();
       }
+      if (is_strict(language_mode())) {
+        CheckStrictOctalLiteral(function_scope->start_position(),
+                                peek_end_position());
+      }
       Expect(closing_token);
     }
   }
@@ -5445,6 +5454,9 @@ void ParserBase<Impl>::ParseClassLiteralBody(ClassInfo& class_info,
     impl()->InferFunctionName();
   }
 
+  if (end_token == Token::kRightBrace) {
+    CheckStrictOctalLiteral(scope()->start_position(), peek_end_position());
+  }
   Expect(end_token);
   scope()->set_end_position(end_position());
 }
@@ -6717,7 +6729,8 @@ typename ParserBase<Impl>::StatementT ParserBase<Impl>::ParseForStatement(
       expression = ParseExpressionCoverGrammar();
       // `for (async of` is disallowed but `for (async.x of` is allowed, so
       // check if the token is kAsync after parsing the expression.
-      bool expression_is_async = scanner()->current_token() == Token::kAsync &&
+      bool expression_is_async = impl()->IsIdentifier(expression) &&
+                                 scanner()->current_token() == Token::kAsync &&
                                  !scanner()->literal_contains_escapes();
       // Initializer is reference followed by in/of.
       lhs_end_pos = end_position();
