@@ -75,7 +75,7 @@ _STRUCT_TYPES = frozenset({
 
 _POINTER_TAG_TYPES = frozenset({
     "v8::internal::ExternalPointerTag",
-    "v8::internal::IndirectPointerTag",
+    "v8::internal::TrustedPointerTag",
 })
 
 
@@ -181,7 +181,7 @@ def _template_args(t: cindex.Type) -> list[cindex.Type]:
 
 def _pointer_tag_names(field: cindex.Cursor) -> list[str]:
   """Names of the pointer-tag constants referenced in the field's
-  declared type (e.g. kFooIndirectPointerTag, or a kFoo...TagRange
+  declared type (e.g. kFooTrustedPointerTag, or a kFoo...TagRange
   constant). The reference can sit below an implicit conversion, so
   walk the whole subtree; the filter keeps unrelated references (array
   extents, defaults) out."""
@@ -327,11 +327,16 @@ class _Extractor:
     parts = args[0].get_canonical().spelling.split("::")
     return named_type(parts[-1], namespaces=tuple(parts[:-1]))
 
-  def _bitfield_storage(self, field: cindex.Cursor, name: str,
-                        group: cindex.Cursor, base: cindex.Type) -> StorageType:
-    """The bit layout of a BitFieldGroup member: every type alias of
-    the group is a base::BitField, read in declaration order (which is
-    bit order) for its name, field type, shift and width."""
+  def _bitfield_storage(self,
+                        field: cindex.Cursor,
+                        name: str,
+                        group: cindex.Cursor,
+                        base: cindex.Type,
+                        smi: bool = False) -> StorageType:
+    """Read base::BitField aliases in bit order.
+
+    Smi storage uses a tagged slot instead of the group's integer width.
+    """
     bits = []
     for alias in group.get_children():
       if alias.kind != cindex.CursorKind.TYPE_ALIAS_DECL:
@@ -352,6 +357,8 @@ class _Extractor:
     if not bits:
       raise LayoutError(f"{_where(field)}: bit field group "
                         f"{group.spelling!r} declares no bit fields")
+    if smi:
+      return StorageType(kind="smi_bitfield", name=name, bits=tuple(bits))
     return StorageType(
         kind="bitfield",
         name=name,
@@ -492,6 +499,16 @@ class _Extractor:
         if self._is_trusted_space_scheme(field, args[1]):
           return StorageType(kind="protected_tagged", arg=arg_type)
         return StorageType(kind="tagged", arg=arg_type)
+      if name == "SmiBitFieldMember":
+        args = _template_args(elem_type) or _template_args(canonical)
+        group = _decl_of(args[0].get_canonical()) if args else None
+        base = _bit_field_group_base(group) if group is not None else None
+        if base is None:
+          raise LayoutError(f"{_where(field)}: SmiBitFieldMember argument "
+                            f"is not a BitFieldGroup")
+        mark_visited(self.parsed, group)
+        return self._bitfield_storage(
+            field, _cpp_bit_field_struct_name(group), group, base, smi=True)
       if name == "TrustedPointerMember":
         args = _template_args(elem_type) or _template_args(canonical)
         if not args:

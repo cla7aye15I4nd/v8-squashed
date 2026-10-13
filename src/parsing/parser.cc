@@ -20,6 +20,7 @@
 #include "src/common/message-template.h"
 #include "src/common/scoped-modification.h"
 #include "src/compiler-dispatcher/lazy-compile-dispatcher.h"
+#include "src/heap/factory-inl.h"
 #include "src/heap/local-heap-inl.h"
 #include "src/heap/parked-scope.h"
 #include "src/logging/counters.h"
@@ -93,8 +94,8 @@ FunctionLiteral* Parser::MakeAutoAccessorGetter(VariableProxy* name_proxy,
                                                 bool is_static, int pos) {
   ScopedPtrList<Statement> body(pointer_buffer());
   DeclarationScope* function_scope =
-      NewFunctionScope(is_static ? FunctionKind::kGetterFunction
-                                 : FunctionKind::kStaticGetterFunction);
+      NewFunctionScope(is_static ? FunctionKind::kStaticGetterFunction
+                                 : FunctionKind::kGetterFunction);
   SetLanguageMode(function_scope, LanguageMode::kStrict);
   function_scope->set_start_position(pos);
   function_scope->set_end_position(pos);
@@ -121,8 +122,8 @@ FunctionLiteral* Parser::MakeAutoAccessorSetter(VariableProxy* name_proxy,
                                                 bool is_static, int pos) {
   ScopedPtrList<Statement> body(pointer_buffer());
   DeclarationScope* function_scope =
-      NewFunctionScope(is_static ? FunctionKind::kSetterFunction
-                                 : FunctionKind::kStaticSetterFunction);
+      NewFunctionScope(is_static ? FunctionKind::kStaticSetterFunction
+                                 : FunctionKind::kSetterFunction);
   SetLanguageMode(function_scope, LanguageMode::kStrict);
   function_scope->set_start_position(pos);
   function_scope->set_end_position(pos);
@@ -1280,10 +1281,19 @@ FunctionLiteral* Parser::ParseClassForMemberInitialization(
   // this point the scanner should be rewound to the position of the class
   // token.
   DCHECK_EQ(peek_position(), initializer_pos);
-  // Insert a FunctionState with the closest outer Declaration scope
+  // Insert a FunctionState with the closest outer Declaration scope.
+  // The immediate enclosing function scope may have been elided from the
+  // ScopeInfo chain if it did not allocate a context. Since class bodies are
+  // always strict mode, 'yield' is never a valid identifier in computed
+  // property names, so we can unconditionally enable generator mode; whether
+  // 'await' is a keyword is recorded on the initializer SharedFunctionInfo.
   DeclarationScope* nearest_decl_scope = original_scope_->GetDeclarationScope();
   DCHECK_NOT_NULL(nearest_decl_scope);
-  FunctionState function_state(&function_state_, &scope_, nearest_decl_scope);
+  FunctionKind enclosing_kind = flags().class_initializer_allows_await()
+                                    ? FunctionKind::kAsyncGeneratorFunction
+                                    : FunctionKind::kGeneratorFunction;
+  FunctionState function_state(&function_state_, &scope_, nearest_decl_scope,
+                               enclosing_kind);
 
   // We preparse the class members that are not fields with initializers
   // in order to collect the function literal ids.
@@ -1372,7 +1382,6 @@ FunctionLiteral* Parser::ParseClassForMemberInitialization(
       DCHECK_EQ(class_info.static_elements_function_id, initializer_id);
       initializer = CreateStaticElementsInitializer(class_name, &class_info);
     }
-    initializer->scope()->TakeUnresolvedReferencesFromParent();
   }
 
   if (has_error()) return nullptr;
@@ -2429,7 +2438,7 @@ Block* Parser::CreateForEachStatementTDZ(Block* init_block,
   return init_block;
 }
 
-Statement* Parser::DesugarLexicalBindingsInForStatement(
+Statement* Parser::DesugarLetBindingsInForStatement(
     ForStatement* loop, Statement* init, Expression* cond, Statement* next,
     Statement* body, Scope* inner_scope, const ForInfo& for_info) {
   // ES6 13.7.4.8 specifies that on each loop iteration the let variables are
@@ -2440,18 +2449,18 @@ Statement* Parser::DesugarLexicalBindingsInForStatement(
   //
   // We are given a for statement of the form
   //
-  //  labels: for (let/const x = i; cond; next) body
+  //  labels: for (let x = i; cond; next) body
   //
   // and rewrite it as follows.  Here we write {{ ... }} for init-blocks, ie.,
   // blocks whose ignore_completion_value_ flag is set.
   //
   //  {
-  //    let/const x = i;
+  //    let x = i;
   //    temp_x = x;
   //    first = 1;
   //    undefined;
   //    outer: for (;;) {
-  //      let/const x = temp_x;
+  //      let x = temp_x;
   //      {{ if (first == 1) {
   //           first = 0;
   //         } else {
@@ -2470,17 +2479,18 @@ Statement* Parser::DesugarLexicalBindingsInForStatement(
   //  }
 
   DCHECK_GT(for_info.bound_names.length(), 0);
+  DCHECK_EQ(for_info.parsing_result.descriptor.mode, VariableMode::kLet);
   ScopedPtrList<Variable> temps(pointer_buffer());
 
   Block* outer_block =
       factory()->NewBlock(for_info.bound_names.length() + 4, false);
 
-  // Add statement: let/const x = i.
+  // Add statement: let x = i.
   outer_block->statements()->Add(init, zone());
 
   const AstRawString* temp_name = ast_value_factory()->dot_for_string();
 
-  // For each lexical variable x:
+  // For each let variable x:
   //   make statement: temp_x = x.
   for (const AstRawString* bound_name : for_info.bound_names) {
     VariableProxy* proxy = NewUnresolved(bound_name);
@@ -2530,14 +2540,10 @@ Statement* Parser::DesugarLexicalBindingsInForStatement(
         factory()->NewBlock(for_info.bound_names.length() + 3, true);
     ScopedPtrList<Variable> inner_vars(pointer_buffer());
     // For each let variable x:
-    //    make statement: let/const x = temp_x.
+    //    make statement: let x = temp_x.
     for (int i = 0; i < for_info.bound_names.length(); i++) {
       VariableProxy* proxy = DeclareBoundVariable(
-          for_info.bound_names[i],
-          IsResourceManagedVariableMode(for_info.parsing_result.descriptor.mode)
-              ? VariableMode::kConst
-              : for_info.parsing_result.descriptor.mode,
-          kNoSourcePosition);
+          for_info.bound_names[i], VariableMode::kLet, kNoSourcePosition);
       inner_vars.Add(proxy->var());
       VariableProxy* temp_proxy = factory()->NewVariableProxy(temps.at(i));
       Assignment* assignment = factory()->NewAssignment(
@@ -2983,6 +2989,10 @@ FunctionLiteral* Parser::ParseFunctionLiteral(
                   &num_parameters, &function_length, &has_duplicate_parameters,
                   &expected_property_count, &suspend_count,
                   arguments_for_wrapped_function);
+    if (should_preparse) {
+      CHECK(has_error());
+      return nullptr;
+    }
   }
 
   if (V8_UNLIKELY(v8_flags.log_function_events)) {
@@ -3566,31 +3576,46 @@ void Parser::InsertSloppyBlockFunctionVarBindings(DeclarationScope* scope) {
 // ----------------------------------------------------------------------------
 // Parser support
 
-template <typename IsolateT>
-void Parser::HandleDebugMagicComments(IsolateT* isolate,
+void Parser::HandleDebugMagicComments(Isolate* isolate,
                                       DirectHandle<Script> script) {
-  DirectHandle<String> source_url = scanner_.SourceUrl(isolate);
+  // On the main thread, the scanned source is the script source.
+  DirectHandle<String> source(Cast<String>(script->source()), isolate);
+  SetDebugMagicCommentFields(isolate, script, source,
+                             scanner_.debug_magic_comment_locations());
+}
+
+// static
+void Parser::SetDebugMagicCommentFields(
+    Isolate* isolate, DirectHandle<Script> script, DirectHandle<String> source,
+    const Scanner::DebugMagicCommentLocations& locations) {
+  // The values can be arbitrarily large (e.g. inline source maps), so they are
+  // substrings of the source rather than copies.
+  auto value = [&](Scanner::Location location) -> DirectHandle<String> {
+    if (!location.IsValid() || location.length() == 0 ||
+        static_cast<uint32_t>(location.end_pos) > source->length()) {
+      return {};
+    }
+    return isolate->factory()->NewSubString(source, location.beg_pos,
+                                            location.end_pos);
+  };
+  DirectHandle<String> source_url = value(locations.source_url);
   if (!source_url.is_null()) {
     script->set_source_url(*source_url);
   }
-  DirectHandle<String> source_mapping_url = scanner_.SourceMappingUrl(isolate);
   // The API can provide a source map URL and the API should take precedence.
   // Let's make sure we do not override the API with the magic comment.
-  if (!source_mapping_url.is_null() &&
-      IsUndefined(script->source_mapping_url())) {
-    script->set_source_mapping_url(*source_mapping_url);
+  if (IsUndefined(script->source_mapping_url())) {
+    DirectHandle<String> source_mapping_url =
+        value(locations.source_mapping_url);
+    if (!source_mapping_url.is_null()) {
+      script->set_source_mapping_url(*source_mapping_url);
+    }
   }
-
-  DirectHandle<String> debug_id = scanner_.DebugId(isolate);
+  DirectHandle<String> debug_id = value(locations.debug_id);
   if (!debug_id.is_null()) {
     script->set_debug_id(*debug_id);
   }
 }
-
-template void Parser::HandleDebugMagicComments(Isolate* isolate,
-                                               DirectHandle<Script> script);
-template void Parser::HandleDebugMagicComments(LocalIsolate* isolate,
-                                               DirectHandle<Script> script);
 
 void Parser::UpdateStatistics(Isolate* isolate, DirectHandle<Script> script) {
   CHECK_NOT_NULL(isolate);
@@ -3694,9 +3719,6 @@ void Parser::ParseOnBackground(LocalIsolate* isolate, ParseInfo* info,
     MaybeProcessSourceRanges(info, result, stack_limit_);
   });
   // We need to unpark by now though, to be able to internalize.
-  if (flags().is_toplevel()) {
-    HandleDebugMagicComments(isolate, script);
-  }
   if (result == nullptr) return;
   PostProcessParseResult(isolate, info, result);
 }

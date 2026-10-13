@@ -32,7 +32,7 @@ Tagged<Union<Smi, TrustedObject>> SharedFunctionInfo::GetTrustedData(
     IsolateForSandbox isolate) const {
   if (HasUnpublishedTrustedData(isolate)) return Smi::zero();
   return TrustedPointerField::ReadMaybeEmptyTrustedPointerField<
-      kTrustedDataIndirectPointerRange>(
+      kTrustedDataTrustedPointerRange>(
       Tagged<HeapObject>(this),
       offsetof(SharedFunctionInfo, trusted_function_data_), isolate,
       kAcquireLoad);
@@ -352,9 +352,7 @@ bool SharedFunctionInfo::PassesFilter(const char* raw_filter) {
   if (V8_LIKELY(raw_filter[0] == '*' && raw_filter[1] == '\0')) {
     return true;
   }
-  base::Vector<const char> filter = base::CStrVector(raw_filter);
-  return v8::internal::PassesFilter(base::CStrVector(DebugNameCStr().get()),
-                                    filter);
+  return v8::internal::PassesFilter(DebugNameCStr().get(), raw_filter);
 }
 
 bool SharedFunctionInfo::HasSourceCode() const {
@@ -581,6 +579,10 @@ void SharedFunctionInfo::InitFromFunctionLiteral(IsolateT* isolate,
         lit->has_static_private_methods_or_accessors());
 
     raw_sfi->set_is_hoisted_in_context(lit->scope()->is_hoisted_in_context());
+    DCHECK_IMPLIES(lit->scope()->class_initializer_allows_await(),
+                   IsClassInitializerFunction(lit->kind()));
+    raw_sfi->set_class_initializer_allows_await(
+        lit->scope()->class_initializer_allows_await());
 
     raw_sfi->set_is_toplevel(is_toplevel);
     DCHECK(IsTheHole(raw_sfi->outer_scope_info()));

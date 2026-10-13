@@ -345,6 +345,7 @@ void DeclarationScope::SetDefaults() {
                            is_module_scope());
   set_needs_private_name_context_chain_recalc(false);
   set_class_scope_has_private_brand(false);
+  set_class_initializer_allows_await(false);
   receiver_ = nullptr;
   new_target_ = nullptr;
   function_ = nullptr;
@@ -496,6 +497,9 @@ Scope* Scope::DeserializeScopeChain(
       if (deserialization_mode == DeserializationMode::kIncludingVariables) {
         script_scope->SetScriptScopeInfo(handle(scope_info, isolate));
       }
+      script_scope->set_has_context_cells(scope_info->HasContextCells());
+      script_scope->set_is_hoisted_in_context(
+          scope_info->is_hoisted_in_context());
       script_scope->num_heap_slots_ = scope_info->ContextLength();
       script_scope->set_start_position(scope_info->StartPosition());
       script_scope->set_end_position(scope_info->EndPosition());
@@ -742,12 +746,6 @@ void DeclarationScope::HoistSloppyBlockFunctions(AstNodeFactory* factory) {
       }
     }
   }
-}
-
-void DeclarationScope::TakeUnresolvedReferencesFromParent() {
-  DCHECK(outer_scope_->reparsing_for_class_initializer_);
-  unresolved_list_.MoveTail(&outer_scope_->unresolved_list_,
-                            outer_scope_->unresolved_list_.begin());
 }
 
 bool DeclarationScope::Analyze(ParseInfo* info) {
@@ -1594,7 +1592,8 @@ bool Scope::NeedsScopeInfo() const {
 }
 
 bool Scope::ShouldBanArguments() {
-  return GetReceiverScope()->should_ban_arguments();
+  return GetReceiverScope()->should_ban_arguments() &&
+         !GetClosureScope()->from_scope_info();
 }
 
 DeclarationScope* Scope::GetReceiverScope() {
@@ -1763,6 +1762,8 @@ void DeclarationScope::ResetAfterPreparsing(AstValueFactory* ast_value_factory,
   sloppy_block_functions_.Clear();
   rare_data_ = nullptr;
   set_has_rest(false);
+  set_has_using_declaration(false);
+  set_has_await_using_declaration(false);
   function_ = nullptr;
 
   DCHECK_NE(zone(), ast_value_factory->single_parse_zone());

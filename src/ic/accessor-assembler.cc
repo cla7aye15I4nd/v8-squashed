@@ -88,8 +88,8 @@ TNode<HeapObjectReference> AccessorAssembler::TryMonomorphicCase(
 
   // Try to quickly handle the monomorphic case without knowing for sure
   // if we have a weak reference in feedback.
-  CSA_DCHECK(this,
-             IsMap(GetHeapObjectAssumeWeak(weak_lookup_start_object_map)));
+  CSA_DCHECK(this, IsMapOrCustomMap(
+                       GetHeapObjectAssumeWeak(weak_lookup_start_object_map)));
   GotoIfNot(TaggedEqual(feedback, weak_lookup_start_object_map), if_miss);
 
   TNode<MaybeObject> handler = UncheckedCast<MaybeObject>(
@@ -126,8 +126,8 @@ void AccessorAssembler::HandlePolymorphicCase(
     TNode<IntPtrT> index = ChangePositiveInt32ToIntPtr(var_index.value());
     TNode<MaybeObject> maybe_cached_map =
         LoadWeakFixedArrayElement(feedback, index);
-    CSA_DCHECK(this,
-               IsMap(GetHeapObjectAssumeWeak(weak_lookup_start_object_map)));
+    CSA_DCHECK(this, IsMapOrCustomMap(GetHeapObjectAssumeWeak(
+                         weak_lookup_start_object_map)));
     GotoIfNot(TaggedEqual(maybe_cached_map, weak_lookup_start_object_map),
               &loop_next);
 
@@ -1968,10 +1968,8 @@ void AccessorAssembler::OverwriteExistingFastDataProperty(
           TNode<UnionOf<HeapNumber, UninitializedHeapNumber>> heap_number =
               CAST(LoadObjectField(object, field_offset));
           StoreHeapNumberValue(heap_number, double_value);
-          // The map store must follow the value write and use release semantics
-          // so background threads (e.g. concurrent compiler) see a consistent
-          // initialized state upon observing the HeapNumber map.
-          StoreMapReleaseNoWriteBarrier(heap_number, RootIndex::kHeapNumberMap);
+          // Migrate UninitializedHeapNumber to mutable HeapNumber.
+          StoreMapNoWriteBarrier(heap_number, RootIndex::kHeapNumberMap);
         }
         Goto(&done);
       }
@@ -2037,10 +2035,8 @@ void AccessorAssembler::OverwriteExistingFastDataProperty(
               CAST(LoadPropertyArrayElement(properties, backing_store_index));
           TNode<Float64T> double_value = ChangeNumberToFloat64(CAST(value));
           StoreHeapNumberValue(heap_number, double_value);
-          // The map store must follow the value write and use release semantics
-          // so background threads (e.g. concurrent compiler) see a consistent
-          // initialized state upon observing the HeapNumber map.
-          StoreMapReleaseNoWriteBarrier(heap_number, RootIndex::kHeapNumberMap);
+          // Migrate UninitializedHeapNumber to mutable HeapNumber.
+          StoreMapNoWriteBarrier(heap_number, RootIndex::kHeapNumberMap);
           Goto(&done);
         }
         BIND(&tagged_rep);
@@ -2600,11 +2596,8 @@ void AccessorAssembler::HandleStoreFieldAndReturn(
   if (store_value_as_double) {
     StoreObjectFieldNoWriteBarrier(property_storage, offset, *double_value);
     if (maybe_initializing_store) {
-      // The map store must follow the value write and use release semantics so
-      // background threads (e.g. concurrent compiler) see a consistent
-      // initialized state upon observing the HeapNumber map.
-      StoreMapReleaseNoWriteBarrier(property_storage,
-                                    RootIndex::kHeapNumberMap);
+      // Migrate UninitializedHeapNumber to mutable HeapNumber.
+      StoreMapNoWriteBarrier(property_storage, RootIndex::kHeapNumberMap);
     }
   } else if (representation.IsSmi()) {
     TNode<Smi> value_smi = CAST(value);

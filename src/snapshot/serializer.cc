@@ -6,6 +6,7 @@
 
 #include "include/v8-internal.h"
 #include "src/base/logging.h"
+#include "src/base/unique-array.h"
 #include "src/codegen/assembler-inl.h"
 #include "src/common/globals.h"
 #include "src/handles/global-handles-inl.h"
@@ -715,30 +716,71 @@ void Serializer::ObjectSerializer::SerializeExternalString() {
 void Serializer::ObjectSerializer::SerializeExternalStringAsSequentialString() {
   // Instead of serializing this as an external string, we serialize
   // an imaginary sequential string with the same content.
-  ReadOnlyRoots roots(isolate());
   DCHECK(IsExternalString(*object_));
   DirectHandle<ExternalString> string = Cast<ExternalString>(object_);
   uint32_t length = string->length();
+  bool one_byte = IsExternalOneByteString(*object_);
+  const uint8_t* content;
+  if (one_byte) {
+    const auto* ext_resource = Cast<ExternalOneByteString>(string)->resource();
+    SBXCHECK_EQ(length, ext_resource->length());
+    content = reinterpret_cast<const uint8_t*>(ext_resource->data());
+  } else {
+    const auto* ext_resource = Cast<ExternalTwoByteString>(string)->resource();
+    SBXCHECK_EQ(length, ext_resource->length());
+    content = reinterpret_cast<const uint8_t*>(ext_resource->data());
+  }
+  SerializeStringAsSequentialString(one_byte, length, content);
+}
+
+void Serializer::ObjectSerializer::SerializeSlicedStringAsSequentialString() {
+  // Instead of serializing this as a sliced string, we serialize an imaginary
+  // sequential string with the same content, so that it does not depend on its
+  // parent.
+  DCHECK(IsSlicedString(*object_));
+  DisallowGarbageCollection no_gc;
+  String::FlatContent flat = Cast<String>(*object_)->GetFlatContent(no_gc);
+  DCHECK(flat.IsFlat());
+  uint32_t length = flat.length();
+  if (flat.IsOneByte()) {
+    SerializeStringAsSequentialString(true, length,
+                                      flat.ToOneByteVector().begin());
+    return;
+  }
+  base::Vector<const base::uc16> chars = flat.ToUC16Vector();
+  if (String::IsOneByte(chars.begin(), length)) {
+    // The parent of the slice is two-byte, but its contents are one-byte, so
+    // serialize a one-byte string (which is also what copying them would
+    // create).
+    base::UniqueArray<uint8_t> one_byte =
+        base::UniqueArray<uint8_t>::NewForOverwrite(length);
+    CopyChars(one_byte.begin(), chars.begin(), length);
+    SerializeStringAsSequentialString(true, length, one_byte.begin());
+    return;
+  }
+  SerializeStringAsSequentialString(
+      false, length, reinterpret_cast<const uint8_t*>(chars.begin()));
+}
+
+void Serializer::ObjectSerializer::SerializeStringAsSequentialString(
+    bool one_byte, uint32_t length, const uint8_t* content) {
+  ReadOnlyRoots roots(isolate());
+  DirectHandle<String> string = Cast<String>(object_);
   Tagged<Map> map;
   int content_size;
   int allocation_size;
-  const uint8_t* resource;
   // Find the map and size for the imaginary sequential string.
   bool internalized = IsInternalizedString(*object_);
-  if (IsExternalOneByteString(*object_)) {
+  if (one_byte) {
     map = internalized ? roots.internalized_one_byte_string_map()
                        : roots.seq_one_byte_string_map();
     allocation_size = SeqOneByteString::SizeFor(length);
     content_size = length * kCharSize;
-    resource = reinterpret_cast<const uint8_t*>(
-        Cast<ExternalOneByteString>(string)->resource()->data());
   } else {
     map = internalized ? roots.internalized_two_byte_string_map()
                        : roots.seq_two_byte_string_map();
     allocation_size = SeqTwoByteString::SizeFor(length);
     content_size = length * kShortSize;
-    resource = reinterpret_cast<const uint8_t*>(
-        Cast<ExternalTwoByteString>(string)->resource()->data());
   }
 
   SnapshotSpace space = SnapshotSpace::kOld;
@@ -754,13 +796,16 @@ void Serializer::ObjectSerializer::SerializeExternalStringAsSequentialString() {
   sink_->PutUint30(slots_to_output, "length");
 
   // Serialize string header (except for map).
-  uint8_t* string_start = reinterpret_cast<uint8_t*>(string->address());
-  for (size_t i = sizeof(HeapObject); i < sizeof(SeqString); i++) {
-    sink_->Put(string_start[i], "StringHeader");
-  }
+  static_assert(offsetof(SeqString, raw_hash_field_) == sizeof(HeapObject));
+  static_assert(offsetof(SeqString, length_) ==
+                offsetof(SeqString, raw_hash_field_) + sizeof(uint32_t));
+  static_assert(sizeof(SeqString) ==
+                sizeof(HeapObject) + sizeof(uint32_t) + sizeof(uint32_t));
+  sink_->PutUint32(string->raw_hash_field(), "StringHash");
+  sink_->PutUint32(length, "StringLength");
 
   // Serialize string content.
-  sink_->PutRaw(resource, content_size, "StringContent");
+  sink_->PutRaw(content, content_size, "StringContent");
 
   // Since the allocation size is rounded up to object alignment, there
   // maybe left-over bytes that need to be padded.
@@ -838,6 +883,11 @@ void Serializer::ObjectSerializer::Serialize(SlotType slot_type) {
   InstanceType instance_type = object_->map()->instance_type();
   if (InstanceTypeChecker::IsExternalString(instance_type)) {
     SerializeExternalString();
+    return;
+  }
+  if (InstanceTypeChecker::IsSlicedString(instance_type) &&
+      serializer_->SerializeSlicedStringsAsSequentialStrings()) {
+    SerializeSlicedStringAsSequentialString();
     return;
   }
   if (InstanceTypeChecker::IsJSTypedArray(instance_type)) {

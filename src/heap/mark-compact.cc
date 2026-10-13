@@ -87,8 +87,8 @@
 #include "src/objects/string-forwarding-table-inl.h"
 #include "src/objects/transitions-inl.h"
 #include "src/objects/visitors.h"
-#include "src/sandbox/indirect-pointer-tag.h"
 #include "src/sandbox/trusted-pointer-table.h"
+#include "src/sandbox/trusted-pointer-tag.h"
 #include "src/snapshot/shared-heap-serializer.h"
 #include "src/tasks/cancelable-task.h"
 #include "src/tracing/tracing-category-observer.h"
@@ -2539,17 +2539,7 @@ void MarkCompactCollector::RetainMaps() {
                 MarkingHelper::WorklistTarget::kRegular, map);
           }
         }
-        Tagged<Object> prototype = map->prototype();
-        if (age > 0 && IsHeapObject(prototype) &&
-            MarkingHelper::IsUnmarkedAndNotAlwaysLive(
-                heap_, marking_state_, Cast<HeapObject>(prototype))) {
-          // The prototype is not marked, age the map.
-          new_age = age - 1;
-        } else {
-          // The prototype and the constructor are marked, this map keeps only
-          // transition tree alive, not JSObjects. Do not age the map.
-          new_age = age;
-        }
+        new_age = age > 0 ? age - 1 : 0;
       } else {
         new_age = v8_flags.retain_maps_for_n_gc;
       }
@@ -3768,7 +3758,7 @@ void MarkCompactCollector::ProcessOldCodeCandidates() {
 
       // Read the object from the table. It is now an UncompiledData.
       Address obj_addr = isolate->trusted_pointer_table().GetMaybeUnpublished(
-          handle, kBytecodeArrayIndirectPointerTag);
+          handle, kBytecodeArrayTrustedPointerTag);
       Tagged<TrustedObject> trusted_obj =
           UncheckedCast<TrustedObject>(Tagged<Object>(obj_addr));
       Tagged<UncompiledData> uncompiled_data =

@@ -1033,6 +1033,7 @@ class V8_EXPORT_PRIVATE MapRef : public HeapObjectRef {
   bool IsBooleanMap(JSHeapBroker* broker) const;
   bool IsNullMap(JSHeapBroker* broker) const;
   bool IsUndefinedMap(JSHeapBroker* broker) const;
+  bool IsAnyWasmObjectMap() const;
 
   OptionalHeapObjectRef GetBackPointer(JSHeapBroker* broker) const;
 
@@ -1222,6 +1223,7 @@ class ScopeInfoRef : public HeapObjectRef {
   MaybeAssignedFlag ContextLocalMaybeAssignedFlag(int var) const;
   VariableMode ContextLocalMode(int var) const;
   bool HasContext() const;
+  bool HasContextCells() const;
   bool HasOuterScopeInfo() const;
   bool HasContextExtensionSlot() const;
   bool SomeContextHasExtension() const;

@@ -2252,6 +2252,7 @@ class LiftoffCompiler {
     CallBuiltin(Builtin::kWasmThrowRef, MakeSig::Params(kRef), {exn},
                 decoder->position());
     int pc_offset = __ pc_offset_for_safepoint();
+    RegisterDebugSideTableEntry(decoder, DebugSideTableBuilder::kDidSpill);
     MaybeOSR();
     EmitLandingPad(decoder, pc_offset);
   }
@@ -2840,23 +2841,17 @@ class LiftoffCompiler {
                     MakeSig::Returns(kRefNull).Params(kRefNull), {input_state},
                     decoder->position());
         __ DropValues(1);
+        RegisterDebugSideTableEntry(decoder, DebugSideTableBuilder::kDidSpill);
         __ PushRegister(kRef, LiftoffRegister(kReturnRegister0));
         return;
       }
       case kExprExternConvertAny: {
-        LiftoffRegList pinned;
-        LiftoffRegister ref = pinned.set(__ PopToModifiableRegister(pinned));
-        LiftoffRegister null = __ GetUnusedRegister(kGpReg, pinned);
-        LoadNullValueForCompare(null.gp(), pinned, kWasmAnyRef);
-        Label label;
-        {
-          FREEZE_STATE(frozen);
-          __ emit_cond_jump(kNotEqual, &label, kRefNull, ref.gp(), null.gp(),
-                            frozen);
-          LoadNullValue(ref.gp(), kWasmExternRef);
-          __ bind(&label);
-        }
-        __ PushRegister(kRefNull, ref);
+        VarState input_state = __ cache_state() -> stack_state.back();
+        CallBuiltin(Builtin::kWasmExternConvertAny,
+                    MakeSig::Returns(kRefNull).Params(kRefNull), {input_state},
+                    decoder->position());
+        __ DropValues(1);
+        __ PushRegister(kRef, LiftoffRegister(kReturnRegister0));
         return;
       }
       default:
@@ -3528,6 +3523,7 @@ class LiftoffCompiler {
     } else if (!v8_flags.wasm_skip_null_checks) {
       // Otherwise, load the word after the map word.
       static_assert(WasmStruct::kHeaderSize > kTaggedSize);
+      static_assert(WasmCustomMap::kHeaderSize > kTaggedSize);
       static_assert(WasmArray::HeaderSize(SharedFlag{false}) > kTaggedSize);
       static_assert(WasmInternalFunction::kHeaderSize > kTaggedSize);
       LiftoffRegister dst = pinned.set(__ GetUnusedRegister(kGpReg, pinned));
@@ -7201,8 +7197,8 @@ class LiftoffCompiler {
     VarState waitqueue = __ PopVarState();
     VarState struct_obj = __ PopVarState();
 
-    int offset = WasmStruct::kHeaderSize +
-                 imm.struct_imm.struct_type->field_offset(imm.field_imm.index);
+    int offset = WasmStruct::FieldOffset(imm.struct_imm.struct_type,
+                                         imm.field_imm.index);
     Builtin target = kind == kI32   ? Builtin::kWasmManagedObjectWait32
                      : kind == kI64 ? Builtin::kWasmManagedObjectWait64
                                     : Builtin::kWasmManagedObjectWaitRef;
@@ -7214,6 +7210,7 @@ class LiftoffCompiler {
         {struct_obj, VarState{kI32, offset, 0}, expected_value, waitqueue,
          timeout},
         decoder->position());
+    RegisterDebugSideTableEntry(decoder, DebugSideTableBuilder::kDidSpill);
     __ PushRegister(kI32, LiftoffRegister{kReturnRegister0});
     MaybeOSR();
   }
@@ -7285,6 +7282,7 @@ class LiftoffCompiler {
         {VarState{kRef, array, 0}, VarState{kI32, index, 0}, expected_value,
          waitqueue, timeout},
         decoder->position());
+    RegisterDebugSideTableEntry(decoder, DebugSideTableBuilder::kDidSpill);
     __ PushRegister(kI32, LiftoffRegister{kReturnRegister0});
     MaybeOSR();
   }
@@ -8073,6 +8071,15 @@ class LiftoffCompiler {
                                               const Value& descriptor_value) {
     LiftoffRegList pinned;
     LiftoffRegister descriptor = pinned.set(__ PopToRegister({}));
+    if (v8_flags.wasm_merged_descriptors) {
+      // The descriptor is the RTT, but we have to check if it's null, and
+      // there's no load that could trigger an implicit check.
+      if (descriptor_value.type.is_nullable()) {
+        MaybeEmitNullCheck(decoder, descriptor.gp(), pinned,
+                           descriptor_value.type);
+      }
+      return descriptor;
+    }
     auto [explicit_check, implicit_check] =
         null_checks_for_struct_op(descriptor_value.type, 0);
     if (explicit_check) {
@@ -8548,6 +8555,7 @@ class LiftoffCompiler {
                  __ cache_state()->stack_state.end()[-3]},
                 decoder->position());
     __ DropValues(5);
+    RegisterDebugSideTableEntry(decoder, DebugSideTableBuilder::kDidSpill);
   }
 
   void ArrayNewFixed(FullDecoder* decoder, const ArrayIndexImmediate& array_imm,
@@ -8730,8 +8738,8 @@ class LiftoffCompiler {
     // Pop parameters from the value stack.
     __ DropValues(2);
 
-    MaybeOSR();
     RegisterDebugSideTableEntry(decoder, DebugSideTableBuilder::kDidSpill);
+    MaybeOSR();
 
     LiftoffRegister result(kReturnRegister0);
     __ PushRegister(kRef, result);
@@ -8767,6 +8775,7 @@ class LiftoffCompiler {
                  __ cache_state()->stack_state.end()[-4]},
                 decoder->position());
     __ DropValues(4);
+    RegisterDebugSideTableEntry(decoder, DebugSideTableBuilder::kDidSpill);
     MaybeOSR();
   }
 
@@ -8840,9 +8849,11 @@ class LiftoffCompiler {
     if (implicit_check) {
       RegisterTrappingInstruction(decoder, protected_load_pc);
     }
-    LoadObjectField(decoder, value, value.gp(), no_reg,
-                    offsetof(Map, instance_descriptors_) - kHeapObjectTag, kRef,
-                    false, false, pinned);
+    if (!v8_flags.wasm_merged_descriptors) {
+      LoadObjectField(decoder, value, value.gp(), no_reg,
+                      offsetof(Map, instance_descriptors_) - kHeapObjectTag,
+                      kRef, false, false, pinned);
+    }
     __ PushRegister(kRef, value);
   }
 
@@ -8922,14 +8933,19 @@ class LiftoffCompiler {
       }
 
       if (is_cast_from_any) {
-        // Check for map being a map for a wasm object (struct, array, func).
+        // Check for map being a map for a wasm object (struct or array).
         __ Load(LiftoffRegister(scratch2), tmp1, no_reg,
                 offsetof(Map, instance_type_) - kHeapObjectTag,
                 LoadType::kI32Load16U);
+        Label is_wasm_obj;
         __ emit_i32_subi(scratch2, scratch2, FIRST_WASM_OBJECT_TYPE);
-        __ emit_i32_cond_jumpi(kUnsignedGreaterThan, no_match, scratch2,
+        __ emit_i32_cond_jumpi(kUnsignedLessThanEqual, &is_wasm_obj, scratch2,
                                LAST_WASM_OBJECT_TYPE - FIRST_WASM_OBJECT_TYPE,
                                frozen);
+        __ emit_i32_cond_jumpi(kNotEqual, no_match, scratch2,
+                               WASM_CUSTOM_MAP_TYPE - FIRST_WASM_OBJECT_TYPE,
+                               frozen);
+        __ bind(&is_wasm_obj);
       }
 
       // Constant-time subtyping check: load exactly one candidate RTT from the
@@ -9128,6 +9144,7 @@ class LiftoffCompiler {
                     VarState{kI32, null_succeeds_reg, 0},
                 },
                 decoder->position());
+    RegisterDebugSideTableEntry(decoder, DebugSideTableBuilder::kDidSpill);
     MaybeOSR();
   }
 
@@ -9515,10 +9532,14 @@ class LiftoffCompiler {
 
   // Abstract type checkers. They all fall through on match.
   void StructCheck(TypeCheck& check, const FreezeCacheState& frozen) {
+    Label match;
     LoadInstanceType(check, frozen, check.no_match);
     LiftoffRegister instance_type(check.instance_type());
-    __ emit_i32_cond_jumpi(kNotEqual, check.no_match, check.instance_type(),
+    __ emit_i32_cond_jumpi(kEqual, &match, check.instance_type(),
                            WASM_STRUCT_TYPE, frozen);
+    __ emit_i32_cond_jumpi(kNotEqual, check.no_match, check.instance_type(),
+                           WASM_CUSTOM_MAP_TYPE, frozen);
+    __ bind(&match);
   }
 
   void ArrayCheck(TypeCheck& check, const FreezeCacheState& frozen) {
@@ -9540,8 +9561,13 @@ class LiftoffCompiler {
     // unsigned comparison.
     Register tmp = check.instance_type();
     __ emit_i32_subi(tmp, tmp, FIRST_WASM_OBJECT_TYPE);
-    __ emit_i32_cond_jumpi(kUnsignedGreaterThan, check.no_match, tmp,
+    __ emit_i32_cond_jumpi(kUnsignedLessThanEqual, &match, tmp,
                            LAST_WASM_OBJECT_TYPE - FIRST_WASM_OBJECT_TYPE,
+                           frozen);
+    // This will look weird in disassembly, but we want to prioritize the
+    // fast path (non-descriptor object, successful cast).
+    __ emit_i32_cond_jumpi(kNotEqual, check.no_match, tmp,
+                           WASM_CUSTOM_MAP_TYPE - FIRST_WASM_OBJECT_TYPE,
                            frozen);
     __ bind(&match);
   }
@@ -11027,7 +11053,7 @@ class LiftoffCompiler {
       __ LoadTrustedPointer(
           internal_function, func_ref,
           offsetof(WasmFuncRef, trusted_internal_) - kHeapObjectTag,
-          kWasmInternalFunctionIndirectPointerTag);
+          kWasmInternalFunctionTrustedPointerTag);
 
       // Load the implicit argument (WasmTrustedInstanceData or WasmImportData)
       // and target.
@@ -11123,8 +11149,7 @@ class LiftoffCompiler {
   }
 
   int StructFieldOffset(const StructType* struct_type, int field_index) {
-    return WasmStruct::kHeaderSize + struct_type->field_offset(field_index) -
-           kHeapObjectTag;
+    return WasmStruct::FieldOffset(struct_type, field_index) - kHeapObjectTag;
   }
 
   std::pair<bool, bool> null_checks_for_struct_op(ValueType struct_type,

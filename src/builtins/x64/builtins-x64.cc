@@ -26,7 +26,7 @@
 #include "src/objects/js-generator.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/smi.h"
-#include "src/sandbox/indirect-pointer-tag.h"
+#include "src/sandbox/trusted-pointer-tag.h"
 
 #if V8_ENABLE_WEBASSEMBLY
 #include "src/wasm/baseline/liftoff-assembler-defs.h"
@@ -3252,11 +3252,12 @@ void RestoreWasmParams(MacroAssembler* masm, int offset) {
 // When this builtin is called, the topmost stack entry is the calling pc.
 // This is replaced with the following:
 //
-// [    calling pc      ]  <-- rsp; popped by {ret}.
-// [  feedback vector   ]
-// [ Wasm instance data ]
-// [ WASM frame marker  ]
-// [    saved rbp       ]  <-- rbp; this is where "calling pc" used to be.
+// [     calling pc      ]  <-- rsp; popped by {ret}.
+// [   alignment slot    ]  (only if V8_X64_16BYTE_STACK_ALIGNMENT_BOOL)
+// [   feedback vector   ]
+// [ Wasm instance data  ]
+// [  WASM frame marker  ]
+// [      saved rbp      ]  <-- rbp; this is where "calling pc" used to be.
 void Builtins::Generate_WasmLiftoffFrameSetup(MacroAssembler* masm) {
   Register func_index = wasm::kLiftoffFrameSetupFunctionReg;
   Register vector = r15;
@@ -3279,6 +3280,16 @@ void Builtins::Generate_WasmLiftoffFrameSetup(MacroAssembler* masm) {
                     Smi::FromInt(1));
   __ Push(kWasmImplicitArgRegister);
   __ Push(vector);
+  if (V8_X64_16BYTE_STACK_ALIGNMENT_BOOL) {
+    // Initialize the OSR target slot (at rbp - kOSRTargetOffset) to 0 so that
+    // the 4-slot static header leaves rsp 16-byte aligned (rbp - 32 instead of
+    // rbp - 24). Between this builtin's {ret} and the patched
+    // {sub rsp, frame_size}, the large-frame OOL stack check path may call
+    // {kWasmStackOverflow} or {kWasmHandleStackOverflow}, which requires {rsp}
+    // to be 16-byte aligned.
+    static_assert(wasm::kOSRTargetOffset == 4 * kSystemPointerSize);
+    __ Push(Immediate(0));
+  }
   __ Push(calling_pc);
   __ ret(0);
 
@@ -4032,7 +4043,7 @@ void Generate_WasmResumeHelper(MacroAssembler* masm, wasm::OnResume on_resume) {
   __ LoadTrustedPointerField(
       suspender,
       FieldOperand(resume_data, offsetof(WasmResumeData, trusted_suspender_)),
-      kWasmSuspenderIndirectPointerTag, kScratchRegister);
+      kWasmSuspenderTrustedPointerTag, kScratchRegister);
   closure = no_reg;
   sfi = no_reg;
 
@@ -5657,7 +5668,7 @@ void Builtins::Generate_InterpreterOnStackReplacement_ToBaseline(
       code_obj,
       FieldOperand(shared_function_info,
                    offsetof(SharedFunctionInfo, trusted_function_data_)),
-      kCodeIndirectPointerTag, kScratchRegister);
+      kCodeTrustedPointerTag, kScratchRegister);
 
   // For OSR entry it is safe to assume we always have baseline code.
   if (v8_flags.debug_code) {

@@ -1233,10 +1233,12 @@ Reduction JSNativeContextSpecialization::ReduceJSLoadGlobal(Node* node) {
   if (feedback.IsScriptContextSlot()) {
     Effect effect = n.effect();
     Control control = n.control();
+    ContextRef script_context_ref = feedback.script_context();
     Node* script_context =
-        jsgraph()->ConstantNoHole(feedback.script_context(), broker());
+        jsgraph()->ConstantNoHole(script_context_ref, broker());
     Node* value;
-    if (v8_flags.script_context_cells && !feedback.immutable()) {
+    if (script_context_ref.scope_info(broker()).HasContextCells() &&
+        !feedback.immutable()) {
       // We collect feedback only for mutable context slots.
       value = effect = control =
           graph()->NewNode(javascript()->LoadContext(0, feedback.slot_index()),
@@ -1275,9 +1277,10 @@ Reduction JSNativeContextSpecialization::ReduceJSStoreGlobal(Node* node) {
     Node* effect = n.effect();
     Node* control = n.control();
     Node* frame_state = n.frame_state();
+    ContextRef script_context_ref = feedback.script_context();
     Node* script_context =
-        jsgraph()->ConstantNoHole(feedback.script_context(), broker());
-    if (v8_flags.script_context_cells) {
+        jsgraph()->ConstantNoHole(script_context_ref, broker());
+    if (script_context_ref.scope_info(broker()).HasContextCells()) {
       effect = control =
           graph()->NewNode(javascript()->StoreContext(0, feedback.slot_index()),
                            value, script_context, frame_state, effect, control);
@@ -2346,7 +2349,7 @@ Reduction JSNativeContextSpecialization::ReduceElementAccess(
         if ((IsHoleyOrDictionaryElementsKind(receiver_map.elements_kind()) ||
              StoreModeCanGrow(feedback.keyed_mode().store_mode())) &&
 #if V8_ENABLE_WEBASSEMBLY
-            !(receiver_map.IsWasmObjectMap() &&
+            !(receiver_map.IsAnyWasmObjectMap() &&
               access_info.is_proxy_on_prototype()) &&
 #endif  // V8_ENABLE_WEBASSEMBLY
             !receiver_map.PrototypesElementsDoNotHaveAccessorsOrThrow(
@@ -3444,12 +3447,6 @@ JSNativeContextSpecialization::BuildPropertyStore(
                                 value, effect, control);
       if (maybe_initializing_store &&
           access_info.field_representation().IsDouble()) {
-        // The map store must follow the value write and use release semantics
-        // so background threads (e.g. concurrent compiler) see a consistent
-        // initialized state upon observing the HeapNumber map.
-        effect = graph()->NewNode(
-            jsgraph()->machine()->MemoryBarrier(AtomicMemoryOrder::kAcqRel),
-            effect, control);
         effect = graph()->NewNode(
             simplified()->StoreField(AccessBuilder::ForMap()), storage,
             jsgraph()->ConstantNoHole(broker()->heap_number_map(), broker()),
@@ -3608,7 +3605,7 @@ JSNativeContextSpecialization::BuildElementAccess(
   }
 
 #if V8_ENABLE_WEBASSEMBLY
-  if (receiver_maps.size() == 1 && receiver_maps.front().IsWasmObjectMap() &&
+  if (receiver_maps.size() == 1 && receiver_maps.front().IsAnyWasmObjectMap() &&
       access_info.is_proxy_on_prototype()) {
     return BuildPrototypeProxyElementAccess(
         receiver, index, value, effect, control, context, access_info,

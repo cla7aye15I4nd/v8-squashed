@@ -449,7 +449,11 @@ class ParserBase {
   class FunctionState final : public BlockState {
    public:
     FunctionState(FunctionState** function_state_stack, Scope** scope_stack,
-                  DeclarationScope* scope);
+                  DeclarationScope* scope)
+        : FunctionState(function_state_stack, scope_stack, scope,
+                        scope->function_kind()) {}
+    FunctionState(FunctionState** function_state_stack, Scope** scope_stack,
+                  DeclarationScope* scope, FunctionKind kind);
     ~FunctionState();
 
     DeclarationScope* scope() const { return scope_->AsDeclarationScope(); }
@@ -466,7 +470,7 @@ class ParserBase {
     int suspend_count() const { return suspend_count_; }
     bool CanSuspend() const { return suspend_count_ > 0; }
 
-    FunctionKind kind() const { return scope()->function_kind(); }
+    FunctionKind kind() const { return kind_; }
 
     bool next_function_is_likely_called() const {
       return next_function_is_likely_called_;
@@ -533,6 +537,7 @@ class ParserBase {
     FunctionState** function_state_stack_;
     FunctionState* outer_function_state_;
     DeclarationScope* scope_;
+    FunctionKind kind_;
     Target* target_stack_ = nullptr;  // for break, continue statements
 
     // A reason, if any, why this function should not be optimized.
@@ -638,6 +643,8 @@ class ParserBase {
         static_elements_scope = parser->NewFunctionScope(kind);
         static_elements_scope->SetLanguageMode(LanguageMode::kStrict);
         static_elements_scope->set_start_position(beg_pos);
+        static_elements_scope->set_class_initializer_allows_await(
+            parser->is_await_allowed());
         static_elements_function_id = info_id;
         // Actually consume the id. The id that was passed in might be an
         // earlier id in case of computed property names.
@@ -656,6 +663,8 @@ class ParserBase {
         instance_members_scope = parser->NewFunctionScope(kind);
         instance_members_scope->SetLanguageMode(LanguageMode::kStrict);
         instance_members_scope->set_start_position(beg_pos);
+        instance_members_scope->set_class_initializer_allows_await(
+            parser->is_await_allowed());
         instance_members_function_id = info_id;
         // Actually consume the id. The id that was passed in might be an
         // earlier id in case of computed property names.
@@ -1834,13 +1843,14 @@ class ParserBase {
 template <typename Impl>
 ParserBase<Impl>::FunctionState::FunctionState(
     FunctionState** function_state_stack, Scope** scope_stack,
-    DeclarationScope* scope)
+    DeclarationScope* scope, FunctionKind kind)
     : BlockState(scope_stack, scope),
       expected_property_count_(0),
       suspend_count_(0),
       function_state_stack_(function_state_stack),
       outer_function_state_(*function_state_stack),
       scope_(scope),
+      kind_(kind),
       dont_optimize_reason_(BailoutReason::kNoReason),
       next_function_is_likely_called_(false),
       previous_function_was_likely_called_(false),
@@ -4302,11 +4312,20 @@ ParserBase<Impl>::ParseSuperExpression() {
     // super() is only allowed in derived constructor. new super() is never
     // allowed; it's reported as an error by
     // ParseMemberWithPresentNewPrefixesExpression.
-    if (peek() == Token::kLeftParen && IsDerivedConstructor(kind)) {
+    if (peek() == Token::kLeftParen &&
+        (IsDerivedConstructor(kind) ||
+         this->scope()->GetClosureScope()->from_scope_info())) {
       // TODO(rossberg): This might not be the correct FunctionState for the
       // method here.
       expression_scope()->RecordThisUse();
       UseThis();
+      return impl()->NewSuperCallReference(pos);
+    }
+  } else if (this->scope()->GetClosureScope()->from_scope_info()) {
+    if (Token::IsProperty(peek())) {
+      return impl()->NewSuperPropertyReference(pos);
+    }
+    if (peek() == Token::kLeftParen) {
       return impl()->NewSuperCallReference(pos);
     }
   }
@@ -4324,7 +4343,8 @@ ParserBase<Impl>::ParseNewTargetExpression() {
   ExpectContextualKeyword(ast_value_factory()->target_string(), "new.target",
                           pos);
 
-  if (!GetReceiverScope()->is_function_scope()) {
+  if (!GetReceiverScope()->is_function_scope() &&
+      !this->scope()->GetClosureScope()->from_scope_info()) {
     impl()->ReportMessageAt(scanner()->location(),
                             MessageTemplate::kUnexpectedNewTarget);
     return impl()->FailureExpression();
@@ -6900,31 +6920,41 @@ ParserBase<Impl>::ParseStandardForLoopWithLexicalDeclarations(
     ZonePtrList<const AstRawString>* labels,
     ZonePtrList<const AstRawString>* own_labels) {
   // The condition and the next statement of the for loop must be parsed
-  // in a new scope.
-  Scope* inner_scope = NewScope(BLOCK_SCOPE);
+  // in a new scope when desugaring per-iteration let bindings.
+  const bool is_let_with_bound_names =
+      for_info->parsing_result.descriptor.mode == VariableMode::kLet &&
+      for_info->bound_names.length() > 0;
+  Scope* inner_scope = nullptr;
   ForStatementT loop = impl()->NullStatement();
   ExpressionT cond = impl()->NullExpression();
   StatementT next = impl()->NullStatement();
   StatementT body = impl()->NullStatement();
   {
-    BlockState block_state(&scope_, inner_scope);
-    scope()->set_start_position(scanner()->location().beg_pos);
+    std::optional<BlockState> block_state;
+    if (is_let_with_bound_names) {
+      inner_scope = NewScope(BLOCK_SCOPE);
+      block_state.emplace(&scope_, inner_scope);
+      scope()->set_start_position(scanner()->location().beg_pos);
+    }
     loop =
         ParseStandardForLoop(stmt_pos, labels, own_labels, &cond, &next, &body);
     RETURN_IF_PARSE_ERROR;
-    scope()->set_end_position(end_position());
+    if (is_let_with_bound_names) {
+      scope()->set_end_position(end_position());
+    }
   }
 
   scope()->set_end_position(end_position());
-  if (for_info->bound_names.length() > 0 &&
-      function_state_->contains_function_or_eval()) {
-    scope()->set_is_hidden();
-    return impl()->DesugarLexicalBindingsInForStatement(
-        loop, init, cond, next, body, inner_scope, *for_info);
-  } else {
-    inner_scope = inner_scope->FinalizeBlockScope();
-    DCHECK_NULL(inner_scope);
-    USE(inner_scope);
+  if (is_let_with_bound_names) {
+    if (function_state_->contains_function_or_eval()) {
+      scope()->set_is_hidden();
+      return impl()->DesugarLetBindingsInForStatement(
+          loop, init, cond, next, body, inner_scope, *for_info);
+    } else {
+      inner_scope = inner_scope->FinalizeBlockScope();
+      DCHECK_NULL(inner_scope);
+      USE(inner_scope);
+    }
   }
 
   Scope* for_scope = scope()->FinalizeBlockScope();

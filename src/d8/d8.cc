@@ -1058,6 +1058,10 @@ class ModuleEmbedderData {
   // List of compiled JavaScript modules awaiting code cache production.
   std::vector<std::pair<Global<String>, Global<Module>>>
       modules_pending_code_cache;
+
+  // Modules inserted during the current FetchModuleTree call, for rollback on
+  // failure.
+  std::vector<decltype(module_map)::iterator> inserted_modules;
 };
 
 enum { kModuleEmbedderDataIndex, kInspectorClientIndex };
@@ -1532,6 +1536,7 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
   Isolate* isolate = Isolate::GetCurrent();
   i::CppGCManaged<ModuleEmbedderData>::Ptr module_data =
       GetModuleDataFromContext(context);
+  DCHECK_IMPLIES(referrer.IsEmpty(), module_data->inserted_modules.empty());
   MaybeLocal<String> source_text;
   std::unique_ptr<base::OS::MemoryMappedFile> raw_file;
 
@@ -1672,6 +1677,7 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
       std::make_pair(std::make_pair(module_specifier, module_type),
                      Global<Module>(isolate, module)));
   CHECK(module_map_inserted.second);
+  module_data->inserted_modules.push_back(module_map_inserted.first);
 
   auto module_to_specifier_map_inserted =
       module_data->module_to_specifier_map.insert(
@@ -1728,10 +1734,14 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
     }
   }
 
-  if (result.IsEmpty()) {
-    module_data->module_map.erase(module_map_inserted.first);
-    module_data->module_to_specifier_map.erase(
-        module_to_specifier_map_inserted.first);
+  if (referrer.IsEmpty()) {
+    if (result.IsEmpty()) {
+      for (auto it : module_data->inserted_modules) {
+        module_data->module_to_specifier_map.erase(it->second);
+        module_data->module_map.erase(it);
+      }
+    }
+    module_data->inserted_modules.clear();
   }
 
   return result;
@@ -2353,13 +2363,14 @@ bool Shell::LoadJSON(Isolate* isolate, const char* file_name) {
   TryCatch try_catch(isolate);
 
   std::string absolute_path = NormalizePath(file_name, GetWorkingDirectory());
-  base::UniqueArray<char> data = ReadChars(absolute_path.c_str());
-  if (data.data() == nullptr) {
+  std::optional<base::UniqueArray<char>> data =
+      ReadChars(absolute_path.c_str());
+  if (!data) {
     printf("Error reading '%s'\n", file_name);
     base::OS::ExitProcess(1);
   }
   // TODO(C++23): Replace with std::ispanstream once Clang supports it.
-  std::stringstream stream(std::string(data.data(), data.size()));
+  std::stringstream stream(std::string(data->data(), data->size()));
   std::string line;
   while (std::getline(stream, line, '\n')) {
     for (int r = 0; r < DeserializationRunCount(); ++r) {
@@ -5758,7 +5769,9 @@ V8_NOINLINE void FuzzerMonitor::ControlFlowViolation() {
 
 V8_NOINLINE void FuzzerMonitor::DCheck() {
   // Caught in debug builds.
-  DCHECK(false);
+  constexpr bool kSimulatedDcheckError = false;
+  USE(kSimulatedDcheckError);
+  DCHECK(kSimulatedDcheckError);
 }
 
 V8_NOINLINE void FuzzerMonitor::Fatal() {
@@ -5796,13 +5809,13 @@ V8_NOINLINE void FuzzerMonitor::UseOfUninitializedValue() {
 #endif
 }
 
-base::UniqueArray<char> Shell::ReadChars(const char* name) {
+std::optional<base::UniqueArray<char>> Shell::ReadChars(const char* name) {
   if (options.read_from_tcp_port >= 0) {
     return ReadCharsFromTcpPort(name);
   }
 
   FILE* file = base::OS::FOpen(name, "rb");
-  if (file == nullptr) return {};
+  if (file == nullptr) return std::nullopt;
 
   fseek(file, 0, SEEK_END);
   size_t size = ftell(file);
@@ -5813,7 +5826,7 @@ base::UniqueArray<char> Shell::ReadChars(const char* name) {
     i += fread(&chars[i], 1, size - i, file);
     if (ferror(file)) {
       base::Fclose(file);
-      return {};
+      return std::nullopt;
     }
   }
   base::Fclose(file);
@@ -5822,13 +5835,13 @@ base::UniqueArray<char> Shell::ReadChars(const char* name) {
 
 MaybeLocal<PrimitiveArray> Shell::ReadLines(Isolate* isolate,
                                             const char* name) {
-  base::UniqueArray<char> data = ReadChars(name);
+  std::optional<base::UniqueArray<char>> data = ReadChars(name);
 
-  if (data.data() == nullptr) {
+  if (!data) {
     return MaybeLocal<PrimitiveArray>();
   }
   // TODO(C++23): Replace with std::ispanstream once Clang supports it.
-  std::stringstream stream(std::string(data.data(), data.size()));
+  std::stringstream stream(std::string(data->data(), data->size()));
   std::string line;
   std::vector<std::string> lines;
   while (std::getline(stream, line, '\n')) {
@@ -5858,8 +5871,8 @@ void Shell::ReadBuffer(const v8::FunctionCallbackInfo<v8::Value>& info) {
   SafeUtf8Value filename(isolate, info[0]);
   if (!filename) return;
 
-  base::UniqueArray<char> data = ReadChars(*filename);
-  if (data.data() == nullptr) {
+  std::optional<base::UniqueArray<char>> data = ReadChars(*filename);
+  if (!data) {
     std::ostringstream error_msg;
     error_msg << "Error reading file \""
               << std::string_view{*filename,
@@ -5868,8 +5881,8 @@ void Shell::ReadBuffer(const v8::FunctionCallbackInfo<v8::Value>& info) {
     ThrowError(isolate, error_msg.str());
     return;
   }
-  Local<v8::ArrayBuffer> buffer = ArrayBuffer::New(isolate, data.size());
-  memcpy(buffer->GetBackingStore()->Data(), data.data(), data.size());
+  Local<v8::ArrayBuffer> buffer = ArrayBuffer::New(isolate, data->size());
+  base::MemCopy(buffer->GetBackingStore()->Data(), data->data(), data->size());
 
   info.GetReturnValue().Set(buffer);
 }
@@ -6033,7 +6046,7 @@ class InspectorFrontend final : public v8_inspector::V8Inspector::Channel {
 #ifdef DEBUG
       i::DirectHandle<i::Object> i_exception;
       if (maybe_exception.ToHandle(&i_exception) &&
-          !try_catch.HasTerminated() && !i::v8_flags.fuzzing) {
+          !try_catch.HasTerminated()) {
         Local<Value> exception = Utils::ToLocal(i_exception);
         Local<Object> exception_obj = exception.As<Object>();
         Local<String> key = v8::String::NewFromUtf8Literal(
@@ -7003,9 +7016,45 @@ namespace {
 
 using KeepFlag = base::StrongAlias<struct KeepFlagTag, bool>;
 
+// Match `arg` against `flag`, normalizing '_' to '-' and accepting both '-'
+// and '--' for long flags (as well as "--nofoo" for "--no-foo"), matching
+// FlagList::SetFlagsFromCommandLine. Returns a pointer to the remainder of
+// `arg` after the matched flag name, or nullptr on mismatch.
+char* MatchFlagPrefix(char* arg, const char* flag) {
+  if (arg == nullptr || arg[0] != '-') return nullptr;
+  DCHECK_EQ('-', flag[0]);
+  ++flag;
+  ++arg;
+  auto normalize_char = [](char ch) { return ch == '_' ? '-' : ch; };
+  if (*flag == '-') {
+    ++flag;
+    // The "--" end-of-options separator requires a second '-'.
+    if (*flag == '\0') return *arg == '-' ? arg + 1 : nullptr;
+    // Long flags ("--foo") accept both "-" and "--" prefixes in `arg`.
+    if (*arg == '-') ++arg;
+    // Negated flags ("--no-foo") also accept "--nofoo" and "--no_foo".
+    if (flag[0] == 'n' && flag[1] == 'o' && flag[2] == '-' && arg[0] == 'n' &&
+        arg[1] == 'o') {
+      flag += 3;
+      arg += 2;
+      if (normalize_char(*arg) == '-') ++arg;
+    }
+  }
+  DCHECK_NE('\0', *flag);
+  // Match the remaining characters, normalizing '_' in `arg` to '-'.
+  while (*flag != '\0') {
+    DCHECK_NE('_', *flag);
+    if (normalize_char(*arg) != *flag) return nullptr;
+    ++flag;
+    ++arg;
+  }
+  return arg;
+}
+
 bool FlagMatches(const char* flag, char** arg,
                  KeepFlag keep_flag = KeepFlag{false}) {
-  if (strcmp(*arg, flag) == 0) {
+  const char* rest = MatchFlagPrefix(*arg, flag);
+  if (rest != nullptr && *rest == '\0') {
     if (!keep_flag) {
       *arg = nullptr;
     }
@@ -7014,23 +7063,19 @@ bool FlagMatches(const char* flag, char** arg,
   return false;
 }
 
-template <size_t N>
-bool FlagWithArgMatches(const char (&flag)[N], char** flag_value, int argc,
+bool FlagWithArgMatches(const char* flag, char** flag_value, int argc,
                         char* argv[], int* i,
                         KeepFlag keep_flag = KeepFlag{false}) {
-  char* current_arg = argv[*i];
-
-  // Compare the flag up to the last character of the flag name (not including
-  // the null terminator).
-  if (strncmp(current_arg, flag, N - 1) == 0) {
+  char* rest = MatchFlagPrefix(argv[*i], flag);
+  if (rest != nullptr) {
     // Match against --flag=value
-    if (current_arg[N - 1] == '=') {
-      *flag_value = argv[*i] + N;
+    if (*rest == '=') {
+      *flag_value = rest + 1;
       if (!keep_flag) argv[*i] = nullptr;
       return true;
     }
     // Match against --flag value
-    if (current_arg[N - 1] == '\0') {
+    if (*rest == '\0') {
       CHECK_LT(*i, argc - 1);
       if (!keep_flag) argv[*i] = nullptr;
       (*i)++;
@@ -7040,7 +7085,7 @@ bool FlagWithArgMatches(const char (&flag)[N], char** flag_value, int argc,
     }
   }
 
-  flag_value = nullptr;
+  *flag_value = nullptr;
   return false;
 }
 
@@ -7145,8 +7190,7 @@ bool Shell::SetOptions(int argc, char* argv[]) {
       options.interactive_shell = true;
     } else if (FlagMatches("--test", &argv[i])) {
       options.test_shell = true;
-    } else if (FlagMatches("--notest", &argv[i]) ||
-               FlagMatches("--no-test", &argv[i])) {
+    } else if (FlagMatches("--no-test", &argv[i])) {
       options.test_shell = false;
     } else if (FlagMatches("--send-idle-notification", &argv[i])) {
       options.send_idle_notification = true;
@@ -7194,7 +7238,7 @@ bool Shell::SetOptions(int argc, char* argv[]) {
                                   &i)) {
       options.icu_locale = flag_value;
 #ifdef V8_USE_EXTERNAL_STARTUP_DATA
-    } else if (FlagWithArgMatches("--snapshot_blob", &flag_value, argc, argv,
+    } else if (FlagWithArgMatches("--snapshot-blob", &flag_value, argc, argv,
                                   &i)) {
       options.snapshot_blob = flag_value;
 #endif  // V8_USE_EXTERNAL_STARTUP_DATA
@@ -7221,8 +7265,7 @@ bool Shell::SetOptions(int argc, char* argv[]) {
       }
     } else if (FlagMatches("--streaming-compile", &argv[i])) {
       options.streaming_compile = true;
-    } else if ((FlagMatches("--no-streaming-compile", &argv[i])) ||
-               (FlagMatches("--nostreaming-compile", &argv[i]))) {
+    } else if (FlagMatches("--no-streaming-compile", &argv[i])) {
       options.streaming_compile = false;
     } else if (FlagMatches("--enable-tracing", &argv[i])) {
       options.trace_enabled = true;
@@ -7376,6 +7419,9 @@ bool Shell::SetOptions(int argc, char* argv[]) {
   handle_unsafe_d8_flag(options.trace_enabled);
   handle_unsafe_d8_flag(options.trace_config);
   handle_unsafe_d8_flag(options.trace_path);
+  // Inspector security bugs must be shown through the embedder (i.e. Chrome,
+  // or content_shell).
+  handle_unsafe_d8_flag(options.enable_inspector);
   handle_unsafe_d8_flag(options.lcov_file);
   handle_unsafe_d8_flag(options.enable_os_system);
   handle_unsafe_d8_flag(options.snapshot_blob);
@@ -7404,9 +7450,6 @@ bool Shell::SetOptions(int argc, char* argv[]) {
       i::v8_flags.developer_only_features = true;
     }
   };
-  // Inspector security bugs must be shown through the embedder (i.e. Chrome,
-  // or content_shell).
-  handle_developer_only_d8_flag(options.enable_inspector);
   // Handle d8-only developer-only flags.
   handle_developer_only_d8_flag(options.dump_counters);
   handle_developer_only_d8_flag(options.dump_counters_nvp);
@@ -8504,15 +8547,15 @@ int Shell::Main(int argc, char* argv[]) {
       if (options.trace_enabled) {
         platform::tracing::TraceConfig* trace_config;
         if (options.trace_config) {
-          base::UniqueArray<char> trace_config_json_str =
+          std::optional<base::UniqueArray<char>> trace_config_json_str =
               ReadChars(options.trace_config);
-          if (trace_config_json_str.data() == nullptr) {
+          if (!trace_config_json_str) {
             printf("Failed to read trace config from '%s'\n",
                    options.trace_config.get());
             base::OS::ExitProcess(1);
           }
           trace_config = tracing::CreateTraceConfigFromJSON(
-              isolate, trace_config_json_str.as_vector());
+              isolate, trace_config_json_str->as_vector());
         } else {
           trace_config =
               platform::tracing::TraceConfig::CreateDefaultTraceConfig();

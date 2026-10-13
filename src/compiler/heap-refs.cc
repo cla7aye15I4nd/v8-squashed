@@ -1319,7 +1319,13 @@ bool MapRef::IsUndefinedMap(JSHeapBroker* broker) const {
   return *this == broker->undefined_map();
 }
 
-
+bool MapRef::IsAnyWasmObjectMap() const {
+#if V8_ENABLE_WEBASSEMBLY
+  return IsWasmObjectMap() || IsWasmCustomMapMap();
+#else
+  return false;
+#endif  // V8_ENABLE_WEBASSEMBLY
+}
 
 bool MapRef::IsStringWrapperMap() const {
   return IsJSPrimitiveWrapperMap() &&
@@ -1921,6 +1927,7 @@ HEAP_ACCESSOR_C(ScopeInfo, bool, HasContextExtensionSlot)
 HEAP_ACCESSOR_C(ScopeInfo, bool, SomeContextHasExtension)
 HEAP_ACCESSOR_C(ScopeInfo, bool, HasOuterScopeInfo)
 HEAP_ACCESSOR_C(ScopeInfo, bool, HasContext)
+HEAP_ACCESSOR_C(ScopeInfo, bool, HasContextCells)
 HEAP_ACCESSOR_C(ScopeInfo, bool, ClassScopeHasPrivateBrand)
 HEAP_ACCESSOR_C(ScopeInfo, bool, SloppyEvalCanExtendVars)
 HEAP_ACCESSOR_C(ScopeInfo, bool, HasAllocatedReceiver)
