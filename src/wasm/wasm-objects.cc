@@ -1613,17 +1613,6 @@ DirectHandle<WasmTrustedInstanceData> WasmTrustedInstanceData::New(
   instance_object->set_module_object(*module_object);
   trusted_data->set_instance_object(*instance_object);
 
-  // Insert the new instance into the script's weak list of instances. This
-  // list is used for breakpoints affecting all instances belonging to the
-  // script.
-  DCHECK_EQ(module_object->script()->type(), Script::Type::kWasm);
-  DirectHandle<WeakArrayList> weak_instance_list(
-      module_object->script()->wasm_weak_instance_list(), isolate);
-  weak_instance_list =
-      WeakArrayList::Append(isolate, weak_instance_list,
-                            MaybeObjectDirectHandle::Weak(instance_object));
-  module_object->script()->set_wasm_weak_instance_list(*weak_instance_list);
-
   return trusted_data;
 }
 
@@ -2986,7 +2975,7 @@ std::unique_ptr<char[]> WasmExportedFunction::GetDebugName(
   size_t len = strlen(kPrefix) + sig->all().size() + 2;
   auto buffer = base::UniqueArray<char>::New(len);
   memcpy(buffer.begin(), kPrefix, strlen(kPrefix));
-  PrintSignature(buffer.as_vector() + strlen(kPrefix), sig);
+  PrintSignature(buffer.subspan(strlen(kPrefix)), sig);
   return buffer.ReleaseData();
 }
 
@@ -3472,7 +3461,8 @@ MaybeDirectHandle<Object> JSToWasmObject(Isolate* isolate,
 }
 
 DirectHandle<Object> WasmToJSObject(Isolate* isolate,
-                                    DirectHandle<Object> value) {
+                                    DirectHandle<Object> value,
+                                    UnshareStringsMode unshare_strings) {
   if (IsWasmNull(*value)) {
     return direct_handle(ReadOnlyRoots(isolate).null_value(), isolate);
   }
@@ -3493,9 +3483,11 @@ DirectHandle<Object> WasmToJSObject(Isolate* isolate,
     return WasmInternalFunction::GetOrCreateExternal(internal);
   }
   if (IsString(*value)) {
-    DirectHandle<String> string = Cast<String>(value);
-    if (HeapLayout::InWritableSharedSpace(*string)) {
-      return String::Unshare(isolate, string);
+    if (unshare_strings) {
+      DirectHandle<String> string = Cast<String>(value);
+      if (HeapLayout::InWritableSharedSpace(*string)) {
+        return String::Unshare(isolate, string);
+      }
     }
   } else if (IsWasmCustomMap(*value)) {
     DirectHandle<WasmCustomMap> map = Cast<WasmCustomMap>(value);

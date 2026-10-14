@@ -553,8 +553,7 @@ void Serializer::ObjectSerializer::SerializePrologue(SnapshotSpace space,
     // object cannot be referenced.
     if (V8_ENABLE_SANDBOX_BOOL && IsExposedTrustedObject(*object_)) {
       SBXCHECK_EQ(space, SnapshotSpace::kTrusted);
-      sink_->Put(kInitializeSelfIndirectPointer,
-                 "InitializeSelfIndirectPointer");
+      sink_->Put(kInitializeSelfTrustedPointer, "InitializeSelfTrustedPointer");
     }
 
     // Now that the object is allocated, we can resolve pending references to
@@ -1014,9 +1013,42 @@ void Serializer::ObjectSerializer::VisitPointers(Tagged<HeapObject> host,
   PtrComprCageBase cage_base(isolate());
   DisallowGarbageCollection no_gc;
 
+  auto IsRawCopyable = [&](MaybeObjectSlot slot) {
+    Tagged<MaybeObject> value = slot.load(cage_base);
+    if (value.IsSmi()) return true;
+#if V8_STATIC_ROOTS_BOOL
+    Tagged<HeapObject> obj;
+    RootIndex root_index;
+    if (value.GetHeapObjectIfStrong(&obj) && HeapLayout::InReadOnlySpace(obj) &&
+        !serializer_->root_index_map()->Lookup(obj, &root_index)) {
+      return true;
+    }
+#endif  // V8_STATIC_ROOTS_BOOL
+    return false;
+  };
+
+  // Advance `current` across contiguous slots that can be emitted as a single
+  // raw-data memcpy (`FixedRawData` / `VariableRawData`). Smis are always raw.
+  // On static-roots builds, non-root read-only strong pointers also reside at
+  // fixed cage offsets and need no relocation or write barriers, so they can be
+  // raw-copied too. However, RO refs only *join* a run and never start a
+  // one-slot run, since an isolated ref is cheaper as `kReadOnlyHeapRef` than
+  // as `FixedRawData`.
+  const Address object_end = object_->address() + object_->Size();
   MaybeObjectSlot current = start;
   while (current < end) {
-    while (current < end && current.load(cage_base).IsSmi()) {
+    const Address raw_start = object_->address() + bytes_processed_so_far_;
+    while (current < end && IsRawCopyable(current)) {
+      if (!current.load(cage_base).IsSmi()) {
+        MaybeObjectSlot next = current + 1;
+        const bool run_already_open = current.address() > raw_start;
+        const bool followed_by_raw_payload =
+            next == end && end.address() < object_end;
+        const bool next_is_raw = next < end && IsRawCopyable(next);
+        if (!run_already_open && !followed_by_raw_payload && !next_is_raw) {
+          break;
+        }
+      }
       ++current;
     }
     if (current < end) {
@@ -1247,7 +1279,7 @@ void Serializer::ObjectSerializer::VisitExternalPointer(
 
 void Serializer::ObjectSerializer::VisitIndirectPointer(
     Tagged<HeapObject> host, IndirectPointerSlot slot,
-    IndirectPointerMode mode) {
+    TrustedPointerMode mode) {
 #ifdef V8_ENABLE_SANDBOX
   // If the slot is empty (i.e. contains a null handle), then we can just skip
   // it since in that case the correct action is to encode the null handle as
@@ -1262,12 +1294,12 @@ void Serializer::ObjectSerializer::VisitIndirectPointer(
   Handle<HeapObject> slot_value(Cast<HeapObject>(slot.load(isolate())),
                                 isolate());
   CHECK(IsHeapObject(*slot_value));
-  bytes_processed_so_far_ += kIndirectPointerSize;
+  bytes_processed_so_far_ += kTrustedPointerSize;
 
   // Currently we cannot see pending objects here, but we may need to support
   // them in the future. They should already be supported by the deserializer.
   CHECK(!serializer_->SerializePendingObject(*slot_value));
-  sink_->Put(kIndirectPointerPrefix, "IndirectPointer");
+  sink_->Put(kTrustedPointerPrefix, "IndirectPointer");
   serializer_->SerializeObject(slot_value, SlotType::kAnySlot);
 #else
   UNREACHABLE();
@@ -1280,11 +1312,11 @@ void Serializer::ObjectSerializer::VisitTrustedPointerTableEntry(
   // These fields only exist on the ExposedTrustedObject class, and they are
   // located directly after the Map word.
   DCHECK_EQ(bytes_processed_so_far_,
-            offsetof(ExposedTrustedObject, self_indirect_pointer_));
+            offsetof(ExposedTrustedObject, self_trusted_pointer_));
 
-  // Nothing to do here. We already emitted the kInitializeSelfIndirectPointer
+  // Nothing to do here. We already emitted the kInitializeSelfTrustedPointer
   // after processing the Map word in SerializePrologue.
-  bytes_processed_so_far_ += kIndirectPointerSize;
+  bytes_processed_so_far_ += kTrustedPointerSize;
 #else
   UNREACHABLE();
 #endif
@@ -1459,6 +1491,20 @@ void Serializer::ObjectSerializer::OutputRawData(Address up_to) {
       OutputRawWithCustomField(sink_, object_start, base, bytes_to_output,
                                offsetof(JSArrayBuffer, backing_store_),
                                sizeof(field_value), field_value);
+    } else if (IsUncompiledDataWithoutPreparseDataWithJob(*object_)) {
+      // The job field contains a raw pointer that is not valid after
+      // deserialization, so write zeros instead.
+      static uint8_t field_value[kSystemPointerSize] = {0};
+      OutputRawWithCustomField(
+          sink_, object_start, base, bytes_to_output,
+          offsetof(UncompiledDataWithoutPreparseDataWithJob, job_),
+          sizeof(field_value), field_value);
+    } else if (IsUncompiledDataWithPreparseDataAndJob(*object_)) {
+      static uint8_t field_value[kSystemPointerSize] = {0};
+      OutputRawWithCustomField(
+          sink_, object_start, base, bytes_to_output,
+          offsetof(UncompiledDataWithPreparseDataAndJob, job_),
+          sizeof(field_value), field_value);
     } else if (IsSeqString(*object_)) {
       // SeqStrings may contain padding. Serialize the padding bytes as 0s to
       // make the snapshot content deterministic.

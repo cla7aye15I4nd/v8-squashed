@@ -676,27 +676,18 @@ bool Object::FilterKey(Tagged<Object> obj, PropertyFilter filter) {
 }
 
 // static
-std::pair<Representation, PropertyConstness> Object::OptimalRepresentation(
-    Tagged<Object> obj, PropertyConstness constness) {
+Representation Object::OptimalRepresentation(Tagged<Object> obj) {
   if (IsSmi(obj)) {
-    return {Representation::Smi(), constness};
+    return Representation::Smi();
   }
   Tagged<HeapObject> heap_object = Cast<HeapObject>(obj);
   if (IsUninitializedHole(heap_object)) {
-    return {Representation::None(), constness};
+    return Representation::None();
   }
   if (IsHeapNumber(heap_object)) {
-    if (constness == PropertyConstness::kConst &&
-        Cast<HeapNumber>(heap_object)->is_the_hole()) {
-      // Make sure that even an initializing store of a double value with
-      // the hole NaN pattern removes constness, otherwise it wouldn't be
-      // possible to distinguish whether subsequent stores to a double field
-      // is initializing or not.
-      constness = PropertyConstness::kMutable;
-    }
-    return {Representation::Double(), constness};
+    return Representation::Double();
   }
-  return {Representation::HeapObject(), constness};
+  return Representation::HeapObject();
 }
 
 // static
@@ -809,10 +800,7 @@ template <typename T, template <typename> typename HandleType>
   requires(std::is_convertible_v<HandleType<T>, DirectHandle<T>>)
 typename HandleType<Number>::MaybeType Object::ToUint32(Isolate* isolate,
                                                         HandleType<T> input) {
-  if (IsSmi(*input)) {
-    return typename HandleType<Number>::MaybeType(
-        Smi::ToUint32Smi(Cast<Smi>(*input)), isolate);
-  }
+  if (IsSmi(*input) && Smi::ToInt(*input) >= 0) return Cast<Smi>(input);
   return ConvertToUint32(isolate, Cast<Object>(input));
 }
 

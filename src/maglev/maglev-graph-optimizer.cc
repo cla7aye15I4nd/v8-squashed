@@ -1186,11 +1186,8 @@ ProcessResult MaglevGraphOptimizer::VisitCheckValue(
     CheckValue* node, const ProcessingState& state) {
   ValueNode* input = node->input_node(0);
   if (HeapConstant* constant = input->TryCast<HeapConstant>()) {
-    if (constant->object() == node->value()) {
-      return RemoveCurrentNode();
-    }
-    // TODO(victorgomes): Support soft deopting and killing the rest of the
-    // block.
+    return RemoveCheckOrDeopt(constant->object() == node->value(),
+                              node->deoptimize_reason());
   }
   return ProcessResult::kContinue;
 }
@@ -3746,6 +3743,15 @@ ProcessResult MaglevGraphOptimizer::VisitBranchIfInt32ToBooleanTrue(
   if (auto cst = reducer_.TryGetInt32Constant(node->ConditionInput().node())) {
     bool condition_value = cst.value() != 0;
     FoldBranch(state.block(), node, condition_value);
+    return ProcessResult::kRevisit;
+  }
+  return ProcessResult::kContinue;
+}
+
+ProcessResult MaglevGraphOptimizer::VisitBranchIfInt32BitwiseAndNonZero(
+    BranchIfInt32BitwiseAndNonZero* node, const ProcessingState& state) {
+  if (auto cst = reducer_.TryGetInt32Constant(node->ValueInput().node())) {
+    FoldBranch(state.block(), node, (cst.value() & node->mask()) != 0);
     return ProcessResult::kRevisit;
   }
   return ProcessResult::kContinue;

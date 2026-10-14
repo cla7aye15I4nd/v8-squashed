@@ -414,17 +414,14 @@ template <template <typename> typename HandleType>
 typename HandleType<Number>::MaybeType Object::ConvertToUint32(
     Isolate* isolate, HandleType<Object> input) {
   ASSIGN_RETURN_ON_EXCEPTION(isolate, input, ConvertToNumber(isolate, input));
-  if (IsSmi(*input)) {
-    return typename HandleType<Number>::MaybeType(
-        Smi::ToUint32Smi(Cast<Smi>(*input)), isolate);
-  }
+  if (IsSmi(*input) && Smi::ToInt(*input) >= 0) return Cast<Smi>(input);
   return isolate->factory()->NewNumberFromUint(
-      DoubleToUint32(Cast<HeapNumber>(*input)->value()));
+      DoubleToUint32(Object::NumberValue(Cast<Number>(*input))));
 }
 
-template MaybeDirectHandle<Number> Object::ConvertToUint32(
+template V8_EXPORT_PRIVATE MaybeDirectHandle<Number> Object::ConvertToUint32(
     Isolate* isolate, DirectHandle<Object> input);
-template MaybeIndirectHandle<Number> Object::ConvertToUint32(
+template V8_EXPORT_PRIVATE MaybeIndirectHandle<Number> Object::ConvertToUint32(
     Isolate* isolate, IndirectHandle<Object> input);
 
 // static
@@ -2029,7 +2026,7 @@ int HeapObject::SizeFromMap(Tagged<Map> map) const {
   if (instance_size != kVariableSizeSentinel) return instance_size;
   // Only inline the most frequent cases.
   InstanceType instance_type = map->instance_type();
-  if (InstanceTypeChecker::IsMap(instance_type)) {
+  if (instance_type == MAP_TYPE) {
     return UncheckedCast<Map>(this)->AllocatedSize();
   }
   if (base::IsInRange(instance_type, FIRST_FIXED_ARRAY_TYPE,

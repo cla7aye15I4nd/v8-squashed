@@ -64,7 +64,6 @@
 #include "src/compiler/loop-variable-optimizer.h"
 #include "src/compiler/machine-graph-verifier.h"
 #include "src/compiler/machine-operator-reducer.h"
-#include "src/compiler/memory-optimizer.h"
 #include "src/compiler/node-observer.h"
 #include "src/compiler/node-origin-table.h"
 #include "src/compiler/osr.h"
@@ -1319,36 +1318,6 @@ struct LoadEliminationPhase {
   }
 };
 
-struct MemoryOptimizationPhase {
-  DECL_PIPELINE_PHASE_CONSTANTS(MemoryOptimization)
-
-  void Run(TFPipelineData* data, Zone* temp_zone) {
-    // The memory optimizer requires the graphs to be trimmed, so trim now.
-    GraphTrimmer trimmer(temp_zone, data->graph());
-    NodeVector roots(temp_zone);
-    data->jsgraph()->GetCachedNodes(&roots);
-    {
-      UnparkedScopeIfNeeded scope(data->broker(),
-                                  v8_flags.trace_turbo_trimming);
-      trimmer.TrimGraph(roots.begin(), roots.end());
-    }
-
-    // Optimize allocations and load/store operations.
-#if V8_ENABLE_WEBASSEMBLY
-    bool is_wasm = data->info()->IsWasm() || data->info()->IsWasmBuiltin();
-#else
-    bool is_wasm = false;
-#endif
-    MemoryOptimizer optimizer(
-        data->broker(), data->jsgraph(), temp_zone,
-        data->info()->allocation_folding()
-            ? MemoryLowering::AllocationFolding::kDoAllocationFolding
-            : MemoryLowering::AllocationFolding::kDontAllocationFolding,
-        data->debug_name(), &data->info()->tick_counter(), is_wasm);
-    optimizer.Optimize();
-  }
-};
-
 #if V8_ENABLE_WEBASSEMBLY
 struct WasmTypingPhase {
   DECL_PIPELINE_PHASE_CONSTANTS(WasmTyping)
@@ -1380,24 +1349,6 @@ struct WasmGCOptimizationPhase {
                                               data->common(), temp_zone);
     AddReducer(data, &graph_reducer, &load_elimination);
     AddReducer(data, &graph_reducer, &wasm_gc);
-    AddReducer(data, &graph_reducer, &dead_code_elimination);
-    graph_reducer.ReduceGraph();
-  }
-};
-
-struct WasmGCLoweringPhase {
-  DECL_PIPELINE_PHASE_CONSTANTS(WasmGCLowering)
-
-  void Run(TFPipelineData* data, Zone* temp_zone,
-           const wasm::WasmModule* module) {
-    GraphReducer graph_reducer(
-        temp_zone, data->graph(), &data->info()->tick_counter(), data->broker(),
-        data->jsgraph()->Dead(), data->observe_node_manager());
-    WasmGCLowering lowering(&graph_reducer, data->mcgraph(), module, false,
-                            data->source_positions());
-    DeadCodeElimination dead_code_elimination(&graph_reducer, data->graph(),
-                                              data->common(), temp_zone);
-    AddReducer(data, &graph_reducer, &lowering);
     AddReducer(data, &graph_reducer, &dead_code_elimination);
     graph_reducer.ReduceGraph();
   }
@@ -2081,7 +2032,7 @@ int ComputeInitialGraphHash(Builtin builtin,
       std::ofstream out(v8_flags.dump_builtins_hashes_to_file,
                         std::ios_base::app);
       out << "Builtin: " << Builtins::name(builtin) << ", hash: 0x" << std::hex
-          << initial_graph_hash << std::endl;
+          << initial_graph_hash << std::dec << std::endl;
     }
   }
   return initial_graph_hash;

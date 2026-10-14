@@ -245,16 +245,20 @@ class Deserializer : public SerializerDeserializer {
   template <typename SlotAccessor>
   int ReadWeakPrefix(uint8_t data, SlotAccessor slot_accessor);
   template <typename SlotAccessor>
-  int ReadIndirectPointerPrefix(uint8_t data, SlotAccessor slot_accessor);
+  int ReadTrustedPointerPrefix(uint8_t data, SlotAccessor slot_accessor);
   template <typename SlotAccessor>
-  int ReadInitializeSelfIndirectPointer(uint8_t data,
-                                        SlotAccessor slot_accessor);
+  int ReadInitializeSelfTrustedPointer(uint8_t data,
+                                       SlotAccessor slot_accessor);
   template <typename SlotAccessor>
   int ReadAllocateJSDispatchEntry(uint8_t data, SlotAccessor slot_accessor);
   template <typename SlotAccessor>
   int ReadJSDispatchEntry(uint8_t data, SlotAccessor slot_accessor);
   template <typename SlotAccessor>
   int ReadProtectedPointerPrefix(uint8_t data, SlotAccessor slot_accessor);
+  template <typename SlotAccessor>
+  int ReadTrustedExportRef(uint8_t data, SlotAccessor slot_accessor);
+  template <typename SlotAccessor>
+  int ReadUntrustedRef(uint8_t data, SlotAccessor slot_accessor);
   template <typename SlotAccessor>
   int ReadRootArrayConstants(uint8_t data, SlotAccessor slot_accessor);
   template <typename SlotAccessor>
@@ -336,11 +340,12 @@ class Deserializer : public SerializerDeserializer {
 
   const base::Vector<const uint8_t> trusted_payload_;
   std::vector<IndirectHandle<HeapObject>> untrusted_back_refs_;
+  std::vector<std::pair<uint32_t, UnresolvedForwardRef>> trusted_export_refs_;
 
   const bool deserializing_user_code_;
 
   bool next_reference_is_weak_ = false;
-  bool next_reference_is_indirect_pointer_ = false;
+  bool next_reference_is_trusted_pointer_ = false;
   bool next_reference_is_protected_pointer = false;
 
   // TODO(6593): generalize rehashing, and remove this flag.

@@ -280,9 +280,8 @@ class DebugInfoImpl {
     for (auto begin = cached_debugging_code_.begin(), it = begin,
               end = cached_debugging_code_.end();
          it != end; ++it) {
-      if (it->func_index == func_index &&
-          it->breakpoint_offsets.as_vector() == offsets &&
-          it->dead_breakpoints.as_vector() == dead_breakpoints) {
+      if (it->func_index == func_index && it->breakpoint_offsets == offsets &&
+          it->dead_breakpoints == dead_breakpoints) {
         // Rotate the cache entry to the front (for LRU).
         for (; it != begin; --it) std::iter_swap(it, it - 1);
         if (for_debugging == kWithBreakpoints) {
@@ -697,9 +696,20 @@ class DebugInfoImpl {
     const DebugSideTable::Entry::Value* value =
         debug_side_table->FindValue(debug_side_table_entry, index);
     if (value->is_constant()) {
-      DCHECK(value->type == kWasmI32 || value->type == kWasmI64);
-      return value->type == kWasmI32 ? WasmValue(value->i32_const)
-                                     : WasmValue(int64_t{value->i32_const});
+      switch (value->type.kind()) {
+        case kI32:
+          return WasmValue(value->i32_const);
+        case kI64:
+          return WasmValue(int64_t{value->i32_const});
+        case kF32:
+          return WasmValue(
+              Float32::FromBits(static_cast<uint32_t>(value->i32_const)));
+        case kF64:
+          return WasmValue(Float64::FromBits(
+              static_cast<uint64_t>(int64_t{value->i32_const})));
+        default:
+          UNREACHABLE();
+      }
     }
 
     if (value->is_register()) {

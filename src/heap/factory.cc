@@ -971,7 +971,8 @@ MaybeHandle<String> Factory::NewStringFromUtf8(
         reinterpret_cast<const base::Atomic8*>(string.data()), string.size());
   }
   auto peek_bytes = [&]() -> base::Vector<const uint8_t> {
-    return config.source_shared() ? private_copy.as_vector() : string;
+    if (config.source_shared()) return private_copy.as_span();
+    return string;
   };
   if (config.dest_shared()) {
     return NewStringFromUtf8Variant(isolate(), peek_bytes, config.variant(),
@@ -1008,7 +1009,7 @@ MaybeDirectHandle<String> Factory::NewStringFromUtf8(
   }
   auto peek_bytes = [&]() -> base::Vector<const uint8_t> {
     if (config.source_shared()) {
-      return private_copy.as_vector();
+      return private_copy.as_span();
     }
     const uint8_t* contents =
         reinterpret_cast<const uint8_t*>(array->ElementAddress(0));
@@ -1068,6 +1069,9 @@ MaybeDirectHandle<String> Factory::NewStringFromUtf16(
   static_assert(WasmArray::MaxLength(sizeof(uint16_t)) <= kMaxInt);
 
   uint32_t length = end - start;
+  if (length > String::kMaxLength) {
+    THROW_NEW_ERROR(isolate(), NewInvalidStringLengthError());
+  }
   base::UniqueArray<uint16_t> private_copy;
   if (config.source_shared()) {
     private_copy = CopyCodeUnits(
@@ -1076,7 +1080,7 @@ MaybeDirectHandle<String> Factory::NewStringFromUtf16(
   }
   auto peek_bytes = [&]() -> base::Vector<const uint16_t> {
     if (config.source_shared()) {
-      return private_copy.as_vector();
+      return private_copy.as_span();
     }
     const uint16_t* contents =
         reinterpret_cast<const uint16_t*>(array->ElementAddress(0));
@@ -1197,7 +1201,8 @@ MaybeDirectHandle<String> Factory::NewStringFromTwoByteLittleEndian(
         reinterpret_cast<const base::Atomic16*>(str.data()), str.size());
   }
   auto peek_bytes = [&]() -> base::Vector<const uint16_t> {
-    return config.source_shared() ? private_copy.as_vector() : str;
+    if (config.source_shared()) return private_copy.as_span();
+    return str;
   };
   if (config.dest_shared()) {
     return NewStringFromBytes<Wtf16Decoder, decltype(peek_bytes),
@@ -2734,7 +2739,7 @@ Handle<Map> Factory::NewMap(DirectHandle<HeapObject> meta_map_holder,
   auto meta_map_provider = [meta_map_holder] {
     // Tie new map to the same native context as given |meta_map_holder| object.
     Tagged<Map> meta_map = meta_map_holder->map();
-    DCHECK(IsMapMap(meta_map));
+    DCHECK(IsMetaMap(meta_map));
     return meta_map;
   };
   Handle<Map> map =
@@ -2798,7 +2803,7 @@ DirectHandle<Map> Factory::NewContextfulMap(
     // Tie new map to the creation context of given |creation_context_holder|
     // object.
     Tagged<Map> meta_map = creation_context_holder->map()->map();
-    DCHECK(IsMapMap(meta_map));
+    DCHECK(IsMetaMap(meta_map));
     return meta_map;
   };
   DirectHandle<Map> map =

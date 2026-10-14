@@ -34,6 +34,10 @@
 #include "src/objects/transitions-inl.h"
 #include "src/roots/roots.h"
 
+#if V8_ENABLE_WEBASSEMBLY
+#include "src/wasm/wasm-objects-inl.h"
+#endif  // V8_ENABLE_WEBASSEMBLY
+
 namespace v8::internal {
 
 Tagged<Map> Map::GetPrototypeChainRootMap(Isolate* isolate) const {
@@ -624,12 +628,11 @@ MaybeHandle<Map> Map::CopyWithConstant(Isolate* isolate, DirectHandle<Map> map,
     return MaybeHandle<Map>();
   }
 
-  auto [representation, constness] =
-      Object::OptimalRepresentation(*constant, PropertyConstness::kConst);
+  Representation representation = Object::OptimalRepresentation(*constant);
   DirectHandle<FieldType> type =
       Object::OptimalType(*constant, isolate, representation);
-  return CopyWithField(isolate, map, name, type, attributes, constness,
-                       representation, flag);
+  return CopyWithField(isolate, map, name, type, attributes,
+                       PropertyConstness::kConst, representation, flag);
 }
 
 bool Map::InstancesNeedRewriting(Tagged<Map> target,
@@ -2048,9 +2051,7 @@ DirectHandle<Map> UpdateDescriptorForValue(Isolate* isolate,
 
   PropertyAttributes attributes =
       map->instance_descriptors()->GetDetails(descriptor).attributes();
-  Representation representation;
-  std::tie(representation, constness) =
-      Object::OptimalRepresentation(*value, constness);
+  Representation representation = Object::OptimalRepresentation(*value);
   DirectHandle<FieldType> type =
       Object::OptimalType(*value, isolate, representation);
 
@@ -2106,9 +2107,7 @@ DirectHandle<Map> Map::TransitionToDataProperty(
       isolate->bootstrapper()->IsActive() ? OMIT_TRANSITION : INSERT_TRANSITION;
   MaybeDirectHandle<Map> maybe_map;
   if (!map->TooManyFastProperties(store_origin)) {
-    Representation representation;
-    std::tie(representation, constness) =
-        Object::OptimalRepresentation(*value, constness);
+    Representation representation = Object::OptimalRepresentation(*value);
     DirectHandle<FieldType> type =
         Object::OptimalType(*value, isolate, representation);
     maybe_map = Map::CopyWithField(isolate, map, name, type, attributes,
@@ -2583,9 +2582,18 @@ Handle<UnionOf<Smi, Cell>> Map::GetOrCreatePrototypeChainValidityCell(
   }
   // Otherwise create a new cell.
   Handle<Cell> cell = isolate->factory()->NewCell();
-  {
+  do {
     Tagged<Map> meta_map = validity_cell_holder_map->map();
-    DCHECK(IsMapMap(meta_map));
+#if V8_ENABLE_WEBASSEMBLY
+    if (!IsMetaMap(meta_map)) {
+      DCHECK(IsWasmCustomMap(*validity_cell_holder_map));
+      cell->set_maybe_value(
+          MakeWeak(Cast<WasmCustomMap>(validity_cell_holder_map)
+                       ->native_context_for_wrapper()));
+      break;
+    }
+#endif  // V8_ENABLE_WEBASSEMBLY
+    DCHECK(IsMetaMap(meta_map));
     // The meta map's context slot is Null for the RO meta map (shared
     // across all contexts). Legacy code reinterpret-loaded the slot as
     // NativeContext and MakeWeak'd it; since Null is immortal the
@@ -2602,7 +2610,7 @@ Handle<UnionOf<Smi, Cell>> Map::GetOrCreatePrototypeChainValidityCell(
       DCHECK(IsNull(maybe_context));
       cell->set_maybe_value(maybe_context);
     }
-  }
+  } while (false);
   validity_cell_holder_map->set_prototype_validity_cell(*cell, kRelaxedStore);
   return cell;
 }

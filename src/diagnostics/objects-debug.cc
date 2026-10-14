@@ -815,8 +815,9 @@ void Map::MapVerify(Isolate* isolate) {
     // Note: for each static type that has a descriptor, there is also a
     // canonical RTT that does not have one (and is not used by any actual
     // objects).
-    if (types->has_descriptor(index) && (IsWasmStruct(custom_descriptor()) ||
-                                         v8_flags.wasm_merged_descriptors)) {
+    if (types->has_descriptor(index) &&
+        ((IsWasmStructMap(this) && IsWasmStruct(custom_descriptor())) ||
+         map()->instance_type() == WASM_CUSTOM_MAP_TYPE)) {
       CHECK_GT(wasm_type_info()->supertypes_length(), subtyping_depth);
       CHECK_EQ(immediate_supertype_map(),
                wasm_type_info()->supertypes(subtyping_depth));
@@ -1984,10 +1985,10 @@ void ExposedTrustedObject::ExposedTrustedObjectVerify(Isolate* isolate) {
   } else {
     tag = kUnpublishedTrustedPointerTag;
   }
-  // We can't use ReadIndirectPointerField here because the tag is not a
+  // We can't use ReadTrustedPointerField here because the tag is not a
   // compile-time constant.
   IndirectPointerSlot slot = RawIndirectPointerField(
-      offsetof(ExposedTrustedObject, self_indirect_pointer_), tag);
+      offsetof(ExposedTrustedObject, self_trusted_pointer_), tag);
   Tagged<Object> self = slot.load(isolate);
   CHECK_EQ(self, this);
   // If the object is in the read-only space, the self indirect pointer entry
@@ -2934,6 +2935,8 @@ void JSArrayBuffer::JSArrayBufferVerify(Isolate* isolate) {
           (v.IsWeak() && IsJSArrayBufferView(v.GetHeapObjectAssumeWeak())) ||
           v.IsCleared());
   }
+  CHECK_IMPLIES(is_resizable_by_js() && !was_detached(),
+                GetBackingStore() != nullptr);
 }
 
 void JSArrayBufferView::JSArrayBufferViewVerify(Isolate* isolate) {
@@ -3134,7 +3137,7 @@ void SourceTextModule::SourceTextModuleVerify(Isolate* isolate) {
     if (status() == kLinked) {
       CHECK(IsJSGeneratorObject(code()));
     } else if (status() == kLinking) {
-      CHECK(IsJSFunction(code()) || IsJSGeneratorObject(code()));
+      CHECK(IsJSFunction(code()));
     } else if (status() == kPreLinking) {
       CHECK(IsSharedFunctionInfo(code()));
     } else if (status() == kUnlinked) {
@@ -3548,7 +3551,10 @@ void WasmStruct::WasmStructVerify(Isolate* isolate) {
   CHECK(Is<WasmStruct>(this));
 }
 
-void WasmCustomMap::WasmCustomMapVerify(Isolate* isolate) { UNIMPLEMENTED(); }
+void WasmCustomMap::WasmCustomMapVerify(Isolate* isolate) {
+  CHECK(Is<WasmCustomMap>(this));
+  MapVerify(isolate);
+}
 
 void WasmCustomMapWrapper::WasmCustomMapWrapperVerify(Isolate* isolate) {
   CHECK(Is<WasmCustomMapWrapper>(this));

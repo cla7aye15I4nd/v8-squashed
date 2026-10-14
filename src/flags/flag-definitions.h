@@ -1804,6 +1804,7 @@ DEFINE_BOOL(turbolev, false,
             "compiler instead of Turbofan")
 // ArrayDestructure bytecode is only supported in Turbolev, not Turbofan.
 DEFINE_WEAK_IMPLICATION(array_destructure_bytecode, turbolev)
+DEFINE_NEG_IMPLICATION(turbofan && !turbolev, array_destructure_bytecode)
 
 DEFINE_DEVELOPER_FLAG(print_turbolev_frontend,
                       "print Turbolev frontend (Maglev graphs)")
@@ -2220,7 +2221,6 @@ DEFINE_BOOL(wasm_custom_descriptors_permitted, true,
             "Emergency off-switch for Custom Descriptors Origin Trial")
 DEFINE_EXPERIMENTAL_FEATURE(wasm_merged_descriptors,
                             "merge Custom Descriptor into v8::internal::Map")
-DEFINE_IMPLICATION(wasm_merged_descriptors, wasm_custom_descriptors)
 
 DEFINE_DEBUG_BOOL(
     wasm_opt, true,
@@ -2372,6 +2372,7 @@ DEFINE_BOOL_READONLY(wasm_memory64_trap_handling, false,
 // DrumBrake flags.
 DEFINE_EXPERIMENTAL_FEATURE(wasm_jitless,
                             "Execute all wasm code in the Wasm interpreter")
+DEFINE_IMPLICATION(wasm_jitless, jitless)
 #ifdef V8_OS_TVOS
 // Enable wasm_jitless on tvOS where jit is not available.
 DEFINE_IMPLICATION(jitless, wasm_jitless)
@@ -2381,6 +2382,9 @@ DEFINE_BOOL(wasm_jitless_if_available_for_testing, false,
             "the 'v8_enable_drumbrake' flag is set.")
 DEFINE_IMPLICATION(wasm_jitless_if_available_for_testing, wasm_jitless)
 
+DEFINE_BOOL_READONLY(drumbrake_exnref, false,
+                     "enable new exception-handling support in the Wasm "
+                     "interpreter")
 DEFINE_BOOL(drumbrake_compact_bytecode, false,
             "Compress the Wasm interpreter bytecode")
 DEFINE_DEVELOPER_FLAG(trace_drumbrake_compact_bytecode,
@@ -2442,6 +2446,7 @@ DEFINE_BOOL_READONLY(wasm_jitless, false,
                      "execute all Wasm code in the Wasm interpreter")
 DEFINE_BOOL(wasm_jitless_if_available_for_testing, false, "")
 DEFINE_NEG_IMPLICATION(wasm_jitless_if_available_for_testing, turbolev)
+DEFINE_BOOL_READONLY(drumbrake_exnref, false, "")
 #endif  // V8_ENABLE_DRUMBRAKE
 
 DEFINE_BOOL(wasm_allow_mixed_eh_for_testing, false,
@@ -4385,7 +4390,7 @@ DISALLOW_UNSAFE_FLAG(perf_prof)
 DISALLOW_UNSAFE_FLAG(perf_prof_annotate_wasm)
 // Known-broken features/configuration.
 DISALLOW_UNSAFE_FLAG(feedback_normalization)
-DISALLOW_UNSAFE_FLAG_IF(turbofan && !turbolev, array_destructure_bytecode)
+DISALLOW_UNSAFE_FLAG(array_destructure_bytecode)
 // Disabled-by-default misc. "unsafe" flags that should not be enabled.
 DISALLOW_UNSAFE_FLAG(abort_on_bad_builtin_profile_data)
 DISALLOW_UNSAFE_FLAG(abort_on_uncaught_exception)

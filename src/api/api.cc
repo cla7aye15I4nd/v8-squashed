@@ -4173,7 +4173,9 @@ MaybeLocal<Int32> Value::ToInt32(Local<Context> context) const {
 
 MaybeLocal<Uint32> Value::ToUint32(Local<Context> context) const {
   auto obj = Utils::OpenDirectHandle(this);
-  if (i::IsSmi(*obj)) return ToApiHandle<Uint32>(obj);
+  if (i::IsSmi(*obj) && i::Smi::ToInt(*obj) >= 0) {
+    return ToApiHandle<Uint32>(obj);
+  }
   PrepareForExecutionScope api_scope{context, RCCId::kAPI_Object_ToUint32};
   i::Isolate* i_isolate = api_scope.i_isolate();
   return api_scope.EscapeMaybe(
@@ -4972,6 +4974,18 @@ MaybeLocal<Value> v8::Object::Get(Local<Context> context, uint32_t index) {
   auto self = Utils::OpenDirectHandle(this);
   return api_scope.EscapeMaybe(
       i::JSReceiver::GetElement(i_isolate, self, index));
+}
+
+MaybeLocal<Value> v8::Object::TryGetWithNoSideEffects(Local<Context> context,
+                                                      Local<Name> key) {
+  auto i_isolate = i::Isolate::Current();
+  EnterV8NoScriptScope<InternalEscapableScope> api_scope{
+      i_isolate, context, RCCId::kAPI_Object_TryGetWithNoSideEffects};
+  auto self = Utils::OpenDirectHandle(this);
+  auto key_obj = Utils::OpenDirectHandle(*key);
+  i::PropertyKey lookup_key(i_isolate, key_obj);
+  i::LookupIterator it(i_isolate, self, lookup_key, self);
+  return api_scope.EscapeMaybe(i::JSReceiver::TryGetDataProperty(&it));
 }
 
 MaybeLocal<Value> v8::Object::GetPrivate(Local<Context> context,

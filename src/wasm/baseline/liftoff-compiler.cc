@@ -1244,12 +1244,14 @@ class LiftoffCompiler {
     // having to spill them on merge points. Use of these initial values should
     // be rare anyway.
     if (actual_locals > kNumCacheRegisters / 2) return true;
-    // If there are locals which are not i32 or i64, we also spill all locals,
-    // because other types cannot be initialized to constants.
+    // If there are locals which are not i32, i64, f32, or f64, we also spill
+    // all locals, because other types cannot be initialized to constants.
     for (uint32_t param_idx = num_params; param_idx < __ num_locals();
          ++param_idx) {
       ValueKind kind = __ local_kind(param_idx);
-      if (kind != kI32 && kind != kI64) return true;
+      if (kind != kI32 && kind != kI64 && kind != kF32 && kind != kF64) {
+        return true;
+      }
     }
     return false;
   }
@@ -1358,8 +1360,8 @@ class LiftoffCompiler {
       for (uint32_t param_idx = num_params; param_idx < __ num_locals();
            ++param_idx) {
         ValueKind kind = __ local_kind(param_idx);
-        // Anything which is not i32 or i64 requires spilling.
-        DCHECK(kind == kI32 || kind == kI64);
+        // Anything which is not i32, i64, f32, or f64 requires spilling.
+        DCHECK(kind == kI32 || kind == kI64 || kind == kF32 || kind == kF64);
         __ PushConstant(kind, int32_t{0});
       }
     }
@@ -1616,8 +1618,7 @@ class LiftoffCompiler {
       if (call_targets.empty()) {
         call_targets = base::UniqueCopyOf(encountered_call_instructions_);
       } else {
-        DCHECK_EQ(call_targets.as_vector(),
-                  base::VectorOf(encountered_call_instructions_));
+        DCHECK_EQ(call_targets, base::VectorOf(encountered_call_instructions_));
       }
     }
 
@@ -3475,15 +3476,19 @@ class LiftoffCompiler {
   }
 
   void F32Const(FullDecoder* decoder, Value* result, float value) {
-    LiftoffRegister reg = __ GetUnusedRegister(kFpReg, {});
-    __ LoadConstant(reg, WasmValue(value));
-    __ PushRegister(kF32, reg);
+    __ PushConstant(kF32, base::bit_cast<int32_t>(value));
   }
 
   void F64Const(FullDecoder* decoder, Value* result, double value) {
-    LiftoffRegister reg = __ GetUnusedRegister(kFpReg, {});
-    __ LoadConstant(reg, WasmValue(value));
-    __ PushRegister(kF64, reg);
+    int64_t value_bits = base::bit_cast<int64_t>(value);
+    int32_t value_i32 = static_cast<int32_t>(value_bits);
+    if (value_i32 == value_bits) {
+      __ PushConstant(kF64, value_i32);
+    } else {
+      LiftoffRegister reg = __ GetUnusedRegister(kFpReg, {});
+      __ LoadConstant(reg, WasmValue(value));
+      __ PushRegister(kF64, reg);
+    }
   }
 
   void RefNull(FullDecoder* decoder, ValueType type, Value*) {
@@ -4685,12 +4690,12 @@ class LiftoffCompiler {
     if (!CheckSupportedType(decoder, kind, "store")) return;
 
     LiftoffRegList pinned;
-    // Where the architecture has an immediate store form, store an integer
-    // constant directly instead of materializing it in a register first. Only
-    // i32 and i64 values are ever constant in the cache state, and Liftoff
-    // keeps i64 constants as sign-extended 32-bit values.
+    // Where the architecture has an immediate store form, store an integer or
+    // float constant directly instead of materializing it in a register first.
+    // Liftoff keeps 64-bit constants as sign-extended 32-bit values.
     VarState value = __ PopVarState();
-    if (!LiftoffAssembler::kSupportsStoreConst || !value.is_const()) {
+    if (!LiftoffAssembler::kSupportsStoreConst || !value.is_const() ||
+        type.value() == StoreType::kF32StoreF16) {
       LiftoffRegister reg = pinned.set(__ LoadToRegister(value, pinned));
       value.MakeRegister(reg);
     }
@@ -4698,8 +4703,8 @@ class LiftoffCompiler {
     if (type.value() == StoreType::kF32StoreF16 &&
         !asm_.supports_f16_mem_access()) {
       type = StoreType::kI32Store16;
-      // {value} is always a float, so it is never a constant and cannot
-      // alias with {i16}.
+      // {value} was loaded into an FP register above, so it cannot alias with
+      // {i16}.
       DCHECK_EQ(kF32, kind);
       DCHECK(value.is_reg());
       LiftoffRegister i16 = pinned.set(__ GetUnusedRegister(kGpReg, {}));
@@ -5005,14 +5010,14 @@ class LiftoffCompiler {
     if (V8_LIKELY(!debug_sidetable_builder_)) return;
     debug_sidetable_builder_->NewEntry(
         __ pc_offset_for_safepoint(),
-        GetCurrentDebugSideTableEntries(decoder, assume_spilling).as_vector());
+        GetCurrentDebugSideTableEntries(decoder, assume_spilling).as_span());
   }
 
   DebugSideTableBuilder::EntryBuilder* RegisterOOLDebugSideTableEntry(
       FullDecoder* decoder, DebugSideTableBuilder::AssumeSpilling spilling) {
     if (V8_LIKELY(!debug_sidetable_builder_)) return nullptr;
     return debug_sidetable_builder_->NewOOLEntry(
-        GetCurrentDebugSideTableEntries(decoder, spilling).as_vector());
+        GetCurrentDebugSideTableEntries(decoder, spilling).as_span());
   }
 
   void CallDirect(FullDecoder* decoder, const CallFunctionImmediate& imm,
@@ -11360,7 +11365,7 @@ class LiftoffCompiler {
               WasmFrameConstants::kTrappingInstructionReturnAddressOffset,
           GetCurrentDebugSideTableEntries(
               decoder, DebugSideTableBuilder::kAllowRegisters)
-              .as_vector());
+              .as_span());
     }
   }
 

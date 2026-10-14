@@ -563,7 +563,7 @@ TNode<Code> AccessorAssembler::CastToCode(TNode<MaybeObject> code_candidate) {
   // TaggedMember<UnionOf<Smi,Code>> requires manual validation of the Code
   // object here.
   code = LoadCodePointerFromObject(
-      code, offsetof(ExposedTrustedObject, self_indirect_pointer_));
+      code, offsetof(ExposedTrustedObject, self_trusted_pointer_));
 #endif
   return code;
 }
@@ -2580,6 +2580,7 @@ void AccessorAssembler::HandleStoreFieldAndReturn(
             &do_store);
   {
     if (store_value_as_double) {
+      CSA_DCHECK(this, IsHeapNumber(property_storage));
       TNode<Float64T> current_value =
           LoadObjectField<Float64T>(property_storage, offset);
       GotoIfNotSameNumberBitPattern(current_value, *double_value, miss);

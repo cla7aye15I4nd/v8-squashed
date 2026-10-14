@@ -703,6 +703,7 @@ void DeclarationScope::HoistSloppyBlockFunctions(AstNodeFactory* factory) {
 
     if (!should_hoist) continue;
 
+    Variable* var;
     if (factory) {
       DCHECK(!is_being_lazily_parsed_);
       int pos = sloppy_block_function->position();
@@ -724,7 +725,7 @@ void DeclarationScope::HoistSloppyBlockFunctions(AstNodeFactory* factory) {
       // Redeclarations for vars do not create new bindings, but the
       // redeclarations' initializers are still run. That is, shadowed FiB will
       // result in multiple assignments to the same synthesized var.
-      Variable* var = DeclareVariable(
+      var = DeclareVariable(
           declaration, name, pos, VariableMode::kVar, NORMAL_VARIABLE,
           Variable::DefaultInitializationFlag(VariableMode::kVar), &was_added,
           nullptr, &ok);
@@ -740,10 +741,10 @@ void DeclarationScope::HoistSloppyBlockFunctions(AstNodeFactory* factory) {
     } else {
       DCHECK(is_being_lazily_parsed_);
       bool was_added;
-      Variable* var = DeclareVariableName(name, VariableMode::kVar, &was_added);
-      if (sloppy_block_function->init() == Token::kAssign) {
-        var->SetMaybeAssigned();
-      }
+      var = DeclareVariableName(name, VariableMode::kVar, &was_added);
+    }
+    if (sloppy_block_function->init() == Token::kAssign) {
+      var->SetMaybeAssigned();
     }
   }
 }
@@ -847,12 +848,15 @@ void DeclarationScope::DeclareArguments(AstValueFactory* ast_value_factory) {
   // According to https://tc39.es/ecma262/#sec-functiondeclarationinstantiation
   // step 18 we should set argumentsObjectNeeded to false if has lexical
   // declared arguments only when hasParameterExpressions is false
-  if (!was_added && IsLexicalVariableMode(arguments_->mode()) &&
-      has_simple_parameters()) {
-    // Check if there's lexically declared variable named arguments to avoid
-    // redeclaration. See
-    // https://tc39.es/ecma262/#sec-functiondeclarationinstantiation, step 20.
-    arguments_ = nullptr;
+  if (!was_added) {
+    if (IsLexicalVariableMode(arguments_->mode()) && has_simple_parameters()) {
+      // Check if there's lexically declared variable named arguments to avoid
+      // redeclaration. See
+      // https://tc39.es/ecma262/#sec-functiondeclarationinstantiation, step 20.
+      arguments_ = nullptr;
+    } else {
+      arguments_->SetMaybeAssigned();
+    }
   }
 }
 
@@ -1713,20 +1717,21 @@ void Scope::AnalyzePartially(DeclarationScope* max_outer_scope,
                              bool maybe_in_arrowhead) {
   this->ForEach([max_outer_scope, ast_node_factory, new_unresolved_list,
                  maybe_in_arrowhead](Scope* scope) {
-    // Skip already lazily parsed scopes. This can only happen to functions
-    // inside arrowheads.
-    if (WasLazilyParsed(scope)) {
-      DCHECK(max_outer_scope->is_arrow_scope());
-      return Iteration::kContinue;
-    }
+    // Functions inside arrowheads may have already been lazily parsed. Their
+    // unresolved variables were already resolved against their own scope, so
+    // continue resolving them from their outer scope.
+    bool was_lazily_parsed = WasLazilyParsed(scope);
+    DCHECK_IMPLIES(was_lazily_parsed, max_outer_scope->is_arrow_scope());
+    Scope* lookup_scope = was_lazily_parsed ? scope->outer_scope() : scope;
 
     for (VariableProxy* proxy = scope->unresolved_list_.first();
          proxy != nullptr; proxy = proxy->next_unresolved()) {
       if (proxy->is_removed_from_unresolved()) continue;
       DCHECK(!proxy->is_resolved());
       int access_position = proxy->position();
-      Variable* var = Lookup<kParsedScope>(
-          proxy, scope, max_outer_scope->outer_scope(), &access_position);
+      Variable* var = Lookup<kParsedScope>(proxy, lookup_scope,
+                                           max_outer_scope->outer_scope(),
+                                           &access_position);
       if (var == nullptr) {
         // Don't copy unresolved references to the script scope, unless it's a
         // reference to a private name or method. In that case keep it so we
@@ -1744,7 +1749,7 @@ void Scope::AnalyzePartially(DeclarationScope* max_outer_scope,
 
     // Clear unresolved_list_ as it's in an inconsistent state.
     scope->unresolved_list_.Clear();
-    return Iteration::kDescend;
+    return was_lazily_parsed ? Iteration::kContinue : Iteration::kDescend;
   });
 }
 
@@ -2435,11 +2440,20 @@ bool UpdateNeedsHoleCheck(Variable* var, VariableProxy* proxy, Scope* scope,
     // but the variable they shadow might need a hole check, which we want to do
     // if we decide that no shadowing variable was dynamically introduced.
     DCHECK_EQ(kCreatedInitialized, var->initialization_flag());
+    Variable* target = var->local_if_not_shadowed();
+    if (target->scope()->IsOuterScopeUpToClosureScopeOf(var->scope())) {
+      // When the shadowed variable is in the same closure scope as the
+      // kDynamicLocal variable (e.g., a non-simple parameter in FUNCTION_SCOPE
+      // shadowed by a kDynamicLocal in the body's VarBlock), HoleCheckState is
+      // not scope-independent because the kDynamicLocal variable can be shared
+      // across references in the body and references in inner closures.
+      return UpdateNeedsHoleCheck(target, proxy, scope, access_position);
+    }
     // The access_position passed to the recursive call is the closest access
     // position to the underlying variable (since it was updated during the
     // lookup traversal).
-    bool needs_check = UpdateNeedsHoleCheck(var->local_if_not_shadowed(), proxy,
-                                            scope, access_position);
+    bool needs_check =
+        UpdateNeedsHoleCheck(target, proxy, scope, access_position);
     if (needs_check) {
       var->set_hole_check_state(Variable::HoleCheckState::kForce);
     } else {

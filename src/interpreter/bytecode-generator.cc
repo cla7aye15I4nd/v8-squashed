@@ -6587,6 +6587,7 @@ void BytecodeGenerator::VisitPropertyLoad(Register obj, Property* property) {
     }
     case PRIVATE_GETTER_ONLY:
     case PRIVATE_GETTER_AND_SETTER: {
+      RegisterAllocationScope register_scope(this);
       Register key = VisitForRegisterValue(property->key());
       BuildPrivateBrandCheck(property, obj);
       BuildPrivateGetterAccess(obj, key);
@@ -6889,7 +6890,7 @@ void BytecodeGenerator::VisitProperty(Property* expr) {
 void BytecodeGenerator::VisitArguments(const ZonePtrList<Expression>* args,
                                        RegisterList* arg_regs) {
   // Visit arguments.
-  builder()->UpdateMaxArguments(static_cast<uint16_t>(args->length()));
+  builder()->UpdateMaxArguments(args->length());
   for (int i = 0; i < static_cast<int>(args->length()); i++) {
     VisitAndPushIntoRegisterList(args->at(i), arg_regs);
   }

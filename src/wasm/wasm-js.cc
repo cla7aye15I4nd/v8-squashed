@@ -943,8 +943,7 @@ void WebAssemblyValidateImpl(const v8::FunctionCallbackInfo<v8::Value>& info) {
   }
 
   bool validated = i::wasm::GetWasmEngine()->SyncValidate(
-      i_isolate, enabled_features, std::move(compile_imports),
-      bytes.as_vector());
+      i_isolate, enabled_features, std::move(compile_imports), bytes.as_span());
 
   return_value.Set(validated);
 }
@@ -2479,7 +2478,8 @@ V8_WARN_UNUSED_RESULT bool WasmObjectToJSReturnValue(
     thrower->TypeError("invalid type %s", unsafe_type.name().c_str());
     return false;
   }
-  return_value.Set(Utils::ToLocal(i::wasm::WasmToJSObject(isolate, value)));
+  return_value.Set(Utils::ToLocal(
+      i::wasm::WasmToJSObject(isolate, value, i::wasm::kUnshareStrings)));
   return true;
 }
 }  // namespace
