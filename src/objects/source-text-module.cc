@@ -987,8 +987,7 @@ SourceTextModule::TransitionAsyncToEvaluated(
 
 // https://tc39.es/ecma262/#sec-moduleevaluation
 MaybeDirectHandle<JSPromise> SourceTextModule::Evaluate(
-    Isolate* isolate,
-    Handle<InState<kLinked, kEvaluatingAsync, kEvaluated, kErrored>> module) {
+    Isolate* isolate, Handle<InState<kLinked>> module) {
   DCHECK(IsUndefined(module->top_level_capability()));
 
   // 5. Let stack be a new empty List.
@@ -1010,17 +1009,28 @@ MaybeDirectHandle<JSPromise> SourceTextModule::Evaluate(
   if (!InnerModuleEvaluation(isolate, module, &stack, &dfs_index)) {
     DirectHandle<Object> exception(isolate->exception(), isolate);
     // a. For each Cyclic Module Record m in stack, do
+    DirectHandle<InState<kErrored>> errored_module;
     for (DirectHandle<InState<kEvaluating>> m : stack) {
       //   i. Assert: m.[[Status]] is EVALUATING.
       //  ii. Set m.[[Status]] to EVALUATED.
       // iii. Set m.[[EvaluationError]] to result.
-      RecordError(isolate, m, exception);
+      const bool is_root = *m == *module;
+      DirectHandle<InState<kErrored>> errored =
+          RecordError(isolate, m, exception);
+      if (is_root) errored_module = errored;
     }
     // b. Assert: module.[[Status]] is EVALUATED.
-    CHECK_EQ(module->status(), kErrored);
+    CHECK(!errored_module.is_null());
 
+    // A termination exception cannot reject the capability: that would run
+    // embedder code (see Isolate::ReportPromiseReject). Drop the capability
+    // instead; Module::Evaluate materializes a rejected one for an errored
+    // module.
     if (isolate->is_execution_terminating()) {
-      CHECK_EQ(module->exception(), ReadOnlyRoots(isolate).null_value());
+      CHECK_EQ(errored_module->exception(),
+               ReadOnlyRoots(isolate).null_value());
+      errored_module->set_top_level_capability(
+          ReadOnlyRoots(isolate).undefined_value());
       return {};
     }
     CHECK(try_catch.HasCaught());
@@ -1105,46 +1115,43 @@ Maybe<bool> SourceTextModule::AsyncModuleExecutionFulfilled(
 
         // 12. For each Module m of sortedExecList, do
         for (Handle<SourceTextModule> m : exec_set) {
-          const bool ok = MatchState(
+          MatchState(
               m,
               [](DirectHandle<InState<kErrored>> errored_m) {
                 // a. If m.[[Status]] is EVALUATED, then
                 //   i. Assert: m.[[EvaluationError]] is not EMPTY.
                 DCHECK(!IsTheHole(errored_m->exception()));
-                return true;
               },
               [&](Handle<InState<kEvaluatingAsync>> evaluating_m) {
-                // b. Else if m.[[HasTLA]] is true, then
-                if (evaluating_m->has_toplevel_await()) {
-                  // i. Perform ExecuteAsyncModule(m).
-                  //
-                  // The execution may have been terminated and can not be
-                  // resumed, so just raise the exception.
-                  if (ExecuteAsyncModule(isolate, evaluating_m).IsNothing()) {
-                    return false;
-                  }
-                } else {  // c. Else,
-                  // i. Let result be m.ExecuteModule().
-                  MaybeDirectHandle<Object> exception;
-                  // ii. If result is an abrupt completion, then
-                  if (!ExecuteModule(isolate, evaluating_m, &exception)) {
-                    if (isolate->is_execution_terminating()) {
-                      return false;
+                if (!isolate->is_execution_terminating()) {
+                  // b. Else if m.[[HasTLA]] is true, then
+                  if (evaluating_m->has_toplevel_await()) {
+                    // i. Perform ExecuteAsyncModule(m).
+                    USE(ExecuteAsyncModule(isolate, evaluating_m));
+                  } else {  // c. Else,
+                    // i. Let result be m.ExecuteModule().
+                    MaybeDirectHandle<Object> exception;
+                    // ii. If result is an abrupt completion, then
+                    if (ExecuteModule(isolate, evaluating_m, &exception)) {
+                      // iii. Else, steps 12.c.iii.1-3.
+                      TransitionAsyncToEvaluated(isolate, evaluating_m);
+                    } else if (!isolate->is_execution_terminating()) {
+                      // 1. Perform AsyncModuleExecutionRejected(
+                      //        m, result.[[Value]]).
+                      AsyncModuleExecutionRejected(isolate, evaluating_m,
+                                                   exception.ToHandleChecked());
                     }
-                    // 1. Perform AsyncModuleExecutionRejected(m,
-                    //                                         result.[[Value]]).
-                    AsyncModuleExecutionRejected(isolate, evaluating_m,
-                                                 exception.ToHandleChecked());
-                  } else {  // iii. Else,
-                    // Steps 12.c.iii.1-3.
-                    TransitionAsyncToEvaluated(isolate, evaluating_m);
                   }
                 }
-                return true;
+                if (isolate->is_execution_terminating()) {
+                  AsyncModuleExecutionRejected(
+                      isolate, evaluating_m,
+                      isolate->factory()->termination_exception());
+                }
               });
-          if (!ok) return Nothing<bool>();
         }
 
+        if (isolate->is_execution_terminating()) return Nothing<bool>();
         // Return UNUSED.
         return Just(true);
       });
@@ -1182,12 +1189,17 @@ void SourceTextModule::AsyncModuleExecutionRejected(
           // a. Assert: module.[[CycleRoot]] and module are the same Module
           //    Record.
           DCHECK_EQ(errored_module->cycle_root(), *errored_module);
-          // b. Perform ! Call(module.[[TopLevelCapability]].[[Reject]],
-          //                   undefined, «error»).
-          DCHECK(isolate->is_catchable_by_javascript(*exception));
-          DirectHandle<JSPromise> capability(
-              Cast<JSPromise>(errored_module->top_level_capability()), isolate);
-          JSPromise::Reject(capability, exception);
+          if (isolate->is_catchable_by_javascript(*exception)) {
+            // b. Perform ! Call(module.[[TopLevelCapability]].[[Reject]],
+            //                   undefined, «error»).
+            DirectHandle<JSPromise> capability(
+                Cast<JSPromise>(errored_module->top_level_capability()),
+                isolate);
+            JSPromise::Reject(capability, exception);
+          } else {
+            errored_module->set_top_level_capability(
+                ReadOnlyRoots(isolate).undefined_value());
+          }
         }
 
         // 9. For each Cyclic Module Record m of module.[[AsyncParentModules]],
@@ -1680,7 +1692,7 @@ SourceTextModule::GetStalledTopLevelAwaitMessages(Isolate* isolate) {
           DirectHandle<JSMessageObject> message =
               MessageHandler::MakeMessageObject(
                   isolate, MessageTemplate::kTopLevelAwaitStalled, &location,
-                  isolate->factory()->null_value());
+                  {});
           messages.push_back(message);
         });
   }

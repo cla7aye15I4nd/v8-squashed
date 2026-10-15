@@ -708,7 +708,8 @@ void Map::MapVerify(Isolate* isolate) {
   }
 
 #if V8_ENABLE_WEBASSEMBLY
-  bool is_wasm_struct = InstanceTypeChecker::IsWasmStruct(instance_type());
+  bool is_wasm_struct = InstanceTypeChecker::IsWasmStruct(instance_type()) ||
+                        InstanceTypeChecker::IsWasmCustomMap(instance_type());
 #else
   constexpr bool is_wasm_struct = false;
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -1987,7 +1988,7 @@ void ExposedTrustedObject::ExposedTrustedObjectVerify(Isolate* isolate) {
   }
   // We can't use ReadTrustedPointerField here because the tag is not a
   // compile-time constant.
-  IndirectPointerSlot slot = RawIndirectPointerField(
+  TrustedPointerSlot slot = RawTrustedPointerField(
       offsetof(ExposedTrustedObject, self_trusted_pointer_), tag);
   Tagged<Object> self = slot.load(isolate);
   CHECK_EQ(self, this);
@@ -3553,6 +3554,8 @@ void WasmStruct::WasmStructVerify(Isolate* isolate) {
 
 void WasmCustomMap::WasmCustomMapVerify(Isolate* isolate) {
   CHECK(Is<WasmCustomMap>(this));
+  Object::VerifyPointer(isolate, js_wrapper());
+  Object::VerifyPointer(isolate, native_context_for_wrapper());
   MapVerify(isolate);
 }
 

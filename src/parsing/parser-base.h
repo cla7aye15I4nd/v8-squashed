@@ -727,6 +727,7 @@ class ParserBase {
           return true;
         case Token::kMul:
         case Token::kSemicolon:
+        case Token::kEos:
           kind = ParsePropertyKind::kClassField;
           return true;
         default:
@@ -1335,7 +1336,8 @@ class ParserBase {
   // become destructuring identifiers.
   V8_INLINE IdentifierT ParsePropertyName();
 
-  ExpressionT ParsePropertyOrPrivatePropertyName();
+  ExpressionT ParsePropertyOrPrivatePropertyName(
+      bool is_property_access = true);
 
   const AstRawString* GetNextSymbolForRegExpLiteral() const {
     return scanner()->NextSymbol(ast_value_factory());
@@ -2015,11 +2017,14 @@ bool ParserBase<Impl>::IsExtraordinaryPrivateNameAccessAllowed() const {
 
 template <typename Impl>
 typename ParserBase<Impl>::ExpressionT
-ParserBase<Impl>::ParsePropertyOrPrivatePropertyName() {
+ParserBase<Impl>::ParsePropertyOrPrivatePropertyName(bool is_property_access) {
   int pos = position();
   IdentifierT name;
   ExpressionT key;
   Token::Value next = Next();
+  if (!is_property_access) {
+    pos = position();
+  }
   if (V8_LIKELY(Token::IsPropertyName(next))) {
     name = impl()->GetSymbol();
     key = factory()->NewStringLiteral(name, pos);
@@ -2049,7 +2054,9 @@ ParserBase<Impl>::ParsePropertyOrPrivatePropertyName() {
     ReportUnexpectedToken(next);
     return impl()->FailureExpression();
   }
-  impl()->PushLiteralName(name);
+  if (is_property_access) {
+    impl()->PushLiteralName(name);
+  }
   return key;
 }
 
@@ -2682,8 +2689,7 @@ bool ParserBase<Impl>::ParseCurrentSymbolAsClassFieldOrMethod(
     *name_expression = factory()->NewStringLiteral(prop_info->name, position());
     return true;
   }
-  if (peek() == Token::kAssign || peek() == Token::kSemicolon ||
-      peek() == Token::kRightBrace) {
+  if (peek() == Token::kAssign || Token::IsAutoSemicolon(peek())) {
     prop_info->name = impl()->GetIdentifier();
     *name_expression = factory()->NewStringLiteral(prop_info->name, position());
     return true;
@@ -3732,7 +3738,7 @@ typename ParserBase<Impl>::ExpressionT ParserBase<Impl>::ParseBinaryExpression(
   // "#foo in ShiftExpression" needs to be parsed separately, since private
   // identifiers are not valid PrimaryExpressions.
   if (V8_UNLIKELY(peek() == Token::kPrivateName)) {
-    ExpressionT x = ParsePropertyOrPrivatePropertyName();
+    ExpressionT x = ParsePropertyOrPrivatePropertyName(false);
     int prec1 = Token::Precedence(peek(), accept_IN_);
     if (peek() != Token::kIn || prec1 < prec) {
       ReportUnexpectedToken(Token::kPrivateName);
@@ -3924,20 +3930,28 @@ ParserBase<Impl>::ParseLeftHandSideContinuation(ExpressionT result) {
                   !scanner()->literal_contains_escapes())) {
     DCHECK(impl()->IsAsync(impl()->AsIdentifier(result)));
     int pos = position();
-
-    ArrowHeadParsingScope maybe_arrow(impl(), FunctionKind::kAsyncArrowFunction,
-                                      PeekNextInfoId());
-    Scope::Snapshot scope_snapshot(scope());
-
     ExpressionListT args(pointer_buffer());
     bool has_spread;
-    ParseArguments(&args, &has_spread, kMaybeArrowHead);
+    {
+      ArrowHeadParsingScope maybe_arrow(
+          impl(), FunctionKind::kAsyncArrowFunction, PeekNextInfoId());
+      Scope::Snapshot scope_snapshot(scope());
+
+      ParseArguments(&args, &has_spread, kMaybeArrowHead);
+      if (V8_LIKELY(peek() == Token::kArrow)) {
+        fni_.RemoveAsyncKeywordFromEnd();
+        next_arrow_function_info_.scope = maybe_arrow.ValidateAndCreateScope();
+        next_arrow_function_info_.function_literal_id =
+            maybe_arrow.function_literal_id();
+        scope_snapshot.Reparent(next_arrow_function_info_.scope);
+      } else {
+        result = factory()->NewCall(result, args, pos, has_spread);
+        maybe_arrow.ValidateExpression();
+        fni_.RemoveLastFunction();
+      }
+    }
     if (V8_LIKELY(peek() == Token::kArrow)) {
-      fni_.RemoveAsyncKeywordFromEnd();
-      next_arrow_function_info_.scope = maybe_arrow.ValidateAndCreateScope();
-      next_arrow_function_info_.function_literal_id =
-          maybe_arrow.function_literal_id();
-      scope_snapshot.Reparent(next_arrow_function_info_.scope);
+      expression_scope()->RemoveAsyncKeyword();
       // async () => ...
       if (!args.length()) return factory()->NewEmptyParentheses(pos);
       // async ( Arguments ) => ...
@@ -3945,12 +3959,6 @@ ParserBase<Impl>::ParseLeftHandSideContinuation(ExpressionT result) {
       result->mark_parenthesized();
       return result;
     }
-
-    result = factory()->NewCall(result, args, pos, has_spread);
-
-    maybe_arrow.ValidateExpression();
-
-    fni_.RemoveLastFunction();
     if (!Token::IsPropertyOrCall(peek())) return result;
   }
 
@@ -4233,7 +4241,7 @@ ParserBase<Impl>::ParseImportExpressions() {
     } else {
       ExpectContextualKeyword(ast_value_factory()->meta_string(), "import.meta",
                               pos);
-      if (!flags().is_module() && !IsParsingWhileDebugging()) {
+      if (!has_module_in_scope_chain() && !IsParsingWhileDebugging()) {
         impl()->ReportMessageAt(scanner()->location(),
                                 MessageTemplate::kImportMetaOutsideModule);
         return impl()->FailureExpression();
@@ -5616,17 +5624,14 @@ ParserBase<Impl>::RewriteInvalidReferenceExpression(ExpressionT expression,
     return impl()->FailureExpression();
   }
   if (expression->IsCall() && !expression->AsCall()->is_tagged_template() &&
-      !early_error) {
+      !early_error && is_sloppy(language_mode())) {
     expression_scope()->RecordPatternError(
         Scanner::Location(beg_pos, end_pos),
         MessageTemplate::kInvalidDestructuringTarget);
     // If it is a call, make it a runtime error for legacy web compatibility.
     // Bug: https://bugs.chromium.org/p/v8/issues/detail?id=4480
     // Rewrite `expr' to `expr[throw ReferenceError]'.
-    impl()->CountUsage(
-        is_strict(language_mode())
-            ? v8::Isolate::kAssigmentExpressionLHSIsCallInStrict
-            : v8::Isolate::kAssigmentExpressionLHSIsCallInSloppy);
+    impl()->CountUsage(v8::Isolate::kAssigmentExpressionLHSIsCallInSloppy);
     ExpressionT error = impl()->NewThrowReferenceError(message, beg_pos);
     return factory()->NewProperty(expression, error, beg_pos);
   }

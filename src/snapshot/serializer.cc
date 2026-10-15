@@ -487,13 +487,11 @@ void Serializer::ObjectSerializer::SerializePrologue(SnapshotSpace space,
     if (map == ReadOnlyRoots(isolate()).meta_map()) {
       DCHECK_EQ(space, SnapshotSpace::kReadOnlyHeap);
       sink_->Put(kNewContextlessMetaMap, "NewContextlessMetaMap");
-      sink_->PutUint30(size >> kObjectAlignmentBits, "ObjectSizeInWords");
       sink_->PutUint30(map->instance_type(), "MetaMapInstanceType");
     } else {
       DCHECK_EQ(space, SnapshotSpace::kOld);
       DCHECK(IsContext(map->native_context_or_null()));
       sink_->Put(kNewContextfulMetaMap, "NewContextfulMetaMap");
-      sink_->PutUint30(size >> kObjectAlignmentBits, "ObjectSizeInWords");
       sink_->PutUint30(map->instance_type(), "MetaMapInstanceType");
 
       // Defer serialization of the native context in order to break
@@ -519,9 +517,6 @@ void Serializer::ObjectSerializer::SerializePrologue(SnapshotSpace space,
   } else {
     sink_->Put(NewObject::Encode(space), "NewObject");
 
-    // TODO(leszeks): Skip this when the map has a fixed size.
-    sink_->PutUint30(size >> kObjectAlignmentBits, "ObjectSizeInWords");
-
     // Until the space for the object is allocated, it is considered "pending".
     serializer_->RegisterObjectIsPending(*object_);
 
@@ -531,6 +526,13 @@ void Serializer::ObjectSerializer::SerializePrologue(SnapshotSpace space,
     // deferred.
     DCHECK(IsMap(map));
     serializer_->SerializeObject(handle(map, isolate()), SlotType::kMapSlot);
+    // Only omit the object size for fixed-size maps in ReadOnlySpace. Mutable
+    // maps live inside the sandbox and could be concurrently corrupted during
+    // deserialization, changing their instance size.
+    if (!HeapLayout::InReadOnlySpace(map) ||
+        map->instance_size_in_words() == kVariableSizeSentinel) {
+      sink_->PutUint30(size >> kObjectAlignmentBits, "ObjectSizeInWords");
+    }
     if (IsExtendedMap(*object_)) {
       // Extended maps store their actual size in bit_field_ex_, write it
       // upfront to make sure the ExtendedMap size can be fully initialized,
@@ -1277,9 +1279,8 @@ void Serializer::ObjectSerializer::VisitExternalPointer(
   }
 }
 
-void Serializer::ObjectSerializer::VisitIndirectPointer(
-    Tagged<HeapObject> host, IndirectPointerSlot slot,
-    TrustedPointerMode mode) {
+void Serializer::ObjectSerializer::VisitTrustedPointer(
+    Tagged<HeapObject> host, TrustedPointerSlot slot, TrustedPointerMode mode) {
 #ifdef V8_ENABLE_SANDBOX
   // If the slot is empty (i.e. contains a null handle), then we can just skip
   // it since in that case the correct action is to encode the null handle as
@@ -1299,7 +1300,7 @@ void Serializer::ObjectSerializer::VisitIndirectPointer(
   // Currently we cannot see pending objects here, but we may need to support
   // them in the future. They should already be supported by the deserializer.
   CHECK(!serializer_->SerializePendingObject(*slot_value));
-  sink_->Put(kTrustedPointerPrefix, "IndirectPointer");
+  sink_->Put(kTrustedPointerPrefix, "TrustedPointer");
   serializer_->SerializeObject(slot_value, SlotType::kAnySlot);
 #else
   UNREACHABLE();
@@ -1307,7 +1308,7 @@ void Serializer::ObjectSerializer::VisitIndirectPointer(
 }
 
 void Serializer::ObjectSerializer::VisitTrustedPointerTableEntry(
-    Tagged<HeapObject> host, IndirectPointerSlot slot) {
+    Tagged<HeapObject> host, TrustedPointerSlot slot) {
 #ifdef V8_ENABLE_SANDBOX
   // These fields only exist on the ExposedTrustedObject class, and they are
   // located directly after the Map word.
@@ -1552,11 +1553,11 @@ DirectHandle<FixedArray> ObjectCacheIndexMap::Values(Isolate* isolate) {
 
 bool Serializer::SerializeReadOnlyObjectReference(Tagged<HeapObject> obj,
                                                   SnapshotByteSink* sink) {
-  if (!ReadOnlyHeap::Contains(obj)) return false;
+  if (!HeapLayout::InReadOnlySpace(obj)) return false;
 
   // For objects on the read-only heap, never serialize the object, but instead
   // create a back reference that encodes the page number as the chunk_index and
-  // the offset within the page as the chunk_offset.
+  // the aligned offset within the page.
   Address address = obj.address();
   BasePage* chunk = BasePage::FromAddress(isolate(), address);
   uint32_t chunk_index = 0;
@@ -1567,9 +1568,12 @@ bool Serializer::SerializeReadOnlyObjectReference(Tagged<HeapObject> obj,
     ++chunk_index;
   }
   uint32_t chunk_offset = static_cast<uint32_t>(chunk->Offset(address));
+  DCHECK(IsAligned(chunk_offset, kObjectAlignment));
+  DCHECK_LT(chunk_offset, kRegularPageSize);
+  uint32_t encoded = (chunk_index << kReadOnlyHeapRefOffsetBits) |
+                     (chunk_offset >> kObjectAlignmentBits);
   sink->Put(kReadOnlyHeapRef, "ReadOnlyHeapRef");
-  sink->PutUint30(chunk_index, "ReadOnlyHeapRefChunkIndex");
-  sink->PutUint30(chunk_offset, "ReadOnlyHeapRefChunkOffset");
+  sink->PutUint30(encoded, "ReadOnlyHeapRef");
   return true;
 }
 

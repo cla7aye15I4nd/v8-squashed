@@ -390,6 +390,8 @@ MaybeDirectHandle<Object> IterableForEach(
 
   // Medium fast path for JSArrayIterator.
   if (IsJSArrayIterator(*iterator) &&
+      iterator->map()->prototype() ==
+          isolate->native_context()->initial_array_iterator_prototype() &&
       Protectors::IsArrayIteratorLookupChainIntact(isolate) &&
       Protectors::IsNoElementsIntact(isolate)) {
     DirectHandle<JSArrayIterator> array_iterator =
@@ -413,9 +415,6 @@ MaybeDirectHandle<Object> IterableForEach(
               Object::ToUint32(array_iterator->next_index(), &current_index)) {
             DCHECK_IMPLIES(max_count, len < *max_count);
             if (max_count_out) *max_count_out = len;
-            if (len == 0) {
-              return isolate->root_handle(RootIndex::kUndefinedValue);
-            }
             DirectHandle<Object> obj_handle(Smi::zero(), isolate);
             {
               std::optional<DisallowJavascriptExecution> no_js;
@@ -535,8 +534,10 @@ MaybeDirectHandle<Object> IterableForEach(
     }
   }
 
-  // Medium fast path for JSSetIterator.
-  if (!kAllowJSExecution && IsJSSetIterator(*iterator) &&
+  // Medium fast path for JSSetValueIterator.
+  if (!kAllowJSExecution && IsJSSetValueIterator(*iterator) &&
+      iterator->map()->prototype() ==
+          isolate->native_context()->initial_set_iterator_prototype() &&
       Protectors::IsSetIteratorLookupChainIntact(isolate)) {
     DirectHandle<JSSetIterator> set_iterator = Cast<JSSetIterator>(iterator);
     DirectHandle<Object> table_obj(set_iterator->table(), isolate);

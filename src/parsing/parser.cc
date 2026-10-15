@@ -210,11 +210,13 @@ void Parser::ReportUnexpectedTokenAt(Scanner::Location location,
     case Token::kStatic:
     case Token::kYield:
     case Token::kFutureStrictReservedWord:
-      message = is_strict(language_mode())
-                    ? MessageTemplate::kUnexpectedStrictReserved
-                    : MessageTemplate::kUnexpectedTokenIdentifier;
-      arg = Token::String(token);
-      break;
+      if (is_strict(language_mode())) {
+        message = MessageTemplate::kUnexpectedStrictReserved;
+        break;
+      }
+      ReportMessageAt(location, MessageTemplate::kUnexpectedTokenIdentifier,
+                      GetIdentifier());
+      return;
     case Token::kTemplateSpan:
     case Token::kTemplateTail:
       message = MessageTemplate::kUnexpectedTemplateString;
@@ -455,11 +457,9 @@ Expression* Parser::BuildUnaryExpression(Expression* expression,
 }
 
 Expression* Parser::NewThrowError(Runtime::FunctionId id,
-                                  MessageTemplate message,
-                                  const AstRawString* arg, int pos) {
+                                  MessageTemplate message, int pos) {
   ScopedPtrList<Expression> args(pointer_buffer());
   args.Add(factory()->NewSmiLiteral(static_cast<int>(message), pos));
-  args.Add(factory()->NewStringLiteral(arg, pos));
   CallRuntime* call_constructor = factory()->NewCallRuntime(id, args, pos);
   return factory()->NewThrow(call_constructor, pos);
 }
@@ -746,12 +746,20 @@ void Parser::ParseProgram(Isolate* isolate, DirectHandle<Script> script,
   }
 
   scanner_.Initialize();
+  std::optional<ClassScope::HeritageParsingScope> heritage;
+  if (V8_UNLIKELY(flags().private_name_lookup_skips_outer_class() &&
+                  original_scope_->is_class_scope())) {
+    heritage.emplace(original_scope_->AsClassScope());
+  }
   FunctionLiteral* result =
       DoParseProgram(isolate, info, script->eval_from_position());
   if (flags().allow_heap_allocation()) {
     HandleDebugMagicComments(isolate, script);
   }
   if (result == nullptr) return;
+  if (V8_UNLIKELY(flags().private_name_lookup_skips_outer_class())) {
+    result->scope()->RecordNeedsPrivateNameContextChainRecalc();
+  }
   result->scope()->set_is_hoisted_in_context(
       info->flags().is_hoisted_in_context());
   if (flags().allow_heap_allocation()) {
@@ -1211,7 +1219,7 @@ FunctionLiteral* Parser::DoParseFunction(Isolate* isolate, ParseInfo* info,
         // Parsing patterns as variable reference expression creates
         // NewUnresolved references in current scope. Enter arrow function
         // scope for formal parameter parsing.
-        BlockState inner_block_state(&scope_, scope);
+        FunctionState inner_function_state(&function_state_, &scope_, scope);
         if (Check(Token::kLeftParen)) {
           // '(' StrictFormalParameters ')'
           ParseFormalParameterList(&formals);
@@ -1297,7 +1305,8 @@ FunctionLiteral* Parser::ParseClassForMemberInitialization(
 
   // We preparse the class members that are not fields with initializers
   // in order to collect the function literal ids.
-  ScopedModification<Mode> mode_scope(&mode_, PARSE_LAZILY);
+  ScopedModification<Mode> mode_scope(
+      &mode_, allow_lazy_ ? PARSE_LAZILY : PARSE_EAGERLY);
 
   ExpressionParsingScope no_expression_scope(impl());
 

@@ -8279,7 +8279,11 @@ void CodeStubAssembler::ThrowIfNotJSReceiver(TNode<Context> context,
 
   // The {value} is not a compatible receiver for this method.
   BIND(&throw_exception);
-  ThrowTypeError(context, msg_template, StringConstant(method_name), value);
+  if (method_name == nullptr || strlen(method_name) == 0) {
+    ThrowTypeError(context, msg_template);
+  } else {
+    ThrowTypeError(context, msg_template, StringConstant(method_name), value);
+  }
 
   BIND(&done);
 }
@@ -20673,7 +20677,7 @@ void CodeStubAssembler::PrintErr(const char* s) {
 
 void CodeStubAssembler::PrintToStream(const char* s, int stream) {
   std::string formatted(s);
-  formatted += "\n";
+  formatted += '\n';
   CallRuntime(Runtime::kGlobalPrint, NoContextConstant(),
               StringConstant(formatted.c_str()), SmiConstant(stream));
 }

@@ -189,8 +189,10 @@ DirectHandle<String> MessageHandler::GetMessage(Isolate* isolate,
                                                 DirectHandle<Object> data) {
   DirectHandle<JSMessageObject> message = Cast<JSMessageObject>(data);
   DirectHandle<Object> arg{message->argument(), isolate};
-  return MessageFormatter::Format(isolate, message->type(),
-                                  base::VectorOf({arg}));
+  return MessageFormatter::Format(
+      isolate, message->type(),
+      IsTheHole(*arg) ? base::Vector<const DirectHandle<Object>>{}
+                      : base::VectorOf({arg}));
 }
 
 std::unique_ptr<char[]> MessageHandler::GetLocalizedMessage(
@@ -454,34 +456,16 @@ MaybeHandle<String> MessageFormatter::TryFormat(
   // TODO(14386): Get this list empty.
   static constexpr MessageTemplate kTemplatesWithMismatchedArguments[] = {
       MessageTemplate::kConstAssign,
-      MessageTemplate::kConstructorNotReceiver,
-      MessageTemplate::kDataCloneErrorDetachedArrayBuffer,
-      MessageTemplate::kDataCloneErrorOutOfMemory,
       MessageTemplate::kIncompatibleMethodReceiver,
       MessageTemplate::kInvalidArgument,
       MessageTemplate::kInvalidArrayLength,
-      MessageTemplate::kInvalidAtomicAccessIndex,
       MessageTemplate::kInvalidDataViewLength,
-      MessageTemplate::kInvalidIndex,
-      MessageTemplate::kInvalidLhsInAssignment,
-      MessageTemplate::kInvalidLhsInFor,
-      MessageTemplate::kInvalidLhsInPostfixOp,
-      MessageTemplate::kInvalidLhsInPrefixOp,
       MessageTemplate::kInvalidPrivateBrandReinitialization,
       MessageTemplate::kInvalidPrivateFieldReinitialization,
       MessageTemplate::kInvalidPrivateMemberWrite,
-      MessageTemplate::kInvalidRegExpExecResult,
-      MessageTemplate::kInvalidTimeValue,
       MessageTemplate::kInvalidWeakMapKey,
       MessageTemplate::kInvalidWeakSetValue,
       MessageTemplate::kIteratorReduceNoInitial,
-      MessageTemplate::kJsonParseShortString,
-      MessageTemplate::kJsonParseUnexpectedEOS,
-      MessageTemplate::kJsonParseUnexpectedTokenEndStringWithContext,
-      MessageTemplate::kJsonParseUnexpectedTokenShortString,
-      MessageTemplate::kJsonParseUnexpectedTokenStartStringWithContext,
-      MessageTemplate::kJsonParseUnexpectedTokenSurroundStringWithContext,
-      MessageTemplate::kMustBePositive,
       MessageTemplate::kNotIterable,
       MessageTemplate::kNotTypedArray,
       MessageTemplate::kProxyNonObject,
@@ -490,12 +474,7 @@ MaybeHandle<String> MessageFormatter::TryFormat(
       MessageTemplate::kProxyTrapReturnedFalsishFor,
       MessageTemplate::kReduceNoInitial,
       MessageTemplate::kSpreadIteratorSymbolNonCallable,
-      MessageTemplate::kSymbolIteratorInvalid,
-      MessageTemplate::kTopLevelAwaitStalled,
-      MessageTemplate::kUndefinedOrNullToObject,
-      MessageTemplate::kUnexpectedStrictReserved,
-      MessageTemplate::kUnexpectedTokenIdentifier,
-      MessageTemplate::kWeakRefsCleanupMustBeCallable};
+      MessageTemplate::kUndefinedOrNullToObject};
 
   base::Vector<const DirectHandle<String>> remaining_args = args;
   for (const char* c = template_string; *c != '\0'; c++) {

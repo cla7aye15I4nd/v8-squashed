@@ -4503,14 +4503,6 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildStoreField(
   }
 
   if (field_representation.IsDouble()) {
-    if (access_info.IsFastDataConstant()) {
-      // Force conversion to Float64 to ensure we can check for hole NaN.
-      GET_VALUE_OR_ABORT(value, GetFloat64(value));
-      if (value->MayBeHoleOrUndefinedNan()) {
-        GET_VALUE_OR_ABORT(value,
-                           AddNewNode<Float64ToSilencedFloat64>({value}));
-      }
-    }
     if (access_info.HasTransitionMap()) {
       // Allocate the mutable double box owned by the field.
       ValueNode* heapnumber_value;
@@ -6476,10 +6468,11 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildProxyPropertyAccess(
         },
         [&]() -> ReduceResult { return result; },
         [&]() -> ReduceResult {
-          RETURN_IF_ABORT(BuildCallRuntime(Runtime::kCheckProxyGetSetTrapResult,
-                                           {argument_name, proxy_target, result,
-                                            GetSmiConstant(JSProxy::kGet)}));
-          return result;
+          // Return the runtime call's result (which forwards `result`) so that
+          // a lazy deopt during the check does not overwrite the load result.
+          return BuildCallRuntime(Runtime::kCheckProxyGetSetTrapResult,
+                                  {argument_name, proxy_target, result,
+                                   GetSmiConstant(JSProxy::kGet)});
         });
   }
 
@@ -7629,6 +7622,7 @@ ReduceResult MaglevGraphBuilder::BuildInlineFunction(
 
 bool MaglevGraphBuilder::IsFunctionCandidateForEagerInlining(
     compiler::SharedFunctionInfoRef shared, CallArguments& args) {
+  if (V8_UNLIKELY(shared.is_eager_inlining_disabled(broker()))) return false;
   compiler::BytecodeArrayRef bytecode = shared.GetBytecodeArray(broker());
   if (bytecode.length() < flags_.max_eager_inlined_bytecode) {
     TRACE_INLINING(TraceInlineEager(shared)
@@ -7752,6 +7746,10 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildInlineCall(
   }
 
   if (!flags_.is_non_eager_inlining_enabled) {
+    if (V8_UNLIKELY(shared.is_eager_inlining_disabled(broker()))) {
+      TRACE_CANNOT_INLINE("eager inlining is disabled");
+      return {};
+    }
     if (graph()->total_inlined_bytecode_size() >=
         flags_.max_inlined_bytecode_size_cumulative) {
       compilation_unit_->info()->set_could_not_inline_all_candidates();

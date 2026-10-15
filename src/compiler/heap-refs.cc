@@ -23,6 +23,7 @@
 #endif
 
 #include "src/api/api-inl.h"
+#include "src/codegen/pending-optimization-table.h"
 #include "src/common/assert-scope.h"
 #include "src/compiler/compilation-dependencies.h"
 #include "src/compiler/js-heap-broker-inl.h"
@@ -657,8 +658,8 @@ class MapData : public HeapObjectData {
 
   InstanceType instance_type() const { return instance_type_; }
   int instance_size() const { return instance_size_; }
-  uint32_t bit_field2() const { return bit_field2_; }
-  uint32_t bit_field3() const { return bit_field3_; }
+  Map::Bits2 bit_field2() const { return bit_field2_; }
+  Map::Bits3 bit_field3() const { return bit_field3_; }
   int in_object_properties() const {
     CHECK(InstanceTypeChecker::IsJSObject(instance_type()));
     return in_object_properties_;
@@ -675,8 +676,8 @@ class MapData : public HeapObjectData {
 
   InstanceType instance_type_;
   int instance_size_;
-  uint32_t bit_field2_;
-  uint32_t bit_field3_;
+  Map::Bits2 bit_field2_;
+  Map::Bits3 bit_field3_;
   int unused_property_fields_;
   bool is_abandoned_prototype_map_;
   int in_object_properties_;
@@ -1964,6 +1965,13 @@ bool SharedFunctionInfoRef::is_toplevel() const {
 BROKER_SFI_FIELDS(DEF_SFI_ACCESSOR)
 #undef DEF_SFI_ACCESSOR
 
+bool SharedFunctionInfoRef::is_eager_inlining_disabled(
+    JSHeapBroker* broker) const {
+  if (!v8_flags.allow_natives_syntax) return false;
+  return ManualOptimizationTable::IsMarkedForDisabledEagerInlining(
+      broker->local_isolate_or_isolate(), *object());
+}
+
 bool SharedFunctionInfoRef::HasBreakInfo(JSHeapBroker* broker) const {
   if (broker->IsMainThread()) {
     return object()->HasBreakInfo(broker->isolate());
@@ -2102,7 +2110,7 @@ int MapRef::constructor_function_index() const {
 
 bool MapRef::is_stable() const {
   IF_ACCESS_FROM_HEAP_C(is_stable);
-  return !Map::Bits3::IsUnstableBit::decode(data()->AsMap()->bit_field3());
+  return !data()->AsMap()->bit_field3().is_unstable();
 }
 
 bool MapRef::CanBeDeprecated() const { return object()->CanBeDeprecated(); }

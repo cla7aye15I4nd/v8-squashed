@@ -118,9 +118,11 @@ Scope::Scope(Zone* zone, Scope* outer_scope, ScopeType scope_type)
   DCHECK(!is_script_scope());
   SetDefaults();
   set_language_mode(outer_scope->language_mode());
-  set_private_name_lookup_skips_outer_class(
-      outer_scope->is_class_scope() &&
-      outer_scope->AsClassScope()->IsParsingHeritage());
+  if (outer_scope->is_class_scope() &&
+      outer_scope->AsClassScope()->IsParsingHeritage()) {
+    set_private_name_lookup_skips_outer_class(true);
+    outer_scope->GetClosureScope()->RecordNeedsPrivateNameContextChainRecalc();
+  }
   outer_scope_->AddInnerScope(this);
 }
 
@@ -180,6 +182,9 @@ DeclarationScope::DeclarationScope(Zone* zone, Scope* outer_scope,
       params_(4, zone) {
   DCHECK(!is_script_scope());
   SetDefaults();
+  if (V8_UNLIKELY(private_name_lookup_skips_outer_class())) {
+    RecordNeedsPrivateNameContextChainRecalc();
+  }
 }
 
 ModuleScope::ModuleScope(DeclarationScope* script_scope,
@@ -305,18 +310,14 @@ DeclarationScope::DeclarationScope(Zone* zone, ScopeType scope_type,
     DCHECK(IsClassConstructor(function_kind()));
     set_class_scope_has_private_brand(true);
   }
+  if (V8_UNLIKELY(private_name_lookup_skips_outer_class())) {
+    RecordNeedsPrivateNameContextChainRecalc();
+  }
 }
 
 Scope::Scope(Zone* zone, const AstRawString* catch_variable_name,
              MaybeAssignedFlag maybe_assigned, Handle<ScopeInfo> scope_info)
-    : outer_scope_(nullptr),
-      variables_(zone),
-      scope_info_(scope_info),
-      scope_type_(CATCH_SCOPE) {
-  SetDefaults();
-#ifdef DEBUG
-  already_resolved_ = true;
-#endif
+    : Scope(zone, CATCH_SCOPE, nullptr, scope_info) {
   // Cache the catch variable, even though it's also available via the
   // scope_info, as the parser expects that a catch scope always has the catch
   // variable as first and only variable.
@@ -326,7 +327,6 @@ Scope::Scope(Zone* zone, const AstRawString* catch_variable_name,
               kCreatedInitialized, maybe_assigned, &was_added);
   DCHECK(was_added);
   AllocateHeapSlot(variable);
-  set_is_hoisted_in_context(scope_info->is_hoisted_in_context());
 }
 
 void DeclarationScope::SetDefaults() {
@@ -427,6 +427,7 @@ Scope* Scope::DeserializeScopeChain(
   Scope* current_scope = nullptr;
   Scope* innermost_scope = nullptr;
   Scope* outer_scope = nullptr;
+  bool has_debug_evaluate_scope = false;
 
   while (!scope_info.is_null()) {
     if (scope_info == eval_outer_info) {
@@ -454,6 +455,14 @@ Scope* Scope::DeserializeScopeChain(
       eval_scope->set_start_position(position);
       eval_scope->set_end_position(position);
       eval_scope->set_eval_position(position);
+      Tagged<MaybeObject> maybe_sfi =
+          script->infos()->get(kFunctionLiteralIdTopLevel);
+      Tagged<HeapObject> sfi;
+      if (maybe_sfi.GetHeapObjectIfWeak(&sfi)) {
+        eval_scope->set_private_name_lookup_skips_outer_class(
+            Cast<SharedFunctionInfo>(sfi)
+                ->private_name_lookup_skips_outer_class());
+      }
 
       if (current_scope != nullptr) {
         eval_scope->AddInnerScope(current_scope);
@@ -525,6 +534,7 @@ Scope* Scope::DeserializeScopeChain(
             zone->New<DeclarationScope>(zone, FUNCTION_SCOPE, ast_value_factory,
                                         handle(scope_info, isolate));
         outer_scope->set_is_dynamic_scope();
+        has_debug_evaluate_scope = true;
       } else {
         // For scope analysis, debug-evaluate is equivalent to a with scope.
         outer_scope = zone->New<Scope>(zone, WITH_SCOPE, ast_value_factory,
@@ -533,7 +543,7 @@ Scope* Scope::DeserializeScopeChain(
     } else if (scope_info->scope_type() == MODULE_SCOPE) {
       outer_scope = zone->New<ModuleScope>(handle(scope_info, isolate),
                                            ast_value_factory);
-      if (parse_info) {
+      if (parse_info && has_debug_evaluate_scope) {
         parse_info->set_has_module_in_scope_chain();
       }
     } else {
@@ -941,6 +951,7 @@ Scope* Scope::FinalizeBlockScope() {
       scope->outer_scope_ = outer_scope();
       if (private_name_lookup_skips_outer_class()) {
         scope->set_private_name_lookup_skips_outer_class(true);
+        scope->GetClosureScope()->RecordNeedsPrivateNameContextChainRecalc();
       }
       if (scope->is_function_scope()) {
         scope->set_is_hoisted_in_context(false);
@@ -998,12 +1009,14 @@ void Scope::Snapshot::Reparent(DeclarationScope* new_parent) {
     for (; inner_scope->sibling() != top_inner_scope_;
          inner_scope = inner_scope->sibling()) {
       inner_scope->outer_scope_ = new_parent;
+      inner_scope->set_private_name_lookup_skips_outer_class(false);
       if (inner_scope->inner_scope_calls_eval()) {
         new_parent->set_inner_scope_calls_eval(true);
       }
       DCHECK_NE(inner_scope, new_parent);
     }
     inner_scope->outer_scope_ = new_parent;
+    inner_scope->set_private_name_lookup_skips_outer_class(false);
     if (inner_scope->inner_scope_calls_eval()) {
       new_parent->set_inner_scope_calls_eval(true);
     }
@@ -1033,6 +1046,7 @@ void Scope::Snapshot::Reparent(DeclarationScope* new_parent) {
   if (outer_scope_->calls_eval()) {
     new_parent->RecordEvalCall();
     outer_scope_->set_calls_eval(false);
+    declaration_scope_->set_calls_eval(false);
     declaration_scope_->set_sloppy_eval_can_extend_vars(false);
     declaration_scope_->set_is_dynamic_scope(false);
   }

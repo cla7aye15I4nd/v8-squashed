@@ -916,6 +916,8 @@ class Heap final {
   V8_INLINE void SetMessageListeners(Tagged<ArrayList> value);
   V8_INLINE void SetFunctionsMarkedForManualOptimization(
       Tagged<Object> bytecode);
+  V8_INLINE void SetFunctionsMarkedForDisabledEagerInlining(
+      Tagged<Object> hash_table);
   V8_INLINE void SetSmiStringCache(Tagged<SmiStringCache> cache);
   V8_INLINE void SetDoubleStringCache(Tagged<DoubleStringCache> cache);
   V8_INLINE void SetCachedBigIntDivisor(Tagged<BigInt> divisor);
@@ -1090,7 +1092,7 @@ class Heap final {
                                              size_t slot_offset);
 
   static void VerifySkippedWriteBarrier(Address object, Address value);
-  static void VerifySkippedIndirectWriteBarrier(Address object);
+  static void VerifySkippedTrustedWriteBarrier(Address object);
 
 #ifdef DEBUG
   void VerifySlotRangeHasNoRecordedSlots(Address start, Address end);

@@ -267,6 +267,9 @@ class V8_EXPORT_PRIVATE Parser : public NON_EXPORTED_BASE(ParserBase<Parser>) {
           pending_error_handler(), runtime_call_stats_, v8_file_logger_,
           flags(), parsing_on_main_thread_);
       reusable_preparser_->set_allow_eval_cache(allow_eval_cache());
+      if (has_module_in_scope_chain()) {
+        reusable_preparser_->set_has_module_in_scope_chain();
+      }
       preparse_data_buffer_.reserve(128);
     }
     return reusable_preparser_;
@@ -538,8 +541,7 @@ class V8_EXPORT_PRIVATE Parser : public NON_EXPORTED_BASE(ParserBase<Parser>) {
 
   // Generic AST generator for throwing errors from compiled code.
   Expression* NewThrowError(Runtime::FunctionId function_id,
-                            MessageTemplate message, const AstRawString* arg,
-                            int pos);
+                            MessageTemplate message, int pos);
 
   void AddArrowFunctionFormalParameters(ParserFormalParameters* parameters,
                                         Expression* params, int end_pos);
@@ -713,8 +715,7 @@ class V8_EXPORT_PRIVATE Parser : public NON_EXPORTED_BASE(ParserBase<Parser>) {
   // Generate AST node that throws a ReferenceError with the given type.
   V8_INLINE Expression* NewThrowReferenceError(MessageTemplate message,
                                                int pos) {
-    return NewThrowError(Runtime::kNewReferenceError, message,
-                         ast_value_factory()->empty_string(), pos);
+    return NewThrowError(Runtime::kNewReferenceError, message, pos);
   }
 
   // Dummy implementation. The parser should never have a unidentifiable

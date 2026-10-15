@@ -1525,8 +1525,8 @@ class IndexedReferencesExtractor : public ObjectVisitorWithCageBases {
     VisitSlotImpl(code_cage_base(), slot);
   }
 
-  void VisitIndirectPointer(Tagged<HeapObject> host, IndirectPointerSlot slot,
-                            TrustedPointerMode mode) override {
+  void VisitTrustedPointer(Tagged<HeapObject> host, TrustedPointerSlot slot,
+                           TrustedPointerMode mode) override {
     VisitSlotImpl(generator_->isolate(), slot);
   }
 
@@ -1643,6 +1643,11 @@ void V8HeapExplorer::ExtractReferences(HeapEntry* entry,
     ExtractStringReferences(entry, Cast<String>(obj));
   } else if (IsSymbol(obj)) {
     ExtractSymbolReferences(entry, Cast<Symbol>(obj));
+#if V8_ENABLE_WEBASSEMBLY
+  } else if (IsWasmCustomMap(obj)) {
+    // Must check this before {IsMap} below due to instance type ranges.
+    ExtractWasmCustomMapReferences(Cast<WasmCustomMap>(obj), entry);
+#endif  // V8_ENABLE_WEBASSEMBLY
   } else if (IsMap(obj)) {
     ExtractMapReferences(entry, Cast<Map>(obj));
   } else if (IsSharedFunctionInfo(obj)) {
@@ -1709,8 +1714,6 @@ void V8HeapExplorer::ExtractReferences(HeapEntry* entry,
 #if V8_ENABLE_WEBASSEMBLY
   } else if (IsWasmStruct(obj)) {
     ExtractWasmStructReferences(Cast<WasmStruct>(obj), entry);
-  } else if (IsWasmCustomMap(obj)) {
-    ExtractWasmCustomMapReferences(Cast<WasmCustomMap>(obj), entry);
   } else if (IsWasmArray(obj)) {
     ExtractWasmArrayReferences(Cast<WasmArray>(obj), entry);
   } else if (Is<WasmTrustedInstanceData>(obj)) {

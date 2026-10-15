@@ -100,7 +100,7 @@ class SlotAccessorForHeapObject {
     return Write(*value, ref_type, slot_offset, mode);
   }
 
-  int WriteIndirectPointerTo(Tagged<HeapObject> value, WriteBarrierMode mode) {
+  int WriteTrustedPointerTo(Tagged<HeapObject> value, WriteBarrierMode mode) {
     // Only ExposedTrustedObjects can be referenced via indirect pointers, so
     // we must have one of these objects here. See the comments in
     // trusted-object.h for more details.
@@ -112,10 +112,10 @@ class SlotAccessorForHeapObject {
     SharedFlag shared = SharedFlag(HeapLayout::InAnySharedSpace(value));
     TrustedPointerTag tag =
         TrustedPointerTagFromInstanceType(instance_type, shared);
-    IndirectPointerSlot dest = object_->RawIndirectPointerField(offset_, tag);
+    TrustedPointerSlot dest = object_->RawTrustedPointerField(offset_, tag);
     dest.store(object);
 
-    WriteBarrier::ForIndirectPointer(*object_, dest, value, mode);
+    WriteBarrier::ForTrustedPointer(*object_, dest, value, mode);
     return 1;
   }
 
@@ -165,7 +165,7 @@ class SlotAccessorForRootSlots {
             int slot_offset, WriteBarrierMode mode) {
     return Write(*value, ref_type, slot_offset, mode);
   }
-  int WriteIndirectPointerTo(Tagged<HeapObject> value, WriteBarrierMode mode) {
+  int WriteTrustedPointerTo(Tagged<HeapObject> value, WriteBarrierMode mode) {
     UNREACHABLE();
   }
   int WriteProtectedPointerTo(Tagged<TrustedObject> value,
@@ -209,7 +209,7 @@ class SlotAccessorForHandle {
     *handle_ = value;
     return 1;
   }
-  int WriteIndirectPointerTo(Tagged<HeapObject> value, WriteBarrierMode mode) {
+  int WriteTrustedPointerTo(Tagged<HeapObject> value, WriteBarrierMode mode) {
     UNREACHABLE();
   }
   int WriteProtectedPointerTo(Tagged<TrustedObject> value,
@@ -229,7 +229,7 @@ int Deserializer<IsolateT>::WriteHeapPointer(SlotAccessor slot_accessor,
                                              ReferenceDescriptor descr,
                                              WriteBarrierMode mode) {
   if (descr.is_indirect_pointer) {
-    return slot_accessor.WriteIndirectPointerTo(heap_object, mode);
+    return slot_accessor.WriteTrustedPointerTo(heap_object, mode);
   } else {
     return slot_accessor.Write(heap_object, descr.type, 0, mode);
   }
@@ -241,7 +241,7 @@ int Deserializer<IsolateT>::WriteHeapPointer(
     SlotAccessor slot_accessor, DirectHandle<HeapObject> heap_object,
     ReferenceDescriptor descr, WriteBarrierMode mode) {
   if (descr.is_indirect_pointer) {
-    return slot_accessor.WriteIndirectPointerTo(*heap_object, mode);
+    return slot_accessor.WriteTrustedPointerTo(*heap_object, mode);
   } else if (descr.is_protected_pointer) {
     DCHECK(IsTrustedObject(*heap_object));
     return slot_accessor.WriteProtectedPointerTo(
@@ -457,9 +457,12 @@ void Deserializer<IsolateT>::DeserializeTrustedSection() {
   }
   DCHECK_EQ(kSynchronize, source_.Get());
   for (const auto& [index, ref] : trusted_export_refs_) {
+    // TODO(573671140): With CSS off-thread direct handles can only be
+    // dereferenced on the stack.
+    DirectHandle<HeapObject> target = trusted_exports[index];
     WriteHeapPointer(
         SlotAccessorForHeapObject::ForSlotOffset(ref.object, ref.offset),
-        *trusted_exports[index], ref.descr);
+        *target, ref.descr);
   }
 }
 
@@ -810,14 +813,26 @@ AllocationType SpaceToAllocation(SnapshotSpace space) {
 
 template <typename IsolateT>
 Handle<HeapObject> Deserializer<IsolateT>::ReadObject(SnapshotSpace space) {
-  const uint32_t size_in_tagged = source_.GetUint30();
-  const uint32_t size_in_bytes = size_in_tagged * kTaggedSize;
-
   // The map can't be a forward ref. If you want the map to be a forward ref,
   // then you're probably serializing the meta-map, in which case you want to
   // use the kNewContextlessMetaMap/kNewContextfulMetaMap bytecode.
   DCHECK_NE(source()->Peek(), kRegisterPendingForwardRef);
   DirectHandle<Map> map = Cast<Map>(ReadObject());
+
+  // Only read the instance size from the map if it resides in ReadOnlySpace.
+  // Mutable maps live inside the sandbox and could be concurrently corrupted
+  // while being read, causing a size mismatch between serialization and
+  // deserialization.
+  uint32_t size_in_tagged;
+  if (HeapLayout::InReadOnlySpace(*map)) {
+    const int instance_size_in_words = map->instance_size_in_words();
+    size_in_tagged = instance_size_in_words == kVariableSizeSentinel
+                         ? source_.GetUint30()
+                         : static_cast<uint32_t>(instance_size_in_words);
+  } else {
+    size_in_tagged = source_.GetUint30();
+  }
+  const uint32_t size_in_bytes = size_in_tagged * kTaggedSize;
 
   AllocationType allocation = SpaceToAllocation(space);
 
@@ -931,8 +946,8 @@ Handle<HeapObject> Deserializer<IsolateT>::ReadObject(SnapshotSpace space) {
 
 template <typename IsolateT>
 Handle<HeapObject> Deserializer<IsolateT>::ReadMetaMap(SnapshotSpace space) {
-  const uint32_t size_in_tagged = source_.GetUint30();
-  const uint32_t size_in_bytes = size_in_tagged * kTaggedSize;
+  const uint32_t size_in_bytes = Map::kSize;
+  const uint32_t size_in_tagged = size_in_bytes / kTaggedSize;
   const InstanceType instance_type =
       static_cast<InstanceType>(source_.GetUint30());
 
@@ -1199,8 +1214,10 @@ template <typename IsolateT>
 template <typename SlotAccessor>
 int Deserializer<IsolateT>::ReadReadOnlyHeapRef(uint8_t data,
                                                 SlotAccessor slot_accessor) {
-  uint32_t chunk_index = source_.GetUint30();
-  uint32_t chunk_offset = source_.GetUint30();
+  uint32_t encoded = source_.GetUint30();
+  uint32_t chunk_index = encoded >> kReadOnlyHeapRefOffsetBits;
+  uint32_t chunk_offset = (encoded & ((1u << kReadOnlyHeapRefOffsetBits) - 1))
+                          << kObjectAlignmentBits;
 
   ReadOnlySpace* read_only_space = isolate()->heap()->read_only_space();
   ReadOnlyPage* page = read_only_space->pages()[chunk_index];
@@ -1652,8 +1669,8 @@ int Deserializer<IsolateT>::ReadRootArrayConstants(uint8_t data,
                 static_cast<int>(RootIndex::kLastImmortalImmovableRoot));
 
   RootIndex root_index = RootArrayConstant::Decode(data);
-  DirectHandle<HeapObject> heap_object =
-      Cast<HeapObject>(isolate()->root_handle(root_index));
+  Tagged<HeapObject> heap_object =
+      Cast<HeapObject>(isolate()->root(root_index));
   if (v8_flags.trace_deserialization) {
     PrintF("%*sRootArrayConstants [%u] : %s\n", depth_, "",
            static_cast<int>(root_index), RootsTable::name(root_index));

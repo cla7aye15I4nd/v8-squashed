@@ -188,7 +188,7 @@ void IC::TraceIC(const char* type, DirectHandle<Object> name, State old_state,
   ic_info.state += "->";
   ic_info.state += TransitionMarkFromState(new_state);
   ic_info.state += modifier;
-  ic_info.state += ")";
+  ic_info.state += ')';
   if (!map.is_null()) {
     ic_info.map = reinterpret_cast<void*>(map->ptr());
     ic_info.is_dictionary_map = map->is_dictionary_map();
@@ -757,12 +757,22 @@ bool IC::UpdatePolymorphicIC(DirectHandle<Name> name,
         // Filter out deprecated maps to ensure their instances get migrated.
         deprecated_maps++;
       } else if (map.is_identical_to(existing_map)) {
+        if (LoadHandler::IsFastProxyHandler(*handler) &&
+            !DataHandler::AreEquivalent(handler, existing_handler)) {
+          // Special case for FastProxy: if we are seeing the same map again,
+          // this means the inner loadIC or the inner callIC missed. We
+          // downgrade to a normal slow proxy handler and not directly to
+          // MEGAMORPHIC.
+          override_handler =
+              MaybeObjectDirectHandle(LoadHandler::LoadProxy(isolate()));
+        }
+
         // If both map and handler stayed the same (and the name is also the
         // same as checked above, for keyed accesses), we're not progressing
         // in the lattice and need to go MEGAMORPHIC instead. There's one
         // exception to this rule, which is when we're in RECOMPUTE_HANDLER
         // state, there we allow to migrate to a new handler.
-        if (handler.is_identical_to(existing_handler) &&
+        if (DataHandler::AreEquivalent(override_handler, existing_handler) &&
             state() != RECOMPUTE_HANDLER) {
           if (v8_flags.sparkplug_plus &&
               caller_frame_type() == CallerFrameType::kBaseline) {
@@ -779,14 +789,7 @@ bool IC::UpdatePolymorphicIC(DirectHandle<Name> name,
           return false;
         }
 
-        if (LoadHandler::IsFastProxyHandler(*handler)) {
-          // Special case for FastProxy: if we are seeing the same map again,
-          // this means the inner loadIC or the inner callIC missed. We
-          // downgrade to a normal slow proxy handler and not directly to
-          // MEGAMORPHIC.
-          override_handler =
-              MaybeObjectDirectHandle(LoadHandler::LoadProxy(isolate()));
-        } else if (map->is_dictionary_map()) {
+        if (map->is_dictionary_map() && !IsJSProxyMap(*map)) {
           // If the receiver type is a dictionary map and the handler is
           // different, it means the dictionary rehashed. Go MEGAMORPHIC to
           // prevent deopt loops.
@@ -979,7 +982,7 @@ bool IC::TryHealMonomorphicIC(const MaybeObjectHandle& handler) {
   MaybeObjectDirectHandle feedback_handler =
       nexus()->FindHandlerForMap(lookup_start_object_map());
   if (feedback_handler.is_null()) return false;
-  if (!feedback_handler.is_identical_to(handler)) return false;
+  if (!DataHandler::AreEquivalent(feedback_handler, handler)) return false;
 
   Builtin current_builtin = GetCurrentBaselineBuiltin();
   DCHECK(current_builtin == Builtin::kLoadICUninitializedBaseline ||
@@ -1652,14 +1655,8 @@ bool AllowConvertHoleElementToUndefined(Isolate* isolate,
       // the {receiver}s prototype is either the initial Object.prototype
       // or the initial Array.prototype, which are both guarded by the
       // "no elements" protector checked above.
-      DirectHandle<HeapObject> receiver_prototype(receiver_map->prototype(),
-                                                  isolate);
-      InstanceType prototype_type = receiver_prototype->map()->instance_type();
-      if (prototype_type == JS_OBJECT_PROTOTYPE_TYPE ||
-          (prototype_type == JS_ARRAY_TYPE &&
-           isolate->IsInCreationContext(
-               Cast<JSObject>(*receiver_prototype),
-               Context::INITIAL_ARRAY_PROTOTYPE_INDEX))) {
+      Tagged<HeapObject> receiver_prototype = receiver_map->prototype();
+      if (receiver_prototype->map()->IsMapInArrayPrototypeChain(isolate)) {
         return true;
       }
     }

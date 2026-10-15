@@ -305,7 +305,7 @@ constexpr bool CanTriggerGC(T... properties) {
   F(NotifyContextCellStateWillChange, 1, 1,                \
     RuntimeCallProperty::kCannotTriggerGC)                 \
   F(NewError, 2, 1)                                        \
-  F(NewReferenceError, 2, 1)                               \
+  F(NewReferenceError, 1, 1)                               \
   F(NewTypeError, -1 /* [1, 4] */, 1)                      \
   F(OrdinaryHasInstance, 2, 1)                             \
   F(PropagateException, 0, 1)                              \
@@ -584,6 +584,7 @@ constexpr bool CanTriggerGC(T... properties) {
   F(DebugTrace, 0, 1)                                                    \
   F(DebugTraceMinimal, 0, 1)                                             \
   F(DeoptimizeFunction, 1, 1)                                            \
+  F(DisableEagerInlining, 1, 1)                                          \
   F(DisableOptimizationFinalization, 0, 1)                               \
   F(DisallowCodegenFromStrings, 1, 1)                                    \
   F(DisassembleFunction, 1, 1)                                           \
@@ -764,8 +765,8 @@ constexpr bool CanTriggerGC(T... properties) {
   F(WasmDebugBreak, 0, 1)                                        \
   F(WasmAllocateDescriptorStruct, 4, 1)                          \
   F(WasmArrayCopy, 5, 1)                                         \
-  F(WasmArrayNewSegment, 5, 1)                                   \
-  F(WasmArrayInitSegment, 6, 1)                                  \
+  F(WasmArrayNewSegment, 6, 1)                                   \
+  F(WasmArrayInitSegment, 7, 1)                                  \
   F(WasmAllocateSuspender, 0, 1)                                 \
   F(WasmSuspended, 2, 1)                                         \
   F(WasmAllocateContinuation, 3, 1)                              \

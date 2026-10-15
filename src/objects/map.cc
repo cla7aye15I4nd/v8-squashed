@@ -1121,14 +1121,19 @@ Tagged<Map> Map::LookupElementsTransitionMap(Isolate* isolate,
 }
 
 bool Map::IsMapInArrayPrototypeChain(Isolate* isolate) const {
-  if (isolate->initial_array_prototype()->map() == this) {
+  DisallowGarbageCollection no_gc;
+  InstanceType type = instance_type();
+  if (type == JS_OBJECT_PROTOTYPE_TYPE) {
     return true;
   }
-
-  if (isolate->initial_object_prototype()->map() == this) {
-    return true;
+  if (type == JS_ARRAY_TYPE) {
+    // Keep in sync with Isolate::IsInCreationContext.
+    Tagged<Map> metamap = map();
+    // Filter out native-context independent objects.
+    if (metamap == ReadOnlyRoots(isolate).meta_map()) return false;
+    Tagged<NativeContext> native_context = metamap->native_context();
+    return native_context->initial_array_prototype()->map() == this;
   }
-
   return false;
 }
 
@@ -2413,10 +2418,9 @@ bool Map::EquivalentToForNormalization(const Tagged<Map> other,
   int properties =
       mode == CLEAR_INOBJECT_PROPERTIES ? 0 : other->GetInObjectProperties();
   // Make sure the elements_kind bits are in bit_field2.
-  DCHECK_EQ(this->elements_kind(),
-            Map::Bits2::ElementsKindBits::decode(bit_field2()));
-  int adjusted_other_bit_field2 =
-      Map::Bits2::ElementsKindBits::update(other->bit_field2(), elements_kind);
+  DCHECK_EQ(this->elements_kind(), bit_field2().elements_kind());
+  Bits2 adjusted_other_bit_field2 =
+      other->bit_field2().with<Bits2::ElementsKindBits>(elements_kind);
   return CheckEquivalentModuloProto(this, other) &&
          prototype() == other_prototype &&
          bit_field2() == adjusted_other_bit_field2 &&

@@ -13510,39 +13510,6 @@ static v8::Isolate::CreateParams CreateTestParams() {
   return create_params;
 }
 
-UNINITIALIZED_TEST(SharedObjectGetConstructorName) {
-  if (!V8_CAN_CREATE_SHARED_HEAP_BOOL) return;
-  // In multi-cage mode we create one cage per isolate
-  // and we don't share objects between cages.
-  if (COMPRESS_POINTERS_IN_MULTIPLE_CAGES_BOOL) return;
-
-  i::v8_flags.shared_string_table = true;
-  i::v8_flags.harmony_struct = true;
-  i::FlagList::EnforceFlagImplications();
-
-  v8::Isolate::CreateParams create_params = CreateTestParams();
-  v8::Isolate* isolate = v8::Isolate::New(create_params);
-  {
-    v8::Isolate::Scope i_scope(isolate);
-    v8::HandleScope scope(isolate);
-    LocalContext context(isolate);
-
-    v8_compile(
-        "var s = new (new SharedStructType(['foo']));"
-        "var a = new SharedArray(1);"
-        "var m = new Atomics.Mutex;"
-        "var c = new Atomics.Condition;")
-        ->Run(context.local())
-        .ToLocalChecked();
-
-    CheckGetConstructorNameOfVar(context, "s", "SharedStruct");
-    CheckGetConstructorNameOfVar(context, "a", "SharedArray");
-    CheckGetConstructorNameOfVar(context, "m", "Atomics.Mutex");
-    CheckGetConstructorNameOfVar(context, "c", "Atomics.Condition");
-  }
-  isolate->Dispose();
-}
-
 static void TestAllocateAndNewForTwoIsolateGroups(
     const v8::Isolate::CreateParams& create_params_1,
     const v8::Isolate::CreateParams& create_params_2,
@@ -15582,157 +15549,6 @@ TEST(ObjectClone) {
                      clone->Get(env.local(), v8_str("beta")).ToLocalChecked())
             .FromJust());
 }
-
-
-class OneByteVectorResource : public v8::String::ExternalOneByteStringResource {
- public:
-  explicit OneByteVectorResource(v8::base::Vector<const char> vector)
-      : data_(vector) {}
-  ~OneByteVectorResource() override = default;
-  size_t length() const override { return data_.length(); }
-  const char* data() const override { return data_.begin(); }
-  void Dispose() override {}
-
- private:
-  v8::base::Vector<const char> data_;
-};
-
-
-class UC16VectorResource : public v8::String::ExternalStringResource {
- public:
-  explicit UC16VectorResource(v8::base::Vector<const v8::base::uc16> vector)
-      : data_(vector) {}
-  ~UC16VectorResource() override = default;
-  size_t length() const override { return data_.length(); }
-  const v8::base::uc16* data() const override { return data_.begin(); }
-  void Dispose() override {}
-
- private:
-  v8::base::Vector<const v8::base::uc16> data_;
-};
-
-static void MorphAString(i::Tagged<i::String> string,
-                         OneByteVectorResource* one_byte_resource,
-                         UC16VectorResource* uc16_resource) {
-  i::Isolate* isolate = CcTest::i_isolate();
-  CHECK(i::StringShape(string).IsExternal());
-  i::ReadOnlyRoots roots(CcTest::heap());
-  if (string->IsOneByteRepresentation()) {
-    // Check old map is not internalized or long.
-    CHECK(string->map() == roots.external_one_byte_string_map());
-    // Morph external string to be TwoByte string.
-    string->set_map(isolate, roots.external_two_byte_string_map());
-    i::Tagged<i::ExternalTwoByteString> morphed =
-        i::Cast<i::ExternalTwoByteString>(string);
-    morphed->SetResource(isolate, uc16_resource);
-  } else {
-    // Check old map is not internalized or long.
-    CHECK(string->map() == roots.external_two_byte_string_map());
-    // Morph external string to be one-byte string.
-    string->set_map(isolate, roots.external_one_byte_string_map());
-    i::Tagged<i::ExternalOneByteString> morphed =
-        i::Cast<i::ExternalOneByteString>(string);
-    morphed->SetResource(isolate, one_byte_resource);
-  }
-}
-
-// Test that we can still flatten a string if the components it is built up
-// from have been turned into 16 bit strings in the mean time.
-THREADED_TEST(MorphCompositeStringTest) {
-  char utf_buffer[129];
-  const char* c_string = "Now is the time for all good men"
-                         " to come to the aid of the party";
-  uint16_t* two_byte_string = AsciiToTwoByteString(c_string);
-  {
-    LocalContext env;
-    i::Factory* factory = CcTest::i_isolate()->factory();
-    v8::Isolate* isolate = env.isolate();
-    i::Isolate* i_isolate = CcTest::i_isolate();
-    v8::HandleScope scope(isolate);
-    OneByteVectorResource one_byte_resource(
-        v8::base::Vector<const char>(c_string, strlen(c_string)));
-    UC16VectorResource uc16_resource(
-        v8::base::Vector<const uint16_t>(two_byte_string, strlen(c_string)));
-
-    Local<String> lhs(v8::Utils::ToLocal(
-        factory->NewExternalStringFromOneByte(&one_byte_resource)
-            .ToHandleChecked()));
-    Local<String> rhs(v8::Utils::ToLocal(
-        factory->NewExternalStringFromOneByte(&one_byte_resource)
-            .ToHandleChecked()));
-
-    CHECK(env->Global()->Set(env.local(), v8_str("lhs"), lhs).FromJust());
-    CHECK(env->Global()->Set(env.local(), v8_str("rhs"), rhs).FromJust());
-
-    CompileRun(
-        "var cons = lhs + rhs;"
-        "var slice = lhs.substring(1, lhs.length - 1);"
-        "var slice_on_cons = (lhs + rhs).substring(1, lhs.length *2 - 1);");
-
-    CHECK(lhs->IsOneByte());
-    CHECK(rhs->IsOneByte());
-
-    i::DirectHandle<i::String> ilhs = v8::Utils::OpenDirectHandle(*lhs);
-    i::DirectHandle<i::String> irhs = v8::Utils::OpenDirectHandle(*rhs);
-    MorphAString(*ilhs, &one_byte_resource, &uc16_resource);
-    MorphAString(*irhs, &one_byte_resource, &uc16_resource);
-
-    // This should UTF-8 without flattening, since everything is ASCII.
-    Local<String> cons =
-        v8_compile("cons")->Run(env.local()).ToLocalChecked().As<String>();
-    CHECK_EQ(128, cons->Utf8Length(isolate));
-    CHECK_EQ(129, cons->WriteUtf8(isolate, utf_buffer, sizeof(utf_buffer),
-                                  String::WriteFlags::kNullTerminate));
-    CHECK_EQ(0, strcmp(
-        utf_buffer,
-        "Now is the time for all good men to come to the aid of the party"
-        "Now is the time for all good men to come to the aid of the party"));
-
-    // Now do some stuff to make sure the strings are flattened, etc.
-    CompileRun(
-        "/[^a-z]/.test(cons);"
-        "/[^a-z]/.test(slice);"
-        "/[^a-z]/.test(slice_on_cons);");
-    const char* expected_cons =
-        "Now is the time for all good men to come to the aid of the party"
-        "Now is the time for all good men to come to the aid of the party";
-    const char* expected_slice =
-        "ow is the time for all good men to come to the aid of the part";
-    const char* expected_slice_on_cons =
-        "ow is the time for all good men to come to the aid of the party"
-        "Now is the time for all good men to come to the aid of the part";
-    CHECK(v8_str(expected_cons)
-              ->Equals(env.local(), env->Global()
-                                        ->Get(env.local(), v8_str("cons"))
-                                        .ToLocalChecked())
-              .FromJust());
-    CHECK(v8_str(expected_slice)
-              ->Equals(env.local(), env->Global()
-                                        ->Get(env.local(), v8_str("slice"))
-                                        .ToLocalChecked())
-              .FromJust());
-    CHECK(v8_str(expected_slice_on_cons)
-              ->Equals(env.local(),
-                       env->Global()
-                           ->Get(env.local(), v8_str("slice_on_cons"))
-                           .ToLocalChecked())
-              .FromJust());
-
-    // This avoids the GC from trying to free a stack allocated resource.
-    if (IsExternalOneByteString(*ilhs)) {
-      i::Cast<i::ExternalOneByteString>(*ilhs)->SetResource(i_isolate, nullptr);
-    } else {
-      i::Cast<i::ExternalTwoByteString>(*ilhs)->SetResource(i_isolate, nullptr);
-    }
-    if (IsExternalOneByteString(*irhs)) {
-      i::Cast<i::ExternalOneByteString>(*irhs)->SetResource(i_isolate, nullptr);
-    } else {
-      i::Cast<i::ExternalTwoByteString>(*irhs)->SetResource(i_isolate, nullptr);
-    }
-  }
-  i::DeleteArray(two_byte_string);
-}
-
 
 TEST(CompileExternalTwoByteSource) {
   LocalContext context;
@@ -19834,17 +19650,25 @@ TEST(RegExp) {
     ExpectTrue("ex instanceof SyntaxError");
   }
 
-  // RegExp::Exec.
+  // RegExp::Exec / RegExp::ExecV2.
   {
     v8::Local<v8::RegExp> regexp =
         v8::RegExp::New(context.local(), v8_str("a.c"), {}).ToLocalChecked();
-    v8::Local<v8::Object> result0 =
-        regexp->Exec(context.local(), v8_str("abc")).ToLocalChecked();
+    v8::Local<v8::Value> result0 =
+        regexp->ExecV2(context.local(), v8_str("abc")).ToLocalChecked();
     CHECK(result0->IsArray());
-    v8::Local<v8::Object> result1 =
-        regexp->Exec(context.local(), v8_str("abd")).ToLocalChecked();
-    // TODO(jgruber): Fix the API; `v8::Null` is not a valid `v8::Object`.
+    v8::Local<v8::Value> result1 =
+        regexp->ExecV2(context.local(), v8_str("abd")).ToLocalChecked();
     CHECK(result1->IsNull());
+
+    START_ALLOW_USE_DEPRECATED();
+    v8::Local<v8::Object> deprecated_result0 =
+        regexp->Exec(context.local(), v8_str("abc")).ToLocalChecked();
+    CHECK(deprecated_result0->IsArray());
+    v8::Local<v8::Object> deprecated_result1 =
+        regexp->Exec(context.local(), v8_str("abd")).ToLocalChecked();
+    CHECK(deprecated_result1->IsNull());
+    END_ALLOW_USE_DEPRECATED();
   }
 }
 
@@ -25889,7 +25713,7 @@ TEST(ModuleEvaluateImportTerminateExecution) {
   // The exception thrown by terminate execution is not catchable by JavaScript
   // so the promise can not be settled.
   CHECK_EQ(promise->State(), v8::Promise::kPending);
-  CHECK_EQ(module->GetStatus(), Module::kEvaluated);
+  CHECK_EQ(module->GetStatus(), Module::kErrored);
   CHECK(try_catch.HasCaught());
   CHECK(try_catch.HasTerminated());
 }
@@ -32996,3 +32820,60 @@ TEST(IsolateFree) {
   v8::Isolate::Free(isolate1);
   v8::Isolate::Free(isolate2);
 }
+
+#ifdef V8_ENABLE_MAGLEV
+TEST(MaglevFastProxyCheckTrapResultLazyDeopt) {
+  if (i::v8_flags.jitless) return;
+  if (i::v8_flags.disable_optimizing_compilers) return;
+  if (!i::v8_flags.maglev) return;
+
+  i::v8_flags.allow_natives_syntax = true;
+  i::v8_flags.fast_proxy_ic = true;
+  i::v8_flags.optimize_on_next_call_optimizes_to_maglev = true;
+
+  LocalContext env;
+  v8::Isolate* isolate = env.isolate();
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+
+  v8::Local<v8::ObjectTemplate> templ = v8::ObjectTemplate::New(isolate);
+  templ->SetNativeDataProperty(
+      v8_str("prop"), [](v8::Local<v8::Name> name,
+                         const v8::PropertyCallbackInfo<v8::Value>& info) {
+        v8::Local<v8::Context> ctx = info.GetIsolate()->GetCurrentContext();
+        v8::Local<v8::Value> trigger =
+            ctx->Global()->Get(ctx, v8_str("trigger_deopt")).ToLocalChecked();
+        if (trigger->BooleanValue(info.GetIsolate())) {
+          CHECK(ctx->Global()
+                    ->Set(ctx, v8_str("global_dep"), v8_num(2))
+                    .FromJust());
+        }
+        info.GetReturnValue().Set(v8_num(100));
+      });
+
+  v8::Local<v8::Object> target = templ->NewInstance(context).ToLocalChecked();
+  v8::Local<v8::Object> target2 = templ->NewInstance(context).ToLocalChecked();
+  CHECK(target2->Set(context, v8_str("extra"), v8_num(1)).FromJust());
+  CHECK(context->Global()->Set(context, v8_str("target"), target).FromJust());
+
+  ExpectInt32(
+      "var global_dep = 1;"
+      "var trigger_deopt = false;"
+      "var mutate_target = false;"
+      "function get_trap(t, p, r) {"
+      "  if (mutate_target) { t.extra = 1; trigger_deopt = true; }"
+      "  return 42;"
+      "}"
+      "%NeverOptimizeFunction(get_trap);"
+      "const handler = { get: get_trap };"
+      "const proxy = new Proxy(target, handler);"
+      "function f(p) { return p.prop + global_dep - global_dep; }"
+      "%PrepareFunctionForOptimization(f);"
+      "f(proxy);"
+      "%OptimizeFunctionOnNextCall(f);"
+      "f(proxy);"
+      "mutate_target = true;"
+      "f(proxy);",
+      42);
+}
+#endif  // V8_ENABLE_MAGLEV
