@@ -1135,7 +1135,8 @@ void ResetFeedbackVectorOsrUrgency(MacroAssembler* masm,
   DCHECK(!AreAliased(feedback_vector, scratch));
   __ Ldrb(scratch, FieldMemOperand(feedback_vector,
                                    offsetof(FeedbackVector, osr_state_)));
-  __ And(scratch, scratch, Operand(~FeedbackVector::OsrUrgencyBits::kMask));
+  __ And(scratch, scratch,
+         Operand(~FeedbackVector::OsrState::OsrUrgencyBits::kMask));
   __ Strb(scratch, FieldMemOperand(feedback_vector,
                                    offsetof(FeedbackVector, osr_state_)));
 }
@@ -5001,9 +5002,9 @@ void Builtins::Generate_WasmReturnFromSegment(MacroAssembler* masm) {
   __ PopAll(fp_saves, kSimd128Size);
   __ PopAll(gp_saves);
 
+  SwitchSimulatorStackLimit(masm);
   __ Mov(sp, fp);
   __ Pop<MacroAssembler::kAuthLR>(fp, lr);
-  SwitchSimulatorStackLimit(masm);
   __ Ret();
 }
 #endif  // V8_ENABLE_WEBASSEMBLY

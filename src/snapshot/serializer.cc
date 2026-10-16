@@ -6,7 +6,6 @@
 
 #include "include/v8-internal.h"
 #include "src/base/logging.h"
-#include "src/base/unique-array.h"
 #include "src/codegen/assembler-inl.h"
 #include "src/common/globals.h"
 #include "src/handles/global-handles-inl.h"
@@ -27,6 +26,7 @@
 #include "src/objects/smi.h"
 #include "src/sandbox/check.h"
 #include "src/sandbox/js-dispatch-table-inl.h"
+#include "src/sandbox/sandbox.h"
 #include "src/snapshot/embedded/embedded-data.h"
 #include "src/snapshot/serializer-deserializer.h"
 #include "src/snapshot/serializer-inl.h"
@@ -36,7 +36,6 @@ namespace internal {
 
 Serializer::Serializer(Isolate* isolate, Snapshot::SerializerFlags flags)
     : isolate_(isolate),
-      hot_objects_(isolate->heap()),
       reference_map_(isolate),
       external_reference_encoder_(isolate),
       root_index_map_(isolate),
@@ -178,6 +177,7 @@ void Serializer::SerializeObject(Handle<HeapObject> obj, SlotType slot_type) {
       // For now just serialize the BytecodeArray instead of baseline code.
       // TODO(v8:11429,pthier): Handle Baseline code in cases we want to
       // serialize it.
+      SBXCHECK(OutsideSandbox(code.address()));
       obj = handle(code->bytecode_or_interpreter_data(), isolate());
     } else {
       CHECK(code->is_builtin());
@@ -226,24 +226,9 @@ bool Serializer::SerializeRoot(Tagged<HeapObject> obj) {
   return false;
 }
 
-bool Serializer::SerializeHotObject(Tagged<HeapObject> obj) {
-  DisallowGarbageCollection no_gc;
-  // Encode a reference to a hot object by its index in the working set.
-  int index = hot_objects_.Find(obj);
-  if (index == HotObjectsList::kNotFound) return false;
-  DCHECK(index >= 0 && index < kHotObjectCount);
-  if (v8_flags.trace_serializer) {
-    PrintF(" Encoding hot object %d:", index);
-    ShortPrint(obj);
-    PrintF("\n");
-  }
-  sink_.Put(HotObject::Encode(index), "HotObject");
-  return true;
-}
-
 bool Serializer::SerializeBackReference(Tagged<HeapObject> obj) {
   DisallowGarbageCollection no_gc;
-  const SerializerReference* reference = reference_map_.LookupReference(obj);
+  SerializerReference* reference = reference_map_.LookupReference(obj);
   if (reference == nullptr) return false;
   // Encode the location of an already deserialized object in order to write
   // its location into a later object.  We can encode the location as an
@@ -255,6 +240,14 @@ bool Serializer::SerializeBackReference(Tagged<HeapObject> obj) {
              reference->attached_reference_index());
     }
     PutAttachedReference(*reference);
+  } else if (reference->is_fixed_back_reference()) {
+    uint32_t fixed_index = reference->fixed_back_ref_index();
+    if (v8_flags.trace_serializer) {
+      PrintF(" Encoding fixed back reference %d to: ", fixed_index);
+      ShortPrint(obj);
+      PrintF("\n");
+    }
+    sink_.Put(FixedBackref::Encode(fixed_index), "FixedBackref");
   } else {
     DCHECK(reference->is_back_reference());
     if (v8_flags.trace_serializer) {
@@ -264,7 +257,7 @@ bool Serializer::SerializeBackReference(Tagged<HeapObject> obj) {
     }
 
     sink_.Put(kBackref, "Backref");
-    PutBackReference(obj, *reference);
+    PutBackReference(obj, reference);
   }
   return true;
 }
@@ -311,7 +304,6 @@ void Serializer::PutRoot(RootIndex root) {
   } else {
     sink_.Put(kRootArray, "RootSerialization");
     sink_.PutUint30(root_index, "root_index");
-    hot_objects_.Add(object);
   }
 }
 
@@ -332,10 +324,14 @@ void Serializer::PutSmiRoot(FullObjectSlot slot) {
 }
 
 void Serializer::PutBackReference(Tagged<HeapObject> object,
-                                  SerializerReference reference) {
-  DCHECK_EQ(object, *back_refs_[reference.back_ref_index()]);
-  sink_.PutUint30(reference.back_ref_index(), "BackRefIndex");
-  hot_objects_.Add(object);
+                                  SerializerReference* reference) {
+  uint32_t index = reference->back_ref_index();
+  DCHECK_EQ(object, *back_refs_[index]);
+  sink_.PutUint30(index, "BackRefIndex");
+  if (num_fixed_back_refs_ < kFixedBackrefCount &&
+      SerializerReference::CanBeFixedBackReference(index)) {
+    reference->set_fixed_back_ref_index(num_fixed_back_refs_++);
+  }
 }
 
 void Serializer::PutAttachedReference(SerializerReference reference) {
@@ -717,71 +713,32 @@ void Serializer::ObjectSerializer::SerializeExternalString() {
 void Serializer::ObjectSerializer::SerializeExternalStringAsSequentialString() {
   // Instead of serializing this as an external string, we serialize
   // an imaginary sequential string with the same content.
+  ReadOnlyRoots roots(isolate());
   DCHECK(IsExternalString(*object_));
   DirectHandle<ExternalString> string = Cast<ExternalString>(object_);
   uint32_t length = string->length();
-  bool one_byte = IsExternalOneByteString(*object_);
-  const uint8_t* content;
-  if (one_byte) {
-    const auto* ext_resource = Cast<ExternalOneByteString>(string)->resource();
-    SBXCHECK_EQ(length, ext_resource->length());
-    content = reinterpret_cast<const uint8_t*>(ext_resource->data());
-  } else {
-    const auto* ext_resource = Cast<ExternalTwoByteString>(string)->resource();
-    SBXCHECK_EQ(length, ext_resource->length());
-    content = reinterpret_cast<const uint8_t*>(ext_resource->data());
-  }
-  SerializeStringAsSequentialString(one_byte, length, content);
-}
-
-void Serializer::ObjectSerializer::SerializeSlicedStringAsSequentialString() {
-  // Instead of serializing this as a sliced string, we serialize an imaginary
-  // sequential string with the same content, so that it does not depend on its
-  // parent.
-  DCHECK(IsSlicedString(*object_));
-  DisallowGarbageCollection no_gc;
-  String::FlatContent flat = Cast<String>(*object_)->GetFlatContent(no_gc);
-  DCHECK(flat.IsFlat());
-  uint32_t length = flat.length();
-  if (flat.IsOneByte()) {
-    SerializeStringAsSequentialString(true, length,
-                                      flat.ToOneByteVector().begin());
-    return;
-  }
-  base::Vector<const base::uc16> chars = flat.ToUC16Vector();
-  if (String::IsOneByte(chars.begin(), length)) {
-    // The parent of the slice is two-byte, but its contents are one-byte, so
-    // serialize a one-byte string (which is also what copying them would
-    // create).
-    base::UniqueArray<uint8_t> one_byte =
-        base::UniqueArray<uint8_t>::NewForOverwrite(length);
-    CopyChars(one_byte.begin(), chars.begin(), length);
-    SerializeStringAsSequentialString(true, length, one_byte.begin());
-    return;
-  }
-  SerializeStringAsSequentialString(
-      false, length, reinterpret_cast<const uint8_t*>(chars.begin()));
-}
-
-void Serializer::ObjectSerializer::SerializeStringAsSequentialString(
-    bool one_byte, uint32_t length, const uint8_t* content) {
-  ReadOnlyRoots roots(isolate());
-  DirectHandle<String> string = Cast<String>(object_);
   Tagged<Map> map;
   int content_size;
   int allocation_size;
+  const uint8_t* resource;
   // Find the map and size for the imaginary sequential string.
   bool internalized = IsInternalizedString(*object_);
-  if (one_byte) {
+  if (IsExternalOneByteString(*object_)) {
     map = internalized ? roots.internalized_one_byte_string_map()
                        : roots.seq_one_byte_string_map();
     allocation_size = SeqOneByteString::SizeFor(length);
     content_size = length * kCharSize;
+    const auto* ext_resource = Cast<ExternalOneByteString>(string)->resource();
+    SBXCHECK_EQ(length, ext_resource->length());
+    resource = reinterpret_cast<const uint8_t*>(ext_resource->data());
   } else {
     map = internalized ? roots.internalized_two_byte_string_map()
                        : roots.seq_two_byte_string_map();
     allocation_size = SeqTwoByteString::SizeFor(length);
     content_size = length * kShortSize;
+    const auto* ext_resource = Cast<ExternalTwoByteString>(string)->resource();
+    SBXCHECK_EQ(length, ext_resource->length());
+    resource = reinterpret_cast<const uint8_t*>(ext_resource->data());
   }
 
   SnapshotSpace space = SnapshotSpace::kOld;
@@ -806,7 +763,7 @@ void Serializer::ObjectSerializer::SerializeStringAsSequentialString(
   sink_->PutUint32(length, "StringLength");
 
   // Serialize string content.
-  sink_->PutRaw(content, content_size, "StringContent");
+  sink_->PutRaw(resource, content_size, "StringContent");
 
   // Since the allocation size is rounded up to object alignment, there
   // maybe left-over bytes that need to be padded.
@@ -884,11 +841,6 @@ void Serializer::ObjectSerializer::Serialize(SlotType slot_type) {
   InstanceType instance_type = object_->map()->instance_type();
   if (InstanceTypeChecker::IsExternalString(instance_type)) {
     SerializeExternalString();
-    return;
-  }
-  if (InstanceTypeChecker::IsSlicedString(instance_type) &&
-      serializer_->SerializeSlicedStringsAsSequentialStrings()) {
-    SerializeSlicedStringAsSequentialString();
     return;
   }
   if (InstanceTypeChecker::IsJSTypedArray(instance_type)) {
@@ -1182,6 +1134,9 @@ void Serializer::ObjectSerializer::OutputExternalReference(
       sink_->PutRaw(reinterpret_cast<uint8_t*>(&target), target_size,
                     "raw pointer");
     }
+  } else if (sandboxify && serializer_->SerializeTrustedExternalReference(
+                               encoded_reference, tag)) {
+    return;
   } else if (encoded_reference.is_from_api()) {
     if (sandboxify) {
       sink_->Put(kSandboxedApiReference, "SandboxedApiRef");
@@ -1257,12 +1212,18 @@ void Serializer::ObjectSerializer::VisitExternalPointer(
       // resource_data_ is initialized in PostProcessExternalString, and
       // extension_ in PostProcessNewJSReceiver. Serializing them as null also
       // keeps the snapshot deterministic, as both hold values that are only
-      // meaningful within the serializing isolate.
-      value = kNullAddress;
-      tag = kExternalPointerNullTag;
+      // meaningful within the serializing isolate. They are written as raw
+      // data, so that they need no external reference.
+      static_assert(kExternalPointerSlotSize % kTaggedSize == 0);
+      sink_->Put(FixedRawDataWithSize::Encode(kExternalPointerSlotSize >>
+                                              kTaggedSizeLog2),
+                 "FixedRawData");
+      sink_->PutRaw(reinterpret_cast<const uint8_t*>(&kNullExternalPointer),
+                    kExternalPointerSlotSize, "null external pointer");
+    } else {
+      const bool sandboxify = V8_ENABLE_SANDBOX_BOOL;
+      OutputExternalReference(value, kSystemPointerSize, sandboxify, tag);
     }
-    const bool sandboxify = V8_ENABLE_SANDBOX_BOOL;
-    OutputExternalReference(value, kSystemPointerSize, sandboxify, tag);
     bytes_processed_so_far_ += kExternalPointerSlotSize;
   } else {
     // Serialization of external references in other objects is handled
@@ -1325,6 +1286,7 @@ void Serializer::ObjectSerializer::VisitTrustedPointerTableEntry(
 
 void Serializer::ObjectSerializer::VisitProtectedPointer(
     Tagged<TrustedObject> host, ProtectedPointerSlot slot) {
+  SBXCHECK(OutsideSandbox(host.address()));
   Tagged<Object> content = slot.load(isolate());
 
   // Similar to the indirect pointer case, if the slot is empty (i.e. contains
@@ -1347,6 +1309,7 @@ void Serializer::ObjectSerializer::VisitProtectedPointer(
 
 void Serializer::ObjectSerializer::VisitProtectedPointer(
     Tagged<TrustedObject> host, ProtectedMaybeObjectSlot slot) {
+  SBXCHECK(OutsideSandbox(host.address()));
   Tagged<MaybeObject> maybe_content = slot.load();
   // Empty slots (Smi::zero()) and Smi slots can be skipped here.
   if (maybe_content.IsSmi()) return;
@@ -1523,15 +1486,6 @@ void Serializer::ObjectSerializer::OutputRawData(Address up_to) {
                     bytes_to_output, "Bytes");
     }
   }
-}
-
-Serializer::HotObjectsList::HotObjectsList(Heap* heap) : heap_(heap) {
-  strong_roots_entry_ = heap->RegisterStrongRoots(
-      "Serializer::HotObjectsList", FullObjectSlot(&circular_queue_[0]),
-      FullObjectSlot(&circular_queue_[kSize]));
-}
-Serializer::HotObjectsList::~HotObjectsList() {
-  heap_->UnregisterStrongRoots(strong_roots_entry_);
 }
 
 DirectHandle<FixedArray> ObjectCacheIndexMap::Values(Isolate* isolate) {

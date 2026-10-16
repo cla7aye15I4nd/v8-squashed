@@ -329,9 +329,9 @@ base::UniqueArray<const uint8_t> GetAndCopyFirstArgumentAsBytes(
   } else if (source->IsTypedArray()) {
     // A TypedArray was passed.
     Local<TypedArray> array = Local<TypedArray>::Cast(source);
-    Local<ArrayBuffer> buffer = array->Buffer();
+    Local<ArrayBufferBase> buffer = array->GetBuffer();
 
-    auto backing_store = buffer->GetBackingStore();
+    std::shared_ptr<v8::BackingStore> backing_store = buffer->GetBackingStore();
 
     start = reinterpret_cast<const uint8_t*>(backing_store->Data()) +
             array->ByteOffset();
@@ -972,7 +972,13 @@ bool TransferPrototype(i::Isolate* isolate,
 void WebAssemblyModuleImpl(const v8::FunctionCallbackInfo<v8::Value>& info) {
   WasmJSApiScope js_api_scope{info, "WebAssembly.Module()"};
   auto [isolate, i_isolate, thrower] = js_api_scope.isolates_and_thrower();
-  if (i_isolate->wasm_module_callback()(info)) return;
+  if (WasmModuleCallback callback = i_isolate->wasm_module_callback()) {
+    if (callback(isolate, info[0])) return;
+  }
+  if (ExtensionCallback callback =
+          i_isolate->deprecated_wasm_module_callback()) {
+    if (callback(info)) return;
+  }
   RecordCompilationMethod(i_isolate, kSyncCompilation);
 
   if (!info.IsConstructCall()) {
@@ -1089,7 +1095,13 @@ void WebAssemblyInstanceImpl(const v8::FunctionCallbackInfo<v8::Value>& info) {
   i_isolate->CountUsage(
       v8::Isolate::UseCounterFeature::kWebAssemblyInstantiation);
 
-  if (i_isolate->wasm_instance_callback()(info)) return;
+  if (WasmInstanceCallback callback = i_isolate->wasm_instance_callback()) {
+    if (callback(isolate, info[0])) return;
+  }
+  if (ExtensionCallback callback =
+          i_isolate->deprecated_wasm_instance_callback()) {
+    if (callback(info)) return;
+  }
 
   i::DirectHandle<i::JSObject> instance_obj;
   {

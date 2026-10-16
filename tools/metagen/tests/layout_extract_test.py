@@ -44,8 +44,6 @@ _PRELUDE = r"""
 #define V8_TQ_ANNOTATE(P) [[clang::annotate(P)]]
 #define V8_TQ_MARK(NAME, PAYLOAD) \
   using V8TQ_##NAME V8_TQ_ANNOTATE(PAYLOAD) = void
-#define V8_TQ_TAIL_NAME(N) \
-  V8_TQ_MARK(TqTailName, "V8_TQ_TAIL_NAME(" #N ")")
 #define V8_TQ_TAIL_LENGTH(F) \
   V8_TQ_MARK(TqTailLength, "V8_TQ_TAIL_LENGTH(" #F ")")
 #define V8_TQ_CONST V8_TQ_ANNOTATE("V8_TQ_CONST")
@@ -622,9 +620,9 @@ class BaseChainTest(unittest.TestCase):
     layouts = extract_layouts(self._ARRAY_BASE + """
       class FakeArray
           : public TaggedArrayBase<FakeArray, Map, FakeArrayBase> {
-        V8_TQ_TAIL_NAME(objects);
-        V8_TQ_TAIL_LENGTH(length);
        public:
+        V8_TQ_TAIL_LENGTH(length);
+        V8_TQ_NAME(objects)
         TaggedMember<Map> objects_[0];
       };
     """)
@@ -657,18 +655,19 @@ class TailTest(unittest.TestCase):
   def test_tail(self):
     layouts = extract_layouts("""
       class Blob : public HeapObject {
-        V8_TQ_TAIL_NAME(bytes);
-        V8_TQ_TAIL_LENGTH(length);
        public:
         V8_TQ_CONST TaggedMember<Smi> length_;
+        V8_TQ_TAIL_LENGTH(length);
+        V8_TQ_NAME(bytes)
         uint8_t flexible_array_member_data_[0];
       };
     """)
     blob = layouts["Blob"]
     self.assertEqual(blob.size, 8)
     self.assertEqual([(a.name, a.arg) for a in blob.annotations],
-                     [("V8_TQ_TAIL_LENGTH", "length"),
-                      ("V8_TQ_TAIL_NAME", "bytes")])
+                     [("V8_TQ_TAIL_LENGTH", "length")])
+    self.assertEqual([(a.name, a.arg) for a in blob.tail.annotations],
+                     [("V8_TQ_NAME", "bytes")])
     tail = blob.tail
     self.assertEqual(tail.element_size, 1)
     self.assertEqual(tail.element_storage.kind, "int")
@@ -703,6 +702,10 @@ class BitFieldGroupTest(unittest.TestCase):
     }  // namespace base
     template <typename Derived, typename U>
     class BitFieldGroup {
+     public:
+      template <typename T, int size>
+      using First = base::BitField<T, 0, size, U>;
+     private:
       U value_;
     };
     template <typename Group>
@@ -718,9 +721,10 @@ class BitFieldGroupTest(unittest.TestCase):
       class Foo : public HeapObject {
        public:
         struct Bits : BitFieldGroup<Bits, uint32_t> {
-          using IsFooBit = base::BitField<bool, 0, 1, uint32_t>;
+          using IsFooBit = First<bool, 1>;
           using KindBits = IsFooBit::Next<Kind, 2>;
           using CountBits = KindBits::Next<int32_t, 5>;
+          using AlternativeBits = IsFooBit::Next<uint32_t, 31>;
         };
         Bits bits_;
       };
@@ -734,6 +738,7 @@ class BitFieldGroupTest(unittest.TestCase):
         ("IsFooBit", "bool", 0, 1),
         ("KindBits", "Kind", 1, 2),
         ("CountBits", "int32_t", 3, 5),
+        ("AlternativeBits", "uint32_t", 1, 31),
     ])
 
   def test_enclosing_classes_name_the_group(self):
@@ -742,7 +747,7 @@ class BitFieldGroupTest(unittest.TestCase):
       class Foo : public HeapObject {
        public:
         struct Bits : BitFieldGroup<Bits, uint8_t> {
-          using IsFooBit = base::BitField<bool, 0, 1, uint8_t>;
+          using IsFooBit = First<bool, 1>;
         };
         using FooBitFields = Bits;
         std::atomic<FooBitFields> aliased_;
@@ -822,6 +827,42 @@ class BitFieldGroupTest(unittest.TestCase):
           struct Bits : BitFieldGroup<Bits, uint8_t> {
             using IsFooBit = base::BitField<bool, 0, 1, uint8_t>;
             using Underlying = uint8_t;
+          };
+          Bits bits_;
+        };
+      """)
+
+  _STRONG_ALIAS = """
+    namespace base {
+    template <typename Tag, typename T>
+    class StrongAlias { T value_; };
+    }  // namespace base
+    using SharedFlag = base::StrongAlias<struct SharedFlagTag, bool>;
+    using Count = base::StrongAlias<struct CountTag, uint16_t>;
+  """
+
+  def test_strong_alias_bit_field_has_its_underlying_type(self):
+    (field,) = self._layouts(self._STRONG_ALIAS + """
+      class Foo : public HeapObject {
+       public:
+        struct Bits : BitFieldGroup<Bits, uint32_t> {
+          using IsSharedBit = base::BitField<SharedFlag, 0, 1, uint32_t>;
+          using CountBits = IsSharedBit::Next<Count, 4>;
+        };
+        Bits bits_;
+      };
+    """)["Foo"].fields
+    self.assertEqual([(b.cpp_name, b.type) for b in field.storage.bits],
+                     [("IsSharedBit", "bool"), ("CountBits", "uint16_t")])
+
+  def test_other_class_bit_field_type_is_fatal(self):
+    with self.assertRaisesRegex(LayoutError, "unsupported bit field type"):
+      self._layouts("""
+        struct Opaque { uint8_t v; };
+        class Foo : public HeapObject {
+         public:
+          struct Bits : BitFieldGroup<Bits, uint32_t> {
+            using OpaqueBits = base::BitField<Opaque, 0, 8, uint32_t>;
           };
           Bits bits_;
         };

@@ -1021,6 +1021,7 @@ CompileWithLiftoffAndGetDeoptInfo(wasm::NativeModule* native_module,
   // WasmCodeManager as a deopt was reached.
   wasm::UnpublishedWasmCode compiled_code =
       native_module->AddCompiledCode(result);
+  compiled_code.for_deopt = true;
   wasm::WasmCodeRefScope code_ref_scope;
   // TODO(mliedtke): This might unoptimize functions because they were inlined
   // into a function that now needs to deopt them while the optimized function
@@ -1235,19 +1236,10 @@ FrameDescription* Deoptimizer::DoComputeWasmLiftoffFrame(
           output_frame->SetSimd128Register(liftoff_iter->reg().simd128().code(),
                                            value.simd_value());
         } else if (!Is64() && liftoff_iter->is_gp_reg_pair()) {
-          intptr_t reg_value = kZapValue;
-          switch (value.kind()) {
-            case TranslatedValue::Kind::kInt32:
-              CHECK_EQ(liftoff_iter->kind(), wasm::ValueKind::kI64);
-              // Ensure that the upper half is zeroed out.
-              reg_value = static_cast<uint32_t>(value.int32_value());
-              break;
-            case TranslatedValue::Kind::kTagged:
-              reg_value = value.raw_literal().ptr();
-              break;
-            default:
-              UNREACHABLE();
-          }
+          CHECK_EQ(liftoff_iter->kind(), wasm::ValueKind::kI64);
+          CHECK_EQ(value.kind(), TranslatedValue::Kind::kInt32);
+          // Ensure that the upper half is zeroed out.
+          intptr_t reg_value = static_cast<uint32_t>(value.int32_value());
           int8_t reg = int64_lowering_is_low
                            ? liftoff_iter->reg().low_gp().code()
                            : liftoff_iter->reg().high_gp().code();

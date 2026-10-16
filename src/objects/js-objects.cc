@@ -84,7 +84,7 @@
 
 #if V8_ENABLE_WEBASSEMBLY
 #include "src/debug/debug-wasm-objects.h"
-#include "src/wasm/wasm-objects.h"
+#include "src/wasm/wasm-objects-inl.h"
 #endif  // V8_ENABLE_WEBASSEMBLY
 
 #ifdef V8_INTL_SUPPORT
@@ -328,7 +328,7 @@ Maybe<bool> JSReceiver::CheckPrivateNameStore(LookupIterator* it,
                   : MessageTemplate::kInvalidPrivateFieldReinitialization;
           RETURN_FAILURE(isolate,
                          GetShouldThrow(isolate, Nothing<ShouldThrow>()),
-                         NewTypeError(message, name_string, it->GetReceiver()));
+                         NewTypeError(message, name_string));
         }
         return Just(true);
       case LookupIterator::WASM_OBJECT:
@@ -339,7 +339,7 @@ Maybe<bool> JSReceiver::CheckPrivateNameStore(LookupIterator* it,
           RETURN_FAILURE(
               isolate, GetShouldThrow(isolate, Nothing<ShouldThrow>()),
               NewTypeError(MessageTemplate::kInvalidPrivateMemberWrite,
-                           name_string, it->GetReceiver()));
+                           name_string));
 
         } else if (it->ExtendingNonExtensible(
                        it->GetStoreTarget<JSReceiver>())) {
@@ -766,6 +766,17 @@ DirectHandle<String> JSReceiver::GetConstructorName(
 }
 
 // static
+Tagged<NativeContext> JSReceiver::GetCreationContext_Slow(Tagged<Map> map) {
+  // Currently only WasmCustomMaps use this slow path.
+#if V8_ENABLE_WEBASSEMBLY
+  DCHECK(IsWasmCustomMap(map));
+  return Cast<WasmCustomMap>(map)->native_context_for_wrapper();
+#else
+  UNREACHABLE();
+#endif  // V8_ENABLE_WEBASSEMBLY
+}
+
+// static
 MaybeDirectHandle<NativeContext> JSReceiver::GetFunctionRealm(
     DirectHandle<JSReceiver> receiver) {
   Isolate* isolate = Isolate::Current();
@@ -781,7 +792,10 @@ MaybeDirectHandle<NativeContext> JSReceiver::GetFunctionRealm(
       Tagged<JSProxy> proxy = Cast<JSProxy>(current);
       if (proxy->IsRevoked()) {
         AllowGarbageCollection allow_allocating_errors;
-        THROW_NEW_ERROR(isolate, NewTypeError(MessageTemplate::kProxyRevoked));
+        THROW_NEW_ERROR(
+            isolate, NewTypeError(MessageTemplate::kProxyRevoked,
+                                  isolate->factory()->NewStringFromAsciiChecked(
+                                      "GetFunctionRealm")));
       }
       current = Cast<JSReceiver>(proxy->target());
       continue;

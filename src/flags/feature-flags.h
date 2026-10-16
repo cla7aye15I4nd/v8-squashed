@@ -67,6 +67,9 @@
                                                                                \
   JS_FEATURE(harmony_shadow_realm, "harmony ShadowRealm")                      \
                                                                                \
+  JS_FEATURE(harmony_struct,                                                   \
+             "harmony structs, shared structs, and shared arrays")             \
+                                                                               \
   IF_INTL_ENABLED(JS_FEATURE, harmony_intl_best_fit_matcher,                   \
                   "Intl BestFitMatcher")                                       \
                                                                                \
@@ -123,6 +126,11 @@
   /* V8 side owner: leszeks */                                                 \
   INTERNAL_FEATURE(always_specialize_for_script_context,                       \
                    "always specialize for script contexts in optimized code")  \
+                                                                               \
+  /* V8 side owner: leszeks */                                                 \
+  INTERNAL_FEATURE(                                                            \
+      code_cache_source_hash_sha256,                                           \
+      "hashing code cache source string with SHA256 instead of string length") \
                                                                                \
   /* Reference-Typed Strings Proposal. */                                      \
   /* https://github.com/WebAssembly/stringref */                               \

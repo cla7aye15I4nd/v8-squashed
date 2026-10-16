@@ -332,6 +332,14 @@ selects.config_setting_group(
     ],
 )
 
+selects.config_setting_group(
+    name = "webassembly_on_arm64_simulator",
+    match_all = [
+        "@v8//bazel/config:v8_arm64_simulator",
+        ":is_v8_enable_webassembly",
+    ],
+)
+
 v8_flag(
     name = "v8_jitless",
     default = False,
@@ -914,6 +922,7 @@ filegroup(
         "src/base/functional/bind-internal.h",
         "src/base/functional/function-ref.h",
         "src/base/free_deleter.h",
+        "src/base/growing-circular-queue.h",
         "src/base/hashing.h",
         "src/base/hashmap.h",
         "src/base/hashmap-entry.h",
@@ -1518,6 +1527,7 @@ filegroup(
         "src/builtins/builtins.cc",
         "src/builtins/builtins-inl.h",
         "src/builtins/builtins.h",
+        "src/builtins/bytecodes-builtins-list.h",
         "src/builtins/builtins-abstract-module-source.cc",
         "src/builtins/builtins-api.cc",
         "src/builtins/builtins-array.cc",
@@ -2592,10 +2602,10 @@ filegroup(
         "src/roots/roots.h",
         "src/roots/roots-inl.h",
         "src/roots/static-roots.h",
-        "src/roots/static-roots-intl-nowasm.h",
-        "src/roots/static-roots-intl-wasm.h",
-        "src/roots/static-roots-nointl-nowasm.h",
-        "src/roots/static-roots-nointl-wasm.h",
+        "src/gen/intl-nowasm/static-roots.h",
+        "src/gen/intl-wasm/static-roots.h",
+        "src/gen/nointl-nowasm/static-roots.h",
+        "src/gen/nointl-wasm/static-roots.h",
         "src/runtime/runtime.cc",
         "src/runtime/runtime.h",
         "src/runtime/runtime-array.cc",
@@ -3061,7 +3071,7 @@ filegroup(
         ],
         "//conditions:default": [],
     }) + select({
-        "@v8//bazel/config:v8_arm64_simulator": [
+        ":webassembly_on_arm64_simulator": [
             "src/trap-handler/handler-outside-simulator.cc",
             "src/trap-handler/trap-handler-simulator.h",
         ],
@@ -3099,6 +3109,7 @@ filegroup(
             "src/maglev/maglev-interpreter-frame-state.h",
             "src/maglev/maglev-ir-inl.h",
             "src/maglev/maglev-ir.h",
+            "src/maglev/maglev-kna-map.h",
             "src/maglev/maglev-kna-processor.h",
             "src/maglev/maglev-map-inference.h",
             "src/maglev/maglev-node-type.h",
@@ -3378,6 +3389,8 @@ filegroup(
         "src/objects/js-plural-rules.cc",
         "src/objects/js-plural-rules.h",
         "src/objects/js-plural-rules-inl.h",
+        "src/objects/js-plural-rules-internal.cc",
+        "src/objects/js-plural-rules-internal.h",
         "src/objects/js-relative-time-format.cc",
         "src/objects/js-relative-time-format.h",
         "src/objects/js-relative-time-format-inl.h",

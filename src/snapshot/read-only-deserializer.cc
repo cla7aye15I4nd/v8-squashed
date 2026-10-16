@@ -207,6 +207,9 @@ class ObjectPostProcessor final {
       : isolate_(isolate), embedded_data_(EmbeddedData::FromBlob(isolate_)) {}
 
   void Finalize() {
+    if (Builtins::kCodeObjectsAreInROSpace) {
+      isolate_->builtins()->MarkInitialized();
+    }
 #ifdef V8_ENABLE_SANDBOX
     std::vector<ReadOnlyArtifacts::ExternalPointerRegistryEntry> registry;
     registry.reserve(external_pointer_slots_.size());
@@ -393,13 +396,14 @@ class ObjectPostProcessor final {
     DCHECK(o->is_builtin());
     DCHECK(!o->has_instruction_stream());
     Builtin builtin = o->builtin_id();
+    isolate_->builtins()->set_code(builtin, o);
     // Mark disabled builtins as such (RO space serializer resets this flag).
     DCHECK(!o->is_disabled_builtin());
     if (Builtins::IsDisabled(builtin)) {
       o->set_is_disabled_builtin(true);
     }
     o->SetInstructionStartForOffHeapBuiltin(
-        isolate_, EmbeddedData::FromBlob(isolate_).InstructionStartOf(builtin));
+        isolate_, embedded_data_.InstructionStartOf(builtin));
 
 #if V8_ENABLE_GEARBOX
     UpdateGearboxPlaceholderBuiltin(o);
@@ -441,6 +445,7 @@ void ReadOnlyDeserializer::PostProcessNewObjects() {
 #ifdef V8_ENABLE_SANDBOX
   std::vector<ReadOnlyArtifacts::TrustedPointerRegistryEntry>
       trusted_pointer_entries;
+  trusted_pointer_entries.reserve(Builtins::kBuiltinCount);
 #endif  // V8_ENABLE_SANDBOX
   for (Tagged<HeapObject> o = it.Next(); !o.is_null(); o = it.Next()) {
     if (IsInaccessible(o)) continue;

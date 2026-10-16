@@ -122,9 +122,9 @@ void ResetFeedbackVectorOsrUrgency(MacroAssembler* masm,
   DCHECK(!AreAliased(feedback_vector, scratch));
   __ LoadU8(scratch, FieldMemOperand(feedback_vector,
                                      offsetof(FeedbackVector, osr_state_)));
-  __ andi(
-      scratch, scratch,
-      Operand(static_cast<uint8_t>(~FeedbackVector::OsrUrgencyBits::kMask)));
+  __ andi(scratch, scratch,
+          Operand(static_cast<uint8_t>(
+              ~FeedbackVector::OsrState::OsrUrgencyBits::kMask)));
   __ StoreU8(scratch, FieldMemOperand(feedback_vector,
                                       offsetof(FeedbackVector, osr_state_)));
 }
@@ -4210,8 +4210,10 @@ void JSToWasmWrapperHelper(MacroAssembler* masm, wasm::Promise mode) {
       // Push parameter
       {
         __ AddS64(params_end, params_end, Operand(-kSystemPointerSize));
-        __ LoadU64(r0, MemOperand(params_end));
-        __ push(r0);
+        UseScratchRegisterScope temps(masm);
+        Register scratch = temps.Acquire();
+        __ LoadU64(scratch, MemOperand(params_end));
+        __ push(scratch);
       }
       __ jmp(&loop_start);
 
@@ -4397,9 +4399,13 @@ void SwitchToTheCentralStackIfNeeded(MacroAssembler* masm, Register argc_input,
 
   // When we switch stack we leave home space allocated on the old stack.
   // Allocate home space on the central stack to prevent stack corruption.
-  __ li(r0, Operand::Zero());
-  __ StoreU64WithUpdate(
-      r0, MemOperand(sp, -kNumRequiredStackFrameSlots * kSystemPointerSize));
+  {
+    UseScratchRegisterScope temps(masm);
+    Register scratch = temps.Acquire();
+    __ li(scratch, Operand::Zero());
+    __ StoreU64WithUpdate(scratch, MemOperand(sp, -kNumRequiredStackFrameSlots *
+                                                      kSystemPointerSize));
+  }
 
   // Update the sp saved in the frame.
   // It will be used to calculate the callee pc during GC.
@@ -4455,8 +4461,6 @@ void Builtins::Generate_CEntry(MacroAssembler* masm, int result_size,
   static constexpr Register argc_input = r3;
   static constexpr Register target_fun = r15;  // C callee-saved
   static constexpr Register argv = r4;
-  UseScratchRegisterScope temps(masm);
-  Register scratch = temps.Acquire();
   static constexpr Register argc_sav = r14;  // C callee-saved
 
   __ mr(target_fun, argv);
@@ -4553,9 +4557,12 @@ void Builtins::Generate_CEntry(MacroAssembler* masm, int result_size,
   // should have returned the exception sentinel.
   if (v8_flags.debug_code) {
     Label okay;
+    UseScratchRegisterScope debug_temps(masm);
+    Register scratch = debug_temps.Acquire();
+    Register scratch2 = debug_temps.Acquire();
     __ LoadU64(scratch, __ AsMemOperand(IsolateFieldId::kException));
-    __ LoadRoot(r0, RootIndex::kTheHoleValue);
-    __ CompareTagged(r0, scratch);
+    __ LoadRoot(scratch2, RootIndex::kTheHoleValue);
+    __ CompareTagged(scratch2, scratch);
     // Cannot use check here as it attempts to generate call into runtime.
     __ beq(&okay);
     __ stop();
@@ -4601,6 +4608,9 @@ void Builtins::Generate_CEntry(MacroAssembler* masm, int result_size,
   __ beq(&skip);
   __ StoreU64(cp, MemOperand(fp, StandardFrameConstants::kContextOffset));
   __ bind(&skip);
+
+  UseScratchRegisterScope temps(masm);
+  Register scratch = temps.Acquire();
 
   // Clear c_entry_fp, like we do in `LeaveExitFrame`.
   __ mov(scratch, Operand::Zero());

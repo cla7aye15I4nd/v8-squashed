@@ -453,29 +453,6 @@ MaybeHandle<String> MessageFormatter::TryFormat(
 
   IncrementalStringBuilder builder(isolate);
 
-  // TODO(14386): Get this list empty.
-  static constexpr MessageTemplate kTemplatesWithMismatchedArguments[] = {
-      MessageTemplate::kConstAssign,
-      MessageTemplate::kIncompatibleMethodReceiver,
-      MessageTemplate::kInvalidArgument,
-      MessageTemplate::kInvalidArrayLength,
-      MessageTemplate::kInvalidDataViewLength,
-      MessageTemplate::kInvalidPrivateBrandReinitialization,
-      MessageTemplate::kInvalidPrivateFieldReinitialization,
-      MessageTemplate::kInvalidPrivateMemberWrite,
-      MessageTemplate::kInvalidWeakMapKey,
-      MessageTemplate::kInvalidWeakSetValue,
-      MessageTemplate::kIteratorReduceNoInitial,
-      MessageTemplate::kNotIterable,
-      MessageTemplate::kNotTypedArray,
-      MessageTemplate::kProxyNonObject,
-      MessageTemplate::kProxyPrivate,
-      MessageTemplate::kProxyRevoked,
-      MessageTemplate::kProxyTrapReturnedFalsishFor,
-      MessageTemplate::kReduceNoInitial,
-      MessageTemplate::kSpreadIteratorSymbolNonCallable,
-      MessageTemplate::kUndefinedOrNullToObject};
-
   base::Vector<const DirectHandle<String>> remaining_args = args;
   for (const char* c = template_string; *c != '\0'; c++) {
     if (*c == '%') {
@@ -483,29 +460,19 @@ MaybeHandle<String> MessageFormatter::TryFormat(
       if (*(c + 1) == '%') {
         c++;
         builder.AppendCharacter('%');
+      } else if (remaining_args.empty()) {
+        FATAL("Missing argument to template (got %zu): %s", args.size(),
+              template_string);
       } else {
-        // TODO(14386): Remove this fallback.
-        if (remaining_args.empty()) {
-          if (std::count(std::begin(kTemplatesWithMismatchedArguments),
-                         std::end(kTemplatesWithMismatchedArguments), index)) {
-            builder.AppendCString("undefined");
-          } else {
-            FATAL("Missing argument to template (got %zu): %s", args.size(),
-                  template_string);
-          }
-        } else {
-          DirectHandle<String> arg = remaining_args[0];
-          remaining_args += 1;
-          builder.AppendString(arg);
-        }
+        DirectHandle<String> arg = remaining_args[0];
+        remaining_args += 1;
+        builder.AppendString(arg);
       }
     } else {
       builder.AppendCharacter(*c);
     }
   }
-  if (!remaining_args.empty() &&
-      std::count(std::begin(kTemplatesWithMismatchedArguments),
-                 std::end(kTemplatesWithMismatchedArguments), index) == 0) {
+  if (!remaining_args.empty()) {
     FATAL("Too many arguments to template (expected %zu, got %zu): %s",
           args.size() - remaining_args.size(), args.size(), template_string);
   }
@@ -965,8 +932,12 @@ Tagged<Object> ErrorUtils::ThrowSpreadArgError(Isolate* isolate,
     }
   }
 
-  isolate->ThrowAt(isolate->factory()->NewTypeError(id, callsite, object),
-                   &location);
+  if (id == MessageTemplate::kSpreadIteratorSymbolNonCallable) {
+    isolate->ThrowAt(isolate->factory()->NewTypeError(id), &location);
+  } else {
+    isolate->ThrowAt(isolate->factory()->NewTypeError(id, callsite, object),
+                     &location);
+  }
   return ReadOnlyRoots(isolate).exception();
 }
 

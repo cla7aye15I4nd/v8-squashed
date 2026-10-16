@@ -2953,6 +2953,62 @@ UNINITIALIZED_TEST(CodeSerializerExternalStringResourceDataRestored) {
   isolate->Dispose();
 }
 
+// The resource of an external string is restored from the code cache.
+UNINITIALIZED_TEST(CodeSerializerExternalStringRoundTrip) {
+  // Off-thread deserialization doesn't support external strings with API
+  // resources.
+  v8_flags.stress_background_compile = false;
+  v8::Isolate::CreateParams create_params;
+  create_params.array_buffer_allocator = CcTest::array_buffer_allocator();
+  create_params.external_references = external_code_cache_references;
+
+  v8::ScriptCompiler::CachedData* cache;
+  v8::Isolate* isolate1 = v8::Isolate::New(create_params);
+  {
+    v8::Isolate::Scope isolate_scope(isolate1);
+    v8::HandleScope scope(isolate1);
+    v8::Local<v8::Context> context = v8::Context::New(isolate1);
+    v8::Context::Scope context_scope(context);
+
+    v8::Local<v8::String> name_string =
+        v8::String::NewExternalOneByte(isolate1,
+                                       &external_code_cache_name_resource)
+            .ToLocalChecked();
+    v8::ScriptCompiler::Source source(v8_str(kExternalCodeCacheSource),
+                                      {name_string});
+    v8::Local<v8::UnboundScript> script =
+        v8::ScriptCompiler::CompileUnboundScript(
+            isolate1, &source, v8::ScriptCompiler::kEagerCompile)
+            .ToLocalChecked();
+    cache = v8::ScriptCompiler::CreateCodeCache(script);
+  }
+  isolate1->Dispose();
+
+  v8::Isolate* isolate2 = v8::Isolate::New(create_params);
+  {
+    v8::Isolate::Scope isolate_scope(isolate2);
+    v8::HandleScope scope(isolate2);
+    v8::Local<v8::Context> context = v8::Context::New(isolate2);
+    v8::Context::Scope context_scope(context);
+
+    // Without an origin, the script name is taken from the code cache.
+    v8::ScriptCompiler::Source source(v8_str(kExternalCodeCacheSource), cache);
+    v8::Local<v8::UnboundScript> script =
+        v8::ScriptCompiler::CompileUnboundScript(
+            isolate2, &source, v8::ScriptCompiler::kConsumeCodeCache)
+            .ToLocalChecked();
+    CHECK(!source.GetCachedData()->rejected);
+    v8::Local<v8::Value> name = script->GetScriptName();
+    CHECK(name->IsString());
+    CHECK(name.As<v8::String>()->GetExternalOneByteStringResource() ==
+          &external_code_cache_name_resource);
+    v8::Local<v8::Value> result =
+        script->BindToCurrentContext()->Run(context).ToLocalChecked();
+    CHECK(result->StrictEquals(v8_str("abcdef")));
+  }
+  isolate2->Dispose();
+}
+
 TEST(CodeSerializerLargeExternalString) {
   LocalContext context;
   Isolate* isolate = CcTest::i_isolate();
@@ -7204,6 +7260,68 @@ UNINITIALIZED_TEST(NoStackFrameCacheSerialization) {
 }
 
 namespace {
+void CheckObjectsAreInSharedHeap(Isolate* isolate) {
+  Heap* heap = isolate->heap();
+  SetCurrentIsolateScope isolate_scope(isolate);
+  SetCurrentLocalHeapScope local_heap_scope(isolate);
+  HeapObjectIterator iterator(heap);
+  DisallowGarbageCollection no_gc;
+  for (Tagged<HeapObject> obj = iterator.Next(); !obj.is_null();
+       obj = iterator.Next()) {
+    const bool expected_in_shared_old =
+        heap->MustBeInSharedOldSpace(obj) ||
+        (IsString(obj) && String::IsInPlaceInternalizable(Cast<String>(obj)));
+    if (expected_in_shared_old) {
+      CHECK(HeapLayout::InAnySharedSpace(obj));
+    }
+  }
+}
+}  // namespace
+
+UNINITIALIZED_TEST(SharedStrings) {
+  // Test that deserializing with --shared-string-table deserializes into the
+  // shared Isolate.
+
+  if (!V8_CAN_CREATE_SHARED_HEAP_BOOL) return;
+  // In multi-cage mode we create one cage per isolate
+  // and we don't share objects between cages.
+  if (COMPRESS_POINTERS_IN_MULTIPLE_CAGES_BOOL) return;
+
+  // Make all the flags that require a shared heap false before creating the
+  // isolate to serialize.
+  v8_flags.shared_string_table = false;
+  v8_flags.harmony_struct = false;
+
+  v8::Isolate* isolate_to_serialize = TestSerializer::NewIsolateInitialized();
+  StartupBlobs blobs = Serialize(isolate_to_serialize);
+  isolate_to_serialize->Dispose();
+
+  v8_flags.shared_string_table = true;
+  i::FlagList::EnforceFlagImplications();
+
+  v8::Isolate* isolate1 = TestSerializer::NewIsolateFromBlob(blobs);
+  v8::Isolate* isolate2 = TestSerializer::NewIsolateFromBlob(blobs);
+  Isolate* i_isolate1 = reinterpret_cast<Isolate*>(isolate1);
+  Isolate* i_isolate2 = reinterpret_cast<Isolate*>(isolate2);
+
+  CHECK_EQ(i_isolate1->string_table(), i_isolate2->string_table());
+  i_isolate2->main_thread_local_heap()->ExecuteMainThreadWhileParked(
+      [i_isolate1]() { CheckObjectsAreInSharedHeap(i_isolate1); });
+
+  i_isolate1->main_thread_local_heap()->ExecuteMainThreadWhileParked(
+      [i_isolate2]() { CheckObjectsAreInSharedHeap(i_isolate2); });
+
+  // Because both isolate1 and isolate2 are considered running on the main
+  // thread, one must be parked to avoid deadlock in the shared heap
+  // verification that may happen on client heap disposal.
+  i_isolate1->main_thread_local_heap()->ExecuteMainThreadWhileParked(
+      [isolate2]() { isolate2->Dispose(); });
+  isolate1->Dispose();
+
+  FreeCurrentEmbeddedBlob();
+}
+
+namespace {
 
 class DebugBreakCounter : public v8::debug::DebugDelegate {
  public:
@@ -7425,6 +7543,66 @@ UNINITIALIZED_TEST(SnapshotCreatorScriptContextCellsMismatch) {
     isolate->Dispose();
   }
   delete[] blob.data;
+}
+
+UNINITIALIZED_TEST(SerializeWeakRootArrayConstantsLeak) {
+  DisableEmbeddedBlobRefcounting();
+  v8::StartupData blob;
+  {
+    SnapshotCreatorParams testing_params;
+    v8::SnapshotCreator creator(testing_params.create_params);
+    v8::Isolate* isolate = creator.GetIsolate();
+    {
+      v8::HandleScope handle_scope(isolate);
+      v8::Local<v8::Context> context = v8::Context::New(isolate);
+      v8::Context::Scope context_scope(context);
+
+      i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
+      i::DirectHandle<i::WeakArrayList> list =
+          i_isolate->factory()->NewWeakArrayList(2);
+      list->Set(0, i::MakeWeak(i::Cast<i::HeapObject>(
+                       i_isolate->root(i::RootIndex::kHeapNumberMap))));
+      i::DirectHandle<i::JSObject> strong_obj =
+          i_isolate->factory()->NewJSObjectWithNullProto();
+      list->Set(1, *strong_obj);
+
+      i::DirectHandle<i::Context> i_context =
+          v8::Utils::OpenDirectHandle(*context);
+      i_context->native_context()->set_retained_maps(*list);
+
+      creator.SetDefaultContext(context);
+    }
+    blob =
+        creator.CreateBlob(v8::SnapshotCreator::FunctionCodeHandling::kClear);
+  }
+
+  {
+    SnapshotCreatorParams testing_params(nullptr, &blob);
+    v8::Isolate* isolate = v8::Isolate::New(testing_params.create_params);
+    {
+      v8::Isolate::Scope isolate_scope(isolate);
+      v8::HandleScope handle_scope(isolate);
+      v8::Local<v8::Context> context = v8::Context::New(isolate);
+      v8::Context::Scope context_scope(context);
+
+      i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
+      i::DirectHandle<i::Context> i_context =
+          v8::Utils::OpenDirectHandle(*context);
+      i::Tagged<i::WeakArrayList> list = i::Cast<i::WeakArrayList>(
+          i_context->native_context()->retained_maps());
+
+      i::Tagged<i::MaybeObject> elem0 = list->Get(0);
+      CHECK(elem0.IsWeak());
+      CHECK_EQ(elem0.GetHeapObjectAssumeWeak(),
+               i_isolate->root(i::RootIndex::kHeapNumberMap));
+
+      i::Tagged<i::MaybeObject> elem1 = list->Get(1);
+      CHECK(elem1.IsStrong());
+    }
+    isolate->Dispose();
+  }
+  delete[] blob.data;
+  FreeCurrentEmbeddedBlob();
 }
 
 }  // namespace internal
