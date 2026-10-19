@@ -49,25 +49,26 @@ V8_OBJECT class Module : public HeapObject {
   //
   //   kEvaluating -> kEvaluatingAsync -> kEvaluated
   //   kEvaluating -> kEvaluated
-  //   kEvaluating -> kErrored
-  //   kEvaluatingAsync -> kErrored
+  //   kEvaluating -> kEvaluatedError
+  //   kEvaluatingAsync -> kEvaluatedError
   //
   // kEvaluating means the module is on the DFS stack of an in-progress
-  // Evaluate() call. kErrored is the spec's EVALUATED with a non-empty
+  // Evaluate() call. kEvaluatedError is the spec's EVALUATED with a non-empty
   // [[EvaluationError]]: {exception} holds the error, or null if a termination
   // exception aborted evaluation. When Evaluate() fails, every module on its
-  // DFS stack becomes kErrored.
+  // DFS stack becomes kEvaluatedError.
   //
   // {top_level_capability} is the promise returned by Evaluate(). Evaluate()
   // redirects to the cycle root of an already evaluated strongly connected
   // component, so the capability lives on cycle roots (and on synthetic
   // modules) and mirrors their status: pending while kEvaluating or
   // kEvaluatingAsync, fulfilled when kEvaluated, and rejected with {exception}
-  // when kErrored (dropped to undefined if termination prevented rejecting it,
-  // in which case a later Evaluate() materializes a fresh capability rejected
-  // with null). These are steady-state invariants: JSPromise resolution runs
-  // embedder hooks before the promise changes state, so they are asserted where
-  // the capability is used, not in the heap verifier.
+  // when kEvaluatedError (dropped to undefined if termination prevented
+  // rejecting it, in which case a later Evaluate() materializes a fresh
+  // capability rejected with null). These are steady-state invariants:
+  // JSPromise resolution runs embedder hooks before the promise changes state,
+  // so they are asserted where the capability is used, not in the heap
+  // verifier.
   enum Status : int {
     kFirst,
 
@@ -79,9 +80,9 @@ V8_OBJECT class Module : public HeapObject {
     kEvaluating,
     kEvaluatingAsync,
     kEvaluated,
-    kErrored,
+    kEvaluatedError,
 
-    kLast = kErrored
+    kLast = kEvaluatedError
   };
 
   template <Status... kStatuses>
@@ -92,8 +93,8 @@ V8_OBJECT class Module : public HeapObject {
   // checks and the dispatch in MatchState.
   using AllStatuses =
       StatusList<kUnlinked, kPreLinking, kLinking, kLinked, kEvaluating,
-                 kEvaluatingAsync, kEvaluated, kErrored>;
-  static_assert(AllStatuses::kSize == kErrored + 1);
+                 kEvaluatingAsync, kEvaluated, kEvaluatedError>;
+  static_assert(AllStatuses::kSize == kEvaluatedError + 1);
 
   static constexpr bool IsValidTransition(Status from, Status to) {
     switch (from) {
@@ -106,11 +107,12 @@ V8_OBJECT class Module : public HeapObject {
       case kLinked:
         return to == kEvaluating;
       case kEvaluating:
-        return to == kEvaluatingAsync || to == kEvaluated || to == kErrored;
+        return to == kEvaluatingAsync || to == kEvaluated ||
+               to == kEvaluatedError;
       case kEvaluatingAsync:
-        return to == kEvaluated || to == kErrored;
+        return to == kEvaluated || to == kEvaluatedError;
       case kEvaluated:
-      case kErrored:
+      case kEvaluatedError:
         return false;
     }
   }
@@ -130,7 +132,7 @@ V8_OBJECT class Module : public HeapObject {
   // Human-readable name of [status]; "<invalid>" for out-of-range values.
   static const char* StatusString(Module::Status status);
 
-  // The exception in the case {status} is kErrored.
+  // The exception in the case {status} is kEvaluatedError.
   Tagged<Object> GetException();
   inline Tagged<Object> exception() const;
 
@@ -160,6 +162,12 @@ V8_OBJECT class Module : public HeapObject {
   static V8_WARN_UNUSED_RESULT MaybeDirectHandle<JSPromise> Evaluate(
       Isolate* isolate, Handle<Module> module);
 
+  // Implementation of spec abstract operation EvaluateModuleSync. Throws and
+  // returns false if the module is not ready for synchronous execution or if
+  // evaluation rejects.
+  static V8_WARN_UNUSED_RESULT bool EvaluateModuleSync(Isolate* isolate,
+                                                       Handle<Module> module);
+
   // Get the namespace object for [module].  If it doesn't exist yet, it is
   // created.
   static Handle<Cell> GetModuleNamespaceCell(
@@ -170,8 +178,6 @@ V8_OBJECT class Module : public HeapObject {
       ModuleImportPhase phase = ModuleImportPhase::kEvaluation);
 
   inline Tagged<ObjectHashTable> exports() const;
-  inline void set_exports(Tagged<ObjectHashTable> value,
-                          WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
   inline int hash() const;
   inline void set_hash(int value);
@@ -215,20 +221,20 @@ V8_OBJECT class Module : public HeapObject {
     return UncheckedCast<InState<ModuleT, kTo>>(module);
   }
 
-  // Transitions from kEvaluating or kEvaluatingAsync to kErrored. Records
-  // [error] as {exception} (null for a termination exception) and, for source
-  // text modules, drops the generator and ends async evaluation.
+  // Transitions from kEvaluating or kEvaluatingAsync to kEvaluatedError.
+  // Records [error] as {exception} (null for a termination exception) and, for
+  // source text modules, drops the generator and ends async evaluation.
   template <template <typename> class Holder, typename ModuleT,
             Status... kStates>
-    requires((IsValidTransition(kStates, kErrored) && ...) &&
+    requires((IsValidTransition(kStates, kEvaluatedError) && ...) &&
              (std::is_same_v<Holder<ModuleT>, Handle<ModuleT>> ||
               std::is_same_v<Holder<ModuleT>, DirectHandle<ModuleT>>))
-  static inline Holder<InState<ModuleT, kErrored>> RecordError(
+  static inline Holder<InState<ModuleT, kEvaluatedError>> RecordError(
       Isolate* isolate, Holder<InState<ModuleT, kStates...>> module,
       DirectHandle<Object> error) {
     CHECK(((module->status() == kStates) || ...));
     module->RecordErrorInternal(isolate, *error);
-    return UncheckedCast<InState<ModuleT, kErrored>>(module);
+    return UncheckedCast<InState<ModuleT, kEvaluatedError>>(module);
   }
 
   // Dispatches [module] to the handler in [handlers...] whose
@@ -274,6 +280,12 @@ V8_OBJECT class Module : public HeapObject {
   static void ResetGraph(Isolate* isolate, Handle<Module> module);
 
  private:
+  inline void set_exports(Tagged<ObjectHashTable> value,
+                          WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  // Once a module namespace (normal or deferred) has been created in
+  // GetModuleNamespace, all star exports have been fetched and {exports} is
+  // finalized (must not be mutated or rehashed as ICs index into it).
+  inline bool ExportsFinalized() const;
   inline void set_status(int value);
   inline void set_exception(Tagged<Object> value,
                             WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
@@ -349,13 +361,29 @@ class Module::InState : public ModuleT {
   static_assert(std::is_base_of_v<Module, ModuleT>);
 
   template <Status... kAllowed>
-  static consteval bool IsAllowed() {
-    return std::is_same_v<ModuleT, SourceTextModule> &&
-           (IsStateIn<kAllowed...>(kStates) && ...);
+  static consteval bool IsModuleAllowed() {
+    return (IsStateIn<kAllowed...>(kStates) && ...);
   }
 
+  template <Status... kAllowed>
+  static consteval bool IsAllowed() {
+    return std::is_same_v<ModuleT, SourceTextModule> &&
+           IsModuleAllowed<kAllowed...>();
+  }
+
+  inline void set_exports(Tagged<ObjectHashTable> value,
+                          WriteBarrierMode mode = UPDATE_WRITE_BARRIER)
+    requires(IsModuleAllowed<kPreLinking, kLinking>());
+  inline void set_star_exports(Tagged<ObjectHashTable> value,
+                               WriteBarrierMode mode = UPDATE_WRITE_BARRIER)
+    requires(IsAllowed<kLinking, kLinked, kEvaluating, kEvaluatingAsync,
+                       kEvaluated, kEvaluatedError>());
+  inline bool ExportsFinalized() const
+    requires(IsModuleAllowed<kLinking, kLinked, kEvaluating, kEvaluatingAsync,
+                             kEvaluated, kEvaluatedError>());
+
   inline Tagged<SharedFunctionInfo> sfi() const
-    requires(IsAllowed<kUnlinked, kPreLinking, kErrored>());
+    requires(IsAllowed<kUnlinked, kPreLinking, kEvaluatedError>());
   inline Tagged<JSFunction> function() const
     requires(IsAllowed<kLinking>());
   inline Tagged<JSGeneratorObject> generator() const
@@ -368,7 +396,7 @@ class Module::InState : public ModuleT {
   inline Handle<SourceTextModule> GetCycleRoot(Isolate* isolate) const
     requires(IsAllowed<kEvaluatingAsync, kEvaluated>());
   inline MaybeHandle<SourceTextModule> TryGetCycleRoot(Isolate* isolate) const
-    requires(IsAllowed<kErrored>());
+    requires(IsAllowed<kEvaluatedError>());
 
   inline int dfs_index() const
     requires(IsAllowed<kLinking, kEvaluating>());
@@ -394,12 +422,11 @@ class Module::InState : public ModuleT {
 
 template <typename ModuleT, Module::Status... kStates>
 struct CastTraits<Module::InState<ModuleT, kStates...>> {
-  template <typename FromModuleT, Module::Status... kFromStates>
-    requires((Module::IsStateIn<kStates...>(kFromStates) && ...))
-  static inline bool AllowFrom(
-      Tagged<Module::InState<FromModuleT, kFromStates...>> value) {
-    DCHECK(Module::IsStateIn<kStates...>(value->status()));
-    if constexpr (std::is_base_of_v<ModuleT, FromModuleT>) {
+  template <typename From>
+    requires(std::is_base_of_v<Module, From>)
+  static inline bool AllowFrom(Tagged<From> value) {
+    if (!Module::IsStateIn<kStates...>(value->status())) return false;
+    if constexpr (std::is_base_of_v<ModuleT, From>) {
       return true;
     } else {
       return Is<ModuleT>(value);

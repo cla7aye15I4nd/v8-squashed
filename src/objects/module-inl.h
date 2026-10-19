@@ -8,6 +8,7 @@
 #include "src/objects/module.h"
 // Include the non-inl header before the rest of the headers.
 
+#include "src/objects/cell-inl.h"
 #include "src/objects/js-promise-inl.h"
 #include "src/objects/oddball-predicates-inl.h"
 #include "src/objects/scope-info.h"
@@ -154,10 +155,39 @@ decltype(auto) Module::MatchState(Holder<ModuleT> module,
     DISPATCH_STATE(kEvaluating)
     DISPATCH_STATE(kEvaluatingAsync)
     DISPATCH_STATE(kEvaluated)
-    DISPATCH_STATE(kErrored)
+    DISPATCH_STATE(kEvaluatedError)
   }
 #undef DISPATCH_STATE
   FatalUnexpectedStatus(status, kHandledMask);
+}
+
+template <typename ModuleT, Module::Status... kStates>
+void Module::InState<ModuleT, kStates...>::set_exports(
+    Tagged<ObjectHashTable> value, WriteBarrierMode mode)
+  requires(IsModuleAllowed<kPreLinking, kLinking>())
+{
+  DCHECK(IsStateIn<kStates...>(this->status()));
+  DCHECK(!Module::ExportsFinalized());
+  Module::set_exports(value, mode);
+}
+
+template <typename ModuleT, Module::Status... kStates>
+void Module::InState<ModuleT, kStates...>::set_star_exports(
+    Tagged<ObjectHashTable> value, WriteBarrierMode mode)
+  requires(IsAllowed<kLinking, kLinked, kEvaluating, kEvaluatingAsync,
+                     kEvaluated, kEvaluatedError>())
+{
+  DCHECK(IsStateIn<kStates...>(this->status()));
+  Module::set_exports(value, mode);
+}
+
+template <typename ModuleT, Module::Status... kStates>
+bool Module::InState<ModuleT, kStates...>::ExportsFinalized() const
+  requires(IsModuleAllowed<kLinking, kLinked, kEvaluating, kEvaluatingAsync,
+                           kEvaluated, kEvaluatedError>())
+{
+  DCHECK(IsStateIn<kStates...>(this->status()));
+  return Module::ExportsFinalized();
 }
 
 template <typename ModuleT, Module::Status... kStates>
@@ -180,7 +210,7 @@ Handle<SourceTextModule> Module::InState<ModuleT, kStates...>::GetCycleRoot(
 template <typename ModuleT, Module::Status... kStates>
 MaybeHandle<SourceTextModule>
 Module::InState<ModuleT, kStates...>::TryGetCycleRoot(Isolate* isolate) const
-  requires(IsAllowed<kErrored>())
+  requires(IsAllowed<kEvaluatedError>())
 {
   DCHECK(IsStateIn<kStates...>(this->status()));
   Tagged<UnionOf<SourceTextModule, TheHole>> root = this->cycle_root();
@@ -288,6 +318,7 @@ void SourceTextModule::DecrementPendingAsyncDependencies() {
 
 Tagged<ObjectHashTable> Module::exports() const { return exports_.load(); }
 void Module::set_exports(Tagged<ObjectHashTable> value, WriteBarrierMode mode) {
+  CHECK(!ExportsFinalized());
   exports_.store(this, value, mode);
 }
 
@@ -313,6 +344,16 @@ Tagged<UnionOf<Cell, Undefined>> Module::deferred_module_namespace() const {
 void Module::set_deferred_module_namespace(
     Tagged<UnionOf<Cell, Undefined>> value, WriteBarrierMode mode) {
   deferred_module_namespace_.store(this, value, mode);
+}
+
+bool Module::ExportsFinalized() const {
+  bool res =
+      (!IsUndefined(module_namespace()) &&
+       IsJSModuleNamespace(Cast<Cell>(module_namespace())->value())) ||
+      (!IsUndefined(deferred_module_namespace()) &&
+       IsJSModuleNamespace(Cast<Cell>(deferred_module_namespace())->value()));
+  DCHECK_IMPLIES(res, status() >= kLinking);
+  return res;
 }
 
 Tagged<Module> JSModuleNamespace::module() const { return module_.load(); }

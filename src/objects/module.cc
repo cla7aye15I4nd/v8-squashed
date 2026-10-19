@@ -85,8 +85,8 @@ const char* Module::StatusString(Module::Status status) {
       return "EvaluatingAsync";
     case Module::kEvaluated:
       return "Evaluated";
-    case Module::kErrored:
-      return "Errored";
+    case Module::kEvaluatedError:
+      return "EvaluatedError";
   }
   // Reached only with a corrupted status; this function is used to report
   // exactly that, so it must not crash itself.
@@ -98,7 +98,7 @@ void Module::FatalUnexpectedStatus(Status status, uint32_t status_mask) {
   std::stringstream expected;
   for (int s = kFirst; s <= kLast; ++s) {
     if ((status_mask & (uint32_t{1} << s)) == 0) continue;
-    if (expected.str().empty()) {
+    if (!expected.str().empty()) {
       expected << ", ";
     }
     expected << StatusString(static_cast<Status>(s));
@@ -130,7 +130,7 @@ void Module::RecordErrorInternal(Isolate* isolate, Tagged<Object> error) {
     // evaluating.
     self->set_code(self->GetSharedFunctionInfo());
   }
-  SetStatusInternal(Module::kErrored);
+  SetStatusInternal(Module::kEvaluatedError);
   if (isolate->is_catchable_by_javascript(error)) {
     set_exception(error);
   } else {
@@ -143,7 +143,7 @@ void Module::ResetGraph(Isolate* isolate, Handle<Module> module) {
   MatchState(
       module,
       [](DirectHandle<InState<Module, kUnlinked, kLinked, kEvaluatingAsync,
-                              kEvaluated, kErrored>>
+                              kEvaluated, kEvaluatedError>>
              m) {
 #ifdef DEBUG
         if (Tagged<SourceTextModule> stm; TryCast(*m, &stm)) {
@@ -205,7 +205,7 @@ void Module::Reset(
 
 Tagged<Object> Module::GetException() {
   DisallowGarbageCollection no_gc;
-  DCHECK_EQ(status(), Module::kErrored);
+  DCHECK_EQ(status(), Module::kEvaluatedError);
   DCHECK(!IsTheHole(exception()));
   return exception();
 }
@@ -215,17 +215,20 @@ MaybeHandle<Cell> Module::ResolveExport(Isolate* isolate, Handle<Module> module,
                                         Handle<String> export_name,
                                         MessageLocation loc, bool must_resolve,
                                         Module::ResolveSet* resolve_set) {
-  DCHECK_GE(module->status(), kPreLinking);
-  DCHECK_NE(module->status(), kEvaluating);
-
   if (Handle<SourceTextModule> stm; TryCast(module, &stm)) {
-    return SourceTextModule::ResolveExport(isolate, stm, module_specifier,
-                                           export_name, loc, must_resolve,
-                                           resolve_set);
+    return SourceTextModule::ResolveExport(
+        isolate,
+        CheckedCast<InState<SourceTextModule, kPreLinking, kLinking, kLinked,
+                            kEvaluatingAsync, kEvaluated, kEvaluatedError>>(
+            stm),
+        module_specifier, export_name, loc, must_resolve, resolve_set);
   } else {
     return SyntheticModule::ResolveExport(
-        isolate, CheckedCast<SyntheticModule>(module), module_specifier,
-        export_name, loc, must_resolve);
+        isolate,
+        CheckedCast<InState<SyntheticModule, kPreLinking, kLinking, kLinked,
+                            kEvaluatingAsync, kEvaluated, kEvaluatedError>>(
+            module),
+        module_specifier, export_name, loc, must_resolve);
   }
 }
 
@@ -264,7 +267,7 @@ bool Module::PrepareInstantiate(Isolate* isolate, Handle<Module> module,
   return MatchState(
       module,
       [](DirectHandle<InState<Module, kPreLinking, kLinked, kEvaluatingAsync,
-                              kEvaluated, kErrored>>) { return true; },
+                              kEvaluated, kEvaluatedError>>) { return true; },
       [&](Handle<InState<Module, kUnlinked>> unlinked) {
         Handle<InState<Module, kPreLinking>> pre_linking =
             TransitionStatus<kPreLinking>(unlinked);
@@ -289,7 +292,7 @@ bool Module::FinishInstantiate(
   return MatchState(
       module,
       [](DirectHandle<InState<Module, kLinking, kLinked, kEvaluatingAsync,
-                              kEvaluated, kErrored>>) { return true; },
+                              kEvaluated, kEvaluatedError>>) { return true; },
       [&](Handle<InState<Module, kPreLinking>> pre_linking) {
         STACK_CHECK(isolate, false);
         if (Handle<InState<SourceTextModule, kPreLinking>> stm;
@@ -313,12 +316,10 @@ MaybeDirectHandle<JSPromise> Module::Evaluate(Isolate* isolate,
 
   // 2. Assert: module.[[Status]] is one of LINKED, EVALUATING-ASYNC, or
   //    EVALUATED.
+  DCHECK(module->status() == kLinked || module->status() == kEvaluatingAsync ||
+         module->status() == kEvaluated || module->status() == kEvaluatedError);
+
   // 3. If module.[[Status]] is either EVALUATING-ASYNC or EVALUATED, then
-  //    a. If module.[[CycleRoot]] is not EMPTY, then
-  //       i. Set module to module.[[CycleRoot]].
-  //    b. Else,
-  //       i. Assert: module.[[Status]] is EVALUATED and
-  //          module.[[EvaluationError]] is a throw completion.
   // A synthetic module has no dependencies, so it is its own cycle root.
   if (Handle<SourceTextModule> stm; TryCast(module, &stm)) {
     module = MatchState(
@@ -329,12 +330,24 @@ MaybeDirectHandle<JSPromise> Module::Evaluate(Isolate* isolate,
         },
         [&](DirectHandle<
             InState<SourceTextModule, kEvaluatingAsync, kEvaluated>>
-                m) -> Handle<Module> { return m->GetCycleRoot(isolate); },
-        [&](Handle<InState<SourceTextModule, kErrored>> m) -> Handle<Module> {
+                m) -> Handle<Module> {
+          // a. If module.[[CycleRoot]] is not EMPTY, then
+          //   i. Set module to module.[[CycleRoot]].
+          return m->GetCycleRoot(isolate);
+        },
+        [&](Handle<InState<SourceTextModule, kEvaluatedError>> m)
+            -> Handle<Module> {
+          // a. If module.[[CycleRoot]] is not EMPTY, then
+          //   i. Set module to module.[[CycleRoot]].
           if (Handle<SourceTextModule> cycle_root;
               m->TryGetCycleRoot(isolate).ToHandle(&cycle_root)) {
             return cycle_root;
           }
+          // b. Else,
+          //   i. Assert: module.[[Status]] is EVALUATED and
+          //      module.[[EvaluationError]] is a throw completion.
+          DCHECK_EQ(m->status(), kEvaluatedError);
+          DCHECK(!IsTheHole(m->exception()));
           return m;
         });
   }
@@ -344,7 +357,7 @@ MaybeDirectHandle<JSPromise> Module::Evaluate(Isolate* isolate,
   if (IsJSPromise(module->top_level_capability())) {
     DirectHandle<JSPromise> capability(
         Cast<JSPromise>(module->top_level_capability()), isolate);
-    DCHECK_IMPLIES(module->status() == kErrored,
+    DCHECK_IMPLIES(module->status() == kEvaluatedError,
                    capability->status() == Promise::kRejected &&
                        capability->result() == module->exception());
     return capability;
@@ -389,7 +402,7 @@ MaybeDirectHandle<JSPromise> Module::Evaluate(Isolate* isolate,
         // 11. Return capability.[[Promise]].
         return capability;
       },
-      [&](DirectHandle<InState<Module, kErrored>> m)
+      [&](DirectHandle<InState<Module, kEvaluatedError>> m)
           -> MaybeDirectHandle<JSPromise> {
         // 6. Let capability be ! NewPromiseCapability(%Promise%).
         DirectHandle<JSPromise> capability = isolate->factory()->NewJSPromise();
@@ -413,6 +426,55 @@ MaybeDirectHandle<JSPromise> Module::Evaluate(Isolate* isolate,
               isolate, Cast<InState<SyntheticModule, kLinked>>(linked));
         }
       });
+}
+
+// https://tc39.es/proposal-defer-import-eval/#sec-EvaluateModuleSync
+bool Module::EvaluateModuleSync(Isolate* isolate, Handle<Module> module) {
+  // 2. If ReadyForSyncExecution(module) is false, throw a TypeError exception.
+  {
+    Zone zone(isolate->allocator(), ZONE_NAME);
+    UnorderedModuleSet seen_modules(&zone);
+    if (!SourceTextModule::ReadyForSyncExecution(isolate, module,
+                                                 &seen_modules)) {
+      isolate->Throw(*isolate->factory()->NewTypeError(
+          MessageTemplate::kNotReadyForSyncExec));
+      return false;
+    }
+  }
+
+  // A side-effect-free debug-evaluate must not start the evaluation.
+  if (isolate->debug_execution_mode() == DebugInfo::kSideEffects) {
+    isolate->debug()->FailSideEffectCheckForDeferredModuleEvaluation();
+    return false;
+  }
+
+  // 3. Let promise be module.Evaluate().
+  DirectHandle<JSPromise> promise;
+  if (!Module::Evaluate(isolate, module).ToHandle(&promise)) {
+    DCHECK(isolate->has_exception());
+    return false;
+  }
+
+  // 4. Assert: promise.[[PromiseState]] is either FULFILLED or REJECTED.
+  DCHECK(promise->status() == Promise::kFulfilled ||
+         promise->status() == Promise::kRejected);
+  // 5. If promise.[[PromiseState]] is REJECTED, then
+  if (promise->status() == Promise::kRejected) {
+    // a. If promise.[[PromiseIsHandled]] is false, perform
+    //    HostPromiseRejectionTracker(promise, "handle").
+    if (!promise->has_handler()) {
+      isolate->ReportPromiseReject(promise, DirectHandle<Object>(),
+                                   v8::kPromiseHandlerAddedAfterReject);
+    }
+    // b. Set promise.[[PromiseIsHandled]] to true.
+    promise->set_has_handler(true);
+    // c. Throw promise.[[PromiseResult]].
+    isolate->Throw(promise->result());
+    return false;
+  }
+  DCHECK_EQ(promise->status(), Promise::kFulfilled);
+  // 6. Return UNUSED.
+  return true;
 }
 
 Handle<Cell> Module::GetModuleNamespaceCell(Isolate* isolate,
@@ -454,9 +516,13 @@ DirectHandle<JSModuleNamespace> Module::GetModuleNamespace(
   Zone zone(isolate->allocator(), ZONE_NAME);
   UnorderedModuleSet visited(&zone);
 
-  if (IsSourceTextModule(*module)) {
-    SourceTextModule::FetchStarExports(isolate, Cast<SourceTextModule>(module),
-                                       &zone, &visited);
+  if (Handle<SourceTextModule> stm; TryCast(module, &stm)) {
+    SourceTextModule::FetchStarExports(
+        isolate,
+        CheckedCast<InState<SourceTextModule, kLinking, kLinked, kEvaluating,
+                            kEvaluatingAsync, kEvaluated, kEvaluatedError>>(
+            stm),
+        &zone, &visited);
   }
 
   DirectHandle<ObjectHashTable> exports(module->exports(), isolate);
@@ -611,46 +677,11 @@ Maybe<PropertyAttributes> JSModuleNamespace::GetPropertyAttributes(
   }
 }
 
-// https://tc39.es/proposal-defer-import-eval/#sec-EvaluateModuleSync
+// https://tc39.es/proposal-defer-import-eval/#sec-GetModuleExportsList
 void JSDeferredModuleNamespace::EvaluateModuleSync(
     Isolate* isolate, DirectHandle<JSDeferredModuleNamespace> holder) {
-  Handle<Module> module = handle(holder->module(), isolate);
-
-  // https://tc39.es/proposal-defer-import-eval/#sec-GetModuleExportsList
-  Zone zone(isolate->allocator(), ZONE_NAME);
-  UnorderedModuleSet seenModules(&zone);
-  if (!SourceTextModule::ReadyForSyncExecution(isolate, module, &seenModules)) {
-    isolate->Throw(*isolate->factory()->NewTypeError(
-        MessageTemplate::kNotReadyForSyncExec));
-    return;
-  }
-
-  // A side-effect-free debug-evaluate must not start the evaluation.
-  if (isolate->debug_execution_mode() == DebugInfo::kSideEffects) {
-    isolate->debug()->FailSideEffectCheckForDeferredModuleEvaluation();
-    return;
-  }
-
-  MaybeDirectHandle<JSPromise> maybe_result = Module::Evaluate(isolate, module);
-  DirectHandle<JSPromise> promise;
-  if (!maybe_result.ToHandle(&promise)) {
-    return;
-  }
-
-  // The result is always the module's top-level capability promise.
-  // 5. If promise.[[PromiseState]] is rejected, then
-  if (promise->status() == Promise::kRejected) {
-    // a. If promise.[[PromiseIsHandled]] is false, perform
-    // HostPromiseRejectionTracker(promise, "handle").
-    if (!promise->has_handler()) {
-      isolate->ReportPromiseReject(promise, DirectHandle<Object>(),
-                                   v8::kPromiseHandlerAddedAfterReject);
-    }
-    promise->set_has_handler(true);
-    isolate->Throw(promise->result());
-    return;
-  }
-  DCHECK_EQ(promise->status(), Promise::kFulfilled);
+  // Callers check isolate->has_exception().
+  USE(Module::EvaluateModuleSync(isolate, handle(holder->module(), isolate)));
 }
 
 bool JSDeferredModuleNamespace::TriggersEvaluation(LookupIterator* it) {
