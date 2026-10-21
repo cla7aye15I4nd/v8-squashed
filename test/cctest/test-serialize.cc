@@ -4060,8 +4060,11 @@ UNINITIALIZED_TEST(SnapshotCreatorExternalReferences) {
       v8::Context::Scope context_scope(context);
       v8::Local<v8::External> writable_external =
           v8::External::New(isolate, &serialized_static_field, kIntPointerTag);
+      START_ALLOW_USE_DEPRECATED()
+      // TODO(b/570436596): Migrate to V3.
       context->SetEmbedderDataV2(my_context_embedder_field_index,
                                  writable_external);
+      END_ALLOW_USE_DEPRECATED()
       v8::Local<v8::External> external =
           v8::External::New(isolate, &serialized_static_field, kIntPointerTag);
       v8::Local<v8::FunctionTemplate> callback =
@@ -4774,7 +4777,10 @@ void DeserializeContextData(v8::Local<v8::Context> context, int index,
   InternalFieldData* field = new InternalFieldData{0};
   memcpy(field, payload.data, payload.raw_size);
   CHECK_EQ(context_data.data, field->data);
+  START_ALLOW_USE_DEPRECATED()
+  // TODO(b/570436596): Migrate to V2.
   context->SetAlignedPointerInEmbedderData(index, field, kInternalFieldDataTag);
+  END_ALLOW_USE_DEPRECATED()
 }
 
 }  // namespace context_data_test
@@ -4805,8 +4811,8 @@ UNINITIALIZED_TEST(SerializeContextData) {
         v8::HandleScope handle_scope(isolate);
         v8::Local<v8::Context> context = v8::Context::New(isolate);
         v8::Context::Scope context_scope(context);
-        context->SetAlignedPointerInEmbedderData(0, nullptr, kRawDataTag);
-        context->SetAlignedPointerInEmbedderData(
+        context->SetAlignedPointerInEmbedderDataV2(0, nullptr, kRawDataTag);
+        context->SetAlignedPointerInEmbedderDataV2(
             1, &context_data_test::context_data, kRawDataTag);
 
         v8::Local<v8::ObjectTemplate> object_template =
@@ -4844,7 +4850,7 @@ UNINITIALIZED_TEST(SerializeContextData) {
             context->GetAlignedPointerFromEmbedderData(1,
                                                        kInternalFieldDataTag));
         CHECK_EQ(context_data_test::context_data.data, data->data);
-        context->SetAlignedPointerInEmbedderData(1, nullptr, kRawDataTag);
+        context->SetAlignedPointerInEmbedderDataV2(1, nullptr, kRawDataTag);
         delete data;
 
         v8::Local<v8::Value> obj_val =
@@ -4875,8 +4881,8 @@ UNINITIALIZED_TEST(SerializeContextData) {
 
         v8::Local<v8::Context> context = v8::Context::New(isolate);
         v8::Context::Scope context_scope(context);
-        context->SetAlignedPointerInEmbedderData(0, nullptr, kRawDataTag);
-        context->SetAlignedPointerInEmbedderData(
+        context->SetAlignedPointerInEmbedderDataV2(0, nullptr, kRawDataTag);
+        context->SetAlignedPointerInEmbedderDataV2(
             1, &context_data_test::context_data, kRawDataTag);
 
         v8::Local<v8::ObjectTemplate> object_template =
@@ -4916,7 +4922,7 @@ UNINITIALIZED_TEST(SerializeContextData) {
             context->GetAlignedPointerFromEmbedderData(1,
                                                        kInternalFieldDataTag));
         CHECK_EQ(context_data_test::context_data.data, data->data);
-        context->SetAlignedPointerInEmbedderData(1, nullptr, kRawDataTag);
+        context->SetAlignedPointerInEmbedderDataV2(1, nullptr, kRawDataTag);
         delete data;
 
         v8::Local<v8::Value> obj_val =
@@ -4951,8 +4957,8 @@ UNINITIALIZED_TEST(SerializeContextData) {
 
         v8::Local<v8::Context> context = v8::Context::New(isolate);
         v8::Context::Scope context_scope(context);
-        context->SetAlignedPointerInEmbedderData(0, nullptr, kRawDataTag);
-        context->SetAlignedPointerInEmbedderData(1, raw_data, kRawDataTag);
+        context->SetAlignedPointerInEmbedderDataV2(0, nullptr, kRawDataTag);
+        context->SetAlignedPointerInEmbedderDataV2(1, raw_data, kRawDataTag);
 
         v8::Local<v8::ObjectTemplate> object_template =
             v8::ObjectTemplate::New(isolate);
@@ -7284,68 +7290,6 @@ UNINITIALIZED_TEST(NoStackFrameCacheSerialization) {
       creator.CreateBlob(v8::SnapshotCreator::FunctionCodeHandling::kKeep);
 
   delete[] blob.data;
-}
-
-namespace {
-void CheckObjectsAreInSharedHeap(Isolate* isolate) {
-  Heap* heap = isolate->heap();
-  SetCurrentIsolateScope isolate_scope(isolate);
-  SetCurrentLocalHeapScope local_heap_scope(isolate);
-  HeapObjectIterator iterator(heap);
-  DisallowGarbageCollection no_gc;
-  for (Tagged<HeapObject> obj = iterator.Next(); !obj.is_null();
-       obj = iterator.Next()) {
-    const bool expected_in_shared_old =
-        heap->MustBeInSharedOldSpace(obj) ||
-        (IsString(obj) && String::IsInPlaceInternalizable(Cast<String>(obj)));
-    if (expected_in_shared_old) {
-      CHECK(HeapLayout::InAnySharedSpace(obj));
-    }
-  }
-}
-}  // namespace
-
-UNINITIALIZED_TEST(SharedStrings) {
-  // Test that deserializing with --shared-string-table deserializes into the
-  // shared Isolate.
-
-  if (!V8_CAN_CREATE_SHARED_HEAP_BOOL) return;
-  // In multi-cage mode we create one cage per isolate
-  // and we don't share objects between cages.
-  if (COMPRESS_POINTERS_IN_MULTIPLE_CAGES_BOOL) return;
-
-  // Make all the flags that require a shared heap false before creating the
-  // isolate to serialize.
-  v8_flags.shared_string_table = false;
-  v8_flags.harmony_struct = false;
-
-  v8::Isolate* isolate_to_serialize = TestSerializer::NewIsolateInitialized();
-  StartupBlobs blobs = Serialize(isolate_to_serialize);
-  isolate_to_serialize->Dispose();
-
-  v8_flags.shared_string_table = true;
-  i::FlagList::EnforceFlagImplications();
-
-  v8::Isolate* isolate1 = TestSerializer::NewIsolateFromBlob(blobs);
-  v8::Isolate* isolate2 = TestSerializer::NewIsolateFromBlob(blobs);
-  Isolate* i_isolate1 = reinterpret_cast<Isolate*>(isolate1);
-  Isolate* i_isolate2 = reinterpret_cast<Isolate*>(isolate2);
-
-  CHECK_EQ(i_isolate1->string_table(), i_isolate2->string_table());
-  i_isolate2->main_thread_local_heap()->ExecuteMainThreadWhileParked(
-      [i_isolate1]() { CheckObjectsAreInSharedHeap(i_isolate1); });
-
-  i_isolate1->main_thread_local_heap()->ExecuteMainThreadWhileParked(
-      [i_isolate2]() { CheckObjectsAreInSharedHeap(i_isolate2); });
-
-  // Because both isolate1 and isolate2 are considered running on the main
-  // thread, one must be parked to avoid deadlock in the shared heap
-  // verification that may happen on client heap disposal.
-  i_isolate1->main_thread_local_heap()->ExecuteMainThreadWhileParked(
-      [isolate2]() { isolate2->Dispose(); });
-  isolate1->Dispose();
-
-  FreeCurrentEmbeddedBlob();
 }
 
 namespace {

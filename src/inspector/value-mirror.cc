@@ -39,19 +39,52 @@ static const int kMaxProtocolDepth = 900;
 static const int kMaxProtocolDepth = 1000;
 #endif
 
-Response toProtocolValue(v8::Local<v8::Context> context,
-                         v8::Local<v8::Value> value, int maxDepth,
-                         std::unique_ptr<protocol::Value>* result);
+namespace {
 
-Response arrayToProtocolValue(v8::Local<v8::Context> context,
-                              v8::Local<v8::Array> array, int maxDepth,
-                              std::unique_ptr<protocol::ListValue>* result) {
+// Limits the total size of the result of a single toProtocolValue() call.
+// Values reachable via multiple references (i.e. shared but not cyclic) are
+// serialized once per reference, so without such limits, a small object graph
+// could expand to an exponential number of values, or a single large string
+// could be copied many times.
+struct ProtocolValueBudget {
+  // The remaining number of array elements and object properties.
+  uint32_t values = kMaxArrayLength;
+  // The remaining number of characters in strings and property names. The
+  // serialized result has to fit into a single string anyway.
+  uint32_t characters = static_cast<uint32_t>(v8::String::kMaxLength);
+};
+
+Response toProtocolValueImpl(v8::Local<v8::Context> context,
+                             v8::Local<v8::Value> value, int maxDepth,
+                             ProtocolValueBudget* budget,
+                             std::unique_ptr<protocol::Value>* result);
+
+Response objectTooLargeError() {
+  return Response::ServerError("Object is too large to be returned by value");
+}
+
+// Takes the characters of the `string` from the `budget`, before the `string`
+// is copied into the result.
+bool takeCharacters(ProtocolValueBudget* budget, v8::Local<v8::String> string) {
+  uint32_t length = static_cast<uint32_t>(string->Length());
+  if (length > budget->characters) return false;
+  budget->characters -= length;
+  return true;
+}
+
+Response arrayToProtocolValueImpl(
+    v8::Local<v8::Context> context, v8::Local<v8::Array> array, int maxDepth,
+    ProtocolValueBudget* budget, std::unique_ptr<protocol::ListValue>* result) {
   std::unique_ptr<protocol::ListValue> inspectorArray =
       protocol::ListValue::create();
   uint32_t length = array->Length();
   if (length > kMaxArrayLength) {
     return Response::ServerError("Array length exceeds maximum limit");
   }
+  // Take all the elements from the budget upfront, so that we fail early
+  // (before serializing any of the elements) if they don't fit.
+  if (length > budget->values) return objectTooLargeError();
+  budget->values -= length;
   inspectorArray->reserve(length);
   for (uint32_t i = 0; i < length; i++) {
     v8::Local<v8::Value> value;
@@ -59,7 +92,8 @@ Response arrayToProtocolValue(v8::Local<v8::Context> context,
       return Response::InternalError();
     }
     std::unique_ptr<protocol::Value> element;
-    Response response = toProtocolValue(context, value, maxDepth - 1, &element);
+    Response response =
+        toProtocolValueImpl(context, value, maxDepth - 1, budget, &element);
     if (!response.IsSuccess()) return response;
     inspectorArray->pushValue(std::move(element));
   }
@@ -67,8 +101,9 @@ Response arrayToProtocolValue(v8::Local<v8::Context> context,
   return Response::Success();
 }
 
-Response objectToProtocolValue(
+Response objectToProtocolValueImpl(
     v8::Local<v8::Context> context, v8::Local<v8::Object> object, int maxDepth,
+    ProtocolValueBudget* budget,
     std::unique_ptr<protocol::DictionaryValue>* result) {
   std::unique_ptr<protocol::DictionaryValue> jsonObject =
       protocol::DictionaryValue::create();
@@ -102,9 +137,12 @@ Response objectToProtocolValue(
       return Response::InternalError();
     }
     if (property->IsUndefined()) continue;
+    if (budget->values == 0) return objectTooLargeError();
+    --budget->values;
+    if (!takeCharacters(budget, propertyName)) return objectTooLargeError();
     std::unique_ptr<protocol::Value> propertyValue;
-    Response response =
-        toProtocolValue(context, property, maxDepth - 1, &propertyValue);
+    Response response = toProtocolValueImpl(context, property, maxDepth - 1,
+                                            budget, &propertyValue);
     if (!response.IsSuccess()) return response;
     jsonObject->setValue(
         toProtocolString(v8::Isolate::GetCurrent(), propertyName),
@@ -113,6 +151,8 @@ Response objectToProtocolValue(
   *result = std::move(jsonObject);
   return Response::Success();
 }
+
+}  // namespace
 
 std::unique_ptr<protocol::FundamentalValue> toProtocolValue(
     double doubleValue) {
@@ -128,9 +168,12 @@ std::unique_ptr<protocol::FundamentalValue> toProtocolValue(
   return protocol::FundamentalValue::create(doubleValue);
 }
 
-Response toProtocolValue(v8::Local<v8::Context> context,
-                         v8::Local<v8::Value> value, int maxDepth,
-                         std::unique_ptr<protocol::Value>* result) {
+namespace {
+
+Response toProtocolValueImpl(v8::Local<v8::Context> context,
+                             v8::Local<v8::Value> value, int maxDepth,
+                             ProtocolValueBudget* budget,
+                             std::unique_ptr<protocol::Value>* result) {
   if (maxDepth <= 0) {
     return Response::ServerError("Object reference chain is too long");
   }
@@ -150,28 +193,53 @@ Response toProtocolValue(v8::Local<v8::Context> context,
     return Response::Success();
   }
   if (value->IsString()) {
+    v8::Local<v8::String> string = value.As<v8::String>();
+    if (!takeCharacters(budget, string)) return objectTooLargeError();
     *result = protocol::StringValue::create(
-        toProtocolString(v8::Isolate::GetCurrent(), value.As<v8::String>()));
+        toProtocolString(v8::Isolate::GetCurrent(), string));
     return Response::Success();
   }
   if (value->IsArray()) {
     v8::Local<v8::Array> array = value.As<v8::Array>();
     std::unique_ptr<protocol::ListValue> list_result;
-    auto response =
-        arrayToProtocolValue(context, array, maxDepth, &list_result);
+    auto response = arrayToProtocolValueImpl(context, array, maxDepth, budget,
+                                             &list_result);
     *result = std::move(list_result);
     return response;
   }
   if (value->IsObject()) {
     v8::Local<v8::Object> object = value.As<v8::Object>();
     std::unique_ptr<protocol::DictionaryValue> dict_result;
-    auto response =
-        objectToProtocolValue(context, object, maxDepth, &dict_result);
+    auto response = objectToProtocolValueImpl(context, object, maxDepth, budget,
+                                              &dict_result);
     *result = std::move(dict_result);
     return response;
   }
 
   return Response::ServerError("Object couldn't be returned by value");
+}
+
+}  // namespace
+
+Response arrayToProtocolValue(v8::Local<v8::Context> context,
+                              v8::Local<v8::Array> array, int maxDepth,
+                              std::unique_ptr<protocol::ListValue>* result) {
+  ProtocolValueBudget budget;
+  return arrayToProtocolValueImpl(context, array, maxDepth, &budget, result);
+}
+
+Response objectToProtocolValue(
+    v8::Local<v8::Context> context, v8::Local<v8::Object> object, int maxDepth,
+    std::unique_ptr<protocol::DictionaryValue>* result) {
+  ProtocolValueBudget budget;
+  return objectToProtocolValueImpl(context, object, maxDepth, &budget, result);
+}
+
+Response toProtocolValue(v8::Local<v8::Context> context,
+                         v8::Local<v8::Value> value, int maxDepth,
+                         std::unique_ptr<protocol::Value>* result) {
+  ProtocolValueBudget budget;
+  return toProtocolValueImpl(context, value, maxDepth, &budget, result);
 }
 
 Response toProtocolValue(v8::Local<v8::Context> context,
@@ -1064,6 +1132,7 @@ struct EntryMirror {
   static bool getEntries(v8::Local<v8::Context> context,
                          v8::Local<v8::Object> object, size_t limit,
                          bool* overflow, std::vector<EntryMirror>* mirrors) {
+    v8::Isolate* isolate = v8::Isolate::GetCurrent();
     bool isKeyValue = false;
     v8::Local<v8::Array> entries;
     if (!object->PreviewEntries(&isKeyValue).ToLocal(&entries)) return false;
@@ -1073,13 +1142,17 @@ struct EntryMirror {
       std::unique_ptr<ValueMirror> keyMirror;
       if (isKeyValue && entries->Get(context, i).ToLocal(&tmp)) {
         keyMirror = ValueMirror::create(context, tmp);
+        // Creating the mirror can run JavaScript, which might terminate
+        // execution. Don't call into V8 anymore in that case, since the next
+        // V8 API call would clear the pending termination exception.
+        if (isolate->IsExecutionTerminating()) return false;
       }
       std::unique_ptr<ValueMirror> valueMirror;
       if (entries->Get(context, isKeyValue ? i + 1 : i).ToLocal(&tmp)) {
         valueMirror = ValueMirror::create(context, tmp);
-      } else {
-        continue;
+        if (isolate->IsExecutionTerminating()) return false;
       }
+      if (!valueMirror) continue;
       if (mirrors->size() == limit) {
         *overflow = true;
         return true;
@@ -1376,11 +1449,17 @@ class ObjectMirror final : public ValueMirrorBase {
       v8::Local<v8::Context> context, bool forEntry,
       bool generatePreviewForTable, int* nameLimit, int* indexLimit,
       std::unique_ptr<ObjectPreview>* result) const {
+    // Building the preview can run JavaScript (e.g. getters on Error objects),
+    // which might terminate execution. Don't call into V8 anymore in that case,
+    // since the next V8 API call would clear the pending termination exception.
+    v8::Isolate* isolate = v8::Isolate::GetCurrent();
+    if (isolate->IsExecutionTerminating()) return;
+
     auto properties = std::make_unique<protocol::Array<PropertyPreview>>();
     std::unique_ptr<protocol::Array<EntryPreview>> entriesPreview;
     bool overflow = false;
 
-    v8::Local<v8::Value> value = v8Value(v8::Isolate::GetCurrent());
+    v8::Local<v8::Value> value = v8Value(isolate);
     while (value->IsProxy()) value = value.As<v8::Proxy>()->GetTarget();
 
     if (value->IsObject() && !value->IsProxy()) {
@@ -1388,6 +1467,7 @@ class ObjectMirror final : public ValueMirrorBase {
       std::vector<InternalPropertyMirror> internalProperties;
       getInternalPropertiesForPreview(context, objectForPreview, nameLimit,
                                       &overflow, &internalProperties);
+      if (isolate->IsExecutionTerminating()) return;
       for (size_t i = 0; i < internalProperties.size(); ++i) {
         std::unique_ptr<PropertyPreview> propertyPreview;
         internalProperties[i].value->buildPropertyPreview(
@@ -1399,6 +1479,7 @@ class ObjectMirror final : public ValueMirrorBase {
 
       getPrivatePropertiesForPreview(context, objectForPreview, nameLimit,
                                      &overflow, properties.get());
+      if (isolate->IsExecutionTerminating()) return;
 
       std::vector<PropertyMirror> mirrors;
       if (getPropertiesForPreview(context, objectForPreview, nameLimit,
@@ -1426,6 +1507,7 @@ class ObjectMirror final : public ValueMirrorBase {
           properties->emplace_back(std::move(preview));
         }
       }
+      if (isolate->IsExecutionTerminating()) return;
 
       std::vector<EntryMirror> entries;
       if (EntryMirror::getEntries(context, objectForPreview, 5, &overflow,
@@ -1454,6 +1536,7 @@ class ObjectMirror final : public ValueMirrorBase {
           }
         }
       }
+      if (isolate->IsExecutionTerminating()) return;
     }
     *result = ObjectPreview::create()
                   .setType(RemoteObject::TypeEnum::Object)
@@ -1591,6 +1674,10 @@ bool ValueMirror::getProperties(v8::Local<v8::Context> context,
                                 bool nonIndexedPropertiesOnly,
                                 PropertyAccumulator* accumulator) {
   v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  // Don't call into V8 when execution is terminating, since that would clear
+  // the pending termination exception (and PropertyIterator::Create() would
+  // fail without throwing).
+  if (isolate->IsExecutionTerminating()) return false;
   v8::TryCatch tryCatch(isolate);
   v8::Local<v8::Set> set = v8::Set::New(isolate);
 
@@ -1715,6 +1802,10 @@ bool ValueMirror::getProperties(v8::Local<v8::Context> context,
         }
       }
     }
+    // Creating the mirrors can run JavaScript, which might terminate
+    // execution. Don't call into V8 anymore in that case, since the next V8
+    // API call would clear the pending termination exception.
+    if (isolate->IsExecutionTerminating()) return false;
     if (accessorPropertiesOnly && !isAccessorProperty) continue;
     auto mirror = PropertyMirror{name,
                                  writable,
@@ -1783,6 +1874,10 @@ void ValueMirror::getInternalProperties(
         continue;
       }
       auto wrapper = ValueMirror::create(context, value);
+      // Creating the mirror can run JavaScript, which might terminate
+      // execution. Don't call into V8 anymore in that case, since the next V8
+      // API call would clear the pending termination exception.
+      if (isolate->IsExecutionTerminating()) return;
       if (wrapper) {
         mirrors->emplace_back(InternalPropertyMirror{
             toProtocolStringWithTypeCheck(v8::Isolate::GetCurrent(), name),
@@ -1836,6 +1931,11 @@ std::vector<PrivatePropertyMirror> ValueMirror::getPrivateProperties(
     } else {
       valueMirror = ValueMirror::create(context, value);
     }
+
+    // Creating the mirrors can run JavaScript, which might terminate
+    // execution. Don't call into V8 anymore in that case, since the next V8
+    // API call would clear the pending termination exception.
+    if (isolate->IsExecutionTerminating()) return {};
 
     mirrors.emplace_back(PrivatePropertyMirror{
         toProtocolStringWithTypeCheck(v8::Isolate::GetCurrent(), name),
@@ -2063,13 +2163,22 @@ std::unique_ptr<ValueMirror> ValueMirror::create(v8::Local<v8::Context> context,
                                           description);
   }
   if (internalType == V8InternalValueType::kScope) {
+    String16 description = descriptionForScope(context, object);
+    if (isolate->IsExecutionTerminating() &&
+        v8::debug::SideEffectCheckScope::IsActive(isolate)) {
+      return nullptr;
+    }
     return std::make_unique<ObjectMirror>(object, "internal#scope",
-                                          descriptionForScope(context, object));
+                                          description);
   }
   if (internalType == V8InternalValueType::kPrivateMethod) {
-    return std::make_unique<ObjectMirror>(
-        object, "internal#privateMethod",
-        descriptionForPrivateMethod(context, object));
+    String16 description = descriptionForPrivateMethod(context, object);
+    if (isolate->IsExecutionTerminating() &&
+        v8::debug::SideEffectCheckScope::IsActive(isolate)) {
+      return nullptr;
+    }
+    return std::make_unique<ObjectMirror>(object, "internal#privateMethod",
+                                          description);
   }
   size_t length = 0;
   if (isArrayLike(context, object, &length)) {

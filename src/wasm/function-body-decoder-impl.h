@@ -833,14 +833,15 @@ struct BlockTypeImmediate {
     std::tie(block_type, length) =
         decoder->read_i33v<ValidationTag>(pc, "block type");
     if (block_type < 0) {
-      // All valid negative types are 1 byte in length, so we check against the
-      // minimum 1-byte LEB128 value.
-      constexpr int64_t min_1_byte_leb128 = -64;
-      if (!VALIDATE(block_type >= min_1_byte_leb128)) {
+      // Concrete type indices (block_type >= 0) are encoded as multi-byte s33
+      // LEB128, whereas kVoidCode (0x40) and value type opcodes are single
+      // bytes.
+      if (!VALIDATE(length == 1)) {
         DecodeError<ValidationTag>(decoder, pc, "invalid block type %" PRId64,
                                    block_type);
         return;
       }
+      DCHECK_GE(block_type, -64);
       if (static_cast<ValueTypeCode>(block_type & 0x7F) != kVoidCode) {
         sig = FunctionSig{1, 0, single_return_sig_storage};
         std::tie(single_return_sig_storage[0], length) =
@@ -6352,8 +6353,9 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
           // All other generic types would have failed validation above.
           DCHECK(ref.type.has_index());
           // Exactness is only propagated if the actual type on the stack
-          // exactly matched the type immediate.
-          if (ref.type.ref_index() != imm.index) {
+          // is equivalent to the type immediate.
+          if (!EquivalentIndices(ref.type.ref_index(), imm.index,
+                                 this->module_)) {
             result_exactness = kAnySubtype;
           }
         }
@@ -7631,9 +7633,15 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
         auto [array_obj, index] =
             Pop(ValueType::RefNull(imm.heap_type()), kWasmI32);
         Value* value = Push(element_type.Unpacked());
-        CALL_INTERFACE_IF_OK_AND_REACHABLE(ArrayGet, array_obj, imm, index,
-                                           opcode == kExprArrayAtomicGetS,
-                                           value);
+        const bool is_signed = opcode == kExprArrayAtomicGetS;
+        if (array_obj.type.is_shared()) {
+          CALL_INTERFACE_IF_OK_AND_REACHABLE(ArrayAtomicGet, array_obj, imm,
+                                             index, is_signed,
+                                             memory_order.order, value);
+        } else {
+          CALL_INTERFACE_IF_OK_AND_REACHABLE(ArrayGet, array_obj, imm, index,
+                                             is_signed, value);
+        }
         return opcode_length + memory_order.length + imm.length;
       }
       case kExprArrayAtomicSet: {

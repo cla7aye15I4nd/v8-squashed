@@ -174,7 +174,7 @@ class ExpressionScope {
                                        MessageTemplate message) {
     ExpressionScope* scope = this;
     while (!scope->IsCertainlyParameterDeclaration()) {
-      if (!has_possible_parameter_in_scope_chain_) return;
+      if (!scope->has_possible_parameter_in_scope_chain_) return;
       if (scope->CanBeParameterDeclaration()) {
         scope->AsArrowHeadParsingScope()->RecordDeclarationError(loc, message);
       }
@@ -216,7 +216,8 @@ class ExpressionScope {
       }
     } else if (is_strict(parser_->language_mode())) {
       AsArrowHeadParsingScope()->RecordDeclarationError(loc, message);
-    } else {
+    } else if (!parser_->next_arrow_function_info_
+                    .strict_parameter_error_location.IsValid()) {
       parser_->next_arrow_function_info_.strict_parameter_error_location = loc;
       parser_->next_arrow_function_info_.strict_parameter_error_message =
           message;
@@ -523,7 +524,10 @@ class ExpressionParsingScope : public ExpressionScope<Types> {
                                        MessageTemplate message) {
     for (ExpressionScopeT* scope = this; scope != nullptr;
          scope = scope->parent()) {
-      if (!has_async_arrow_in_scope_chain_) break;
+      if (!scope->CanBeExpression() ||
+          !scope->AsExpressionParsingScope()->has_async_arrow_in_scope_chain_) {
+        break;
+      }
       if (scope->type_ ==
           ExpressionScopeT::kMaybeAsyncArrowParameterDeclaration) {
         scope->AsArrowHeadParsingScope()->RecordDeclarationError(loc, message);

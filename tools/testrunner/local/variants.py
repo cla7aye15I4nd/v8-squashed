@@ -301,7 +301,6 @@ INCOMPATIBLE_FLAGS_PER_VARIANT = {
         "--wasm-deopt",
     ],
     "verify_turboshaft": ["--jitless"],
-    "conservative_stack_scanning": ["--predictable-gc-schedule"],
 }
 
 
@@ -379,7 +378,6 @@ INCOMPATIBLE_FLAGS_PER_BUILD_VARIABLE = {
     "single_generation": [
         "--shared-strings",
         "--shared-heap",
-        "--harmony-struct",
         "--wasm-shared",
     ],
     "!slow_dchecks": ["--enable-slow-asserts"],
@@ -418,7 +416,6 @@ INCOMPATIBLE_FLAGS_PER_EXTRA_FLAG = {
     ],
     "--wasm-generate-compilation-hints": ["--single-threaded"],
     "--trace-wasm-generate-compilation-hints": ["--single-threaded"],
-    "--optimize-for-size": ["--predictable-gc-schedule"],
 }
 
 SLOW_VARIANTS = set([

@@ -350,6 +350,11 @@ v8_int(
     default = 64,
 )
 
+v8_int(
+    name = "v8_embedder_data_array_size",
+    default = 5,
+)
+
 # We use a string flag to create a 3 value-logic.
 # If no explicit value for v8_enable_pointer_compression, we set it to 'none'.
 v8_string(
@@ -2738,6 +2743,8 @@ filegroup(
         "src/snapshot/startup-deserializer.h",
         "src/snapshot/startup-serializer.cc",
         "src/snapshot/startup-serializer.h",
+        "src/snapshot/trusted-section-serializer.cc",
+        "src/snapshot/trusted-section-serializer.h",
         "src/strings/char-predicates.h",
         "src/strings/char-predicates-inl.h",
         "src/strings/owning-external-string-resource.h",

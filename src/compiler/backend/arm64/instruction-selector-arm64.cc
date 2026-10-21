@@ -1147,10 +1147,7 @@ std::tuple<InstructionCode, ImmediateMode> GetStoreOpcodeAndImmediate(
       // We never store directly to protected pointers from generated code.
       UNREACHABLE();
     case MemoryRepresentation::TrustedPointer():
-      // Only LoadTrustedPointer uses this representation.
-      UNREACHABLE();
-    case MemoryRepresentation::IndirectPointer():
-      return {kArm64StrIndirectPointer, kLoadStoreImm32};
+      return {kArm64StrTrustedPointer, kLoadStoreImm32};
     case MemoryRepresentation::SandboxedPointer():
       CHECK(!paired);
       return {kArm64StrEncodeSandboxedPointer, kLoadStoreImm64};
@@ -1494,8 +1491,6 @@ std::tuple<InstructionCode, ImmediateMode> GetLoadOpcodeAndImmediate(
     case MemoryRepresentation::ProtectedPointer():
       CHECK(V8_ENABLE_SANDBOX_BOOL);
       return {kArm64LdrDecompressProtected, kNoImmediate};
-    case MemoryRepresentation::IndirectPointer():
-      UNREACHABLE();
     case MemoryRepresentation::TrustedPointer():
       // Only LoadTrustedPointer uses this representation.
       UNREACHABLE();
@@ -1545,7 +1540,7 @@ void InstructionSelector::VisitStore(OpIndex node) {
   // TODO(arm64): I guess this could be done in a better way.
   if (write_barrier_kind != kNoWriteBarrier &&
       !v8_flags.disable_write_barriers) {
-    DCHECK(CanBeTaggedOrCompressedOrIndirectPointer(representation));
+    DCHECK(CanBeTaggedOrCompressedOrTrustedPointer(representation));
     AddressingMode addressing_mode;
     InstructionOperand inputs[5];
     size_t input_count = 0;
@@ -1564,15 +1559,15 @@ void InstructionSelector::VisitStore(OpIndex node) {
     }
     inputs[input_count++] = g.UseUniqueRegister(store_view.value());
     InstructionCode code;
-    if (store_rep == MemoryRepresentation::IndirectPointer()) {
-      DCHECK(write_barrier_kind == kIndirectPointerWriteBarrier ||
+    if (store_rep == MemoryRepresentation::TrustedPointer()) {
+      DCHECK(write_barrier_kind == kTrustedPointerWriteBarrier ||
              write_barrier_kind == kSkippedWriteBarrier);
       // In this case we need to add the TrustedPointerTag as additional input.
       code = write_barrier_kind == kSkippedWriteBarrier
-                 ? kArchStoreIndirectSkippedWriteBarrier
-                 : kArchStoreIndirectWithWriteBarrier;
-      code |= RecordWriteModeField::encode(
-          RecordWriteMode::kValueIsIndirectPointer);
+                 ? kArchStoreTrustedSkippedWriteBarrier
+                 : kArchStoreTrustedWithWriteBarrier;
+      code |=
+          RecordWriteModeField::encode(RecordWriteMode::kValueIsTrustedPointer);
       TrustedPointerTag tag = store_view.trusted_pointer_tag();
       inputs[input_count++] = g.UseImmediate64(static_cast<int64_t>(tag));
     } else if (write_barrier_kind == kSkippedWriteBarrier) {

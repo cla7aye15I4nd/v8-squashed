@@ -101,6 +101,65 @@
   'regress/regress-538529872-2': [SKIP],
   'turboshaft/regress-523436017': [SKIP],
 
+  # TODO(572988458): Skip --harmony-struct/--shared-string-table tests.
+  # To be removed soon.
+  'harmony/regress/regress-520728938': [SKIP],
+  'regress/regress-476509600': [SKIP],
+  'regress/regress-499155348': [SKIP],
+  'regress/regress-505101417': [SKIP],
+  'regress/wasm/regress-474491347': [SKIP],
+  'regress/wasm/regress-490877756': [SKIP],
+  'turbolev/instanceof': [SKIP],
+  'shared-memory/brand-checks': [SKIP],
+  'shared-memory/builtins': [SKIP],
+  'shared-memory/cannot-redefine-properties': [SKIP],
+  'shared-memory/condition': [SKIP],
+  'shared-memory/condition-workers': [SKIP],
+  'shared-memory/mutex': [SKIP],
+  'shared-memory/mutex-lock-twice': [SKIP],
+  'shared-memory/mutex-workers': [SKIP],
+  'shared-memory/optimize-non-instance': [SKIP],
+  'shared-memory/private-brand': [SKIP],
+  'shared-memory/private-field': [SKIP],
+  'shared-memory/private-name': [SKIP],
+  'shared-memory/regress-488754149': [SKIP],
+  'shared-memory/regress-524783017': [SKIP],
+  'shared-memory/regress-crbug-1394741': [SKIP],
+  'shared-memory/regress-crbug-1395117': [SKIP],
+  'shared-memory/regress-crbug-1425710': [SKIP],
+  'shared-memory/regress-crbug-1429570': [SKIP],
+  'shared-memory/regress-crbug-1441241': [SKIP],
+  'shared-memory/regress-crbug-1449611': [SKIP],
+  'shared-memory/regress-crbug-1487973': [SKIP],
+  'shared-memory/regress-crbug-1492013': [SKIP],
+  'shared-memory/regress-crbug-333007256': [SKIP],
+  'shared-memory/regress/regress-468231509': [SKIP],
+  'shared-memory/regress/regress-469804007': [SKIP],
+  'shared-memory/regress/regress-541880797': [SKIP],
+  'shared-memory/shared-array-atomics': [SKIP],
+  'shared-memory/shared-array-atomics-workers': [SKIP],
+  'shared-memory/shared-array-concat': [SKIP],
+  'shared-memory/shared-array-surface': [SKIP],
+  'shared-memory/shared-array-workers': [SKIP],
+  'shared-memory/shared-external-string-dictionary-lookup': [SKIP],
+  'shared-memory/shared-external-string-megamorphic-ic': [SKIP],
+  'shared-memory/shared-object-has-instance': [SKIP],
+  'shared-memory/shared-string-copy-on-share': [SKIP],
+  'shared-memory/shared-string-copy-on-share-large': [SKIP],
+  'shared-memory/shared-string-in-global-object-optimized': [SKIP],
+  'shared-memory/shared-string': [SKIP],
+  'shared-memory/shared-string-promotion-major': [SKIP],
+  'shared-memory/shared-string-promotion-minor': [SKIP],
+  'shared-memory/shared-struct-atomics': [SKIP],
+  'shared-memory/shared-struct-atomics-workers': [SKIP],
+  'shared-memory/shared-struct-property-storage': [SKIP],
+  'shared-memory/shared-struct-surface': [SKIP],
+  'shared-memory/shared-struct-type-registry': [SKIP],
+  'shared-memory/shared-struct-workers': [SKIP],
+  'shared-memory/shared-struct-workers-optimized-code': [SKIP],
+  'shared-memory/shared-value-barrier-optimization': [SKIP],
+  'shared-memory/shrink-large-object': [SKIP],
+
   ##############################################################################
   # Tests where variants make no sense.
   'd8/enable-tracing': [PASS, NO_VARIANTS],
@@ -214,6 +273,7 @@
   'regress/regress-558568713': [PASS, SLOW, NO_VARIANTS],
   'regress/regress-rab-proto-oob': [PASS, SLOW, ['tsan', SKIP]],
   'regress/regress-crbug-503557995-b': [PASS, ['mode != release or simulator_run', SKIP]],
+  'regress/regress-crbug-540324230': [PASS, SLOW],
   'regress/wasm/regress-810973': [PASS, SLOW],
   'sealed-array-reduce': [PASS, SLOW],
   'string-replace-gc': [PASS, SLOW],
@@ -678,6 +738,7 @@
   'whitespaces': [SKIP],
   'baseline/*': [SKIP],
   'regress/regress-chromium-1194026': [SKIP],
+  'regress/regress-crbug-540324230': [SKIP],
 
   # Unsuitable for GC stress because coverage information is lost on GC.
   'code-coverage-ad-hoc': [SKIP],
@@ -750,10 +811,6 @@
 
   # GC stress sets --concurrent-recompilation-delay itself.
   'compiler/regress-542923494': [SKIP],
-
-  # --stress-compaction and --predictable-gc-schedule imply different
-  # --max-semi-space-size values.
-  'regress/regress-memory-pool-release-task': [SKIP],
 }],  # 'gc_stress'
 
 ##############################################################################
@@ -827,6 +884,7 @@
   'sandbox/regress/regress-334120897': [SKIP],
   'sandbox/regress/regress-349502157': [SKIP],
   'sandbox/regress/regress-572826713': [SKIP],
+  'sandbox/regress/regress-574792351': [SKIP],
   'sandbox/regress-537948358': [SKIP],
   'sandbox/wasm-inlining-sigcheck': [SKIP],
   'sandbox/wasm-signature-verification': [SKIP],
@@ -850,6 +908,7 @@
 ##############################################################################
 ['not has_wasm_interpreter or variant != jitless', {
   # Tests to run only with the Wasm interpreter.
+  'regress/wasm/regress-drumbrake-array-segment-args': [SKIP],
   'regress/wasm/regress-drumbrake-cast-nofunc': [SKIP],
   'regress/wasm/regress-drumbrake-exception-null': [SKIP],
   'regress/wasm/regress-drumbrake-exnref': [SKIP],
@@ -885,11 +944,6 @@
 ['variant == jitless', {
   # Skip tests that require Wasm experimental features not supported by the
   # Wasm interpreter, or that explicitly require compilation.
-
-  # Wasm debugging that runs GC while paused at a trap safepoint is not
-  # supported by the Wasm interpreter; it crashes (BUS_ADRALN) in the DrumBrake
-  # safepoint path in jitless mode. Passes in JIT variants.
-  'wasm/regress-534579660': [SKIP],
 
   # --wasm-inlining
   'regress/wasm/regress-crbug-1510626': [SKIP],
@@ -2776,6 +2830,7 @@
 ##############################################################################
 ['variant == stress_incremental_marking', {
   'harmony/sharedarraybuffer-worker-gc-stress': [PASS, ['gc_stress', SKIP]],
+  'regress/regress-crbug-540324230': [SKIP],
   'regress/regress-crbug-820312': [PASS, SLOW],
   'wasm/shared-memory-worker-stress': [PASS, SLOW, ['tsan', SKIP]],
 }],  # variant == stress_incremental_marking

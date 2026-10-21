@@ -1995,8 +1995,12 @@ static void Generate_InterpreterEnterBytecode(MacroAssembler* masm) {
   __ LoadU64(r5, MemOperand(r5));
 
   __ bind(&trampoline_loaded);
-  __ addi(r0, r5, Operand(interpreter_entry_return_pc_offset.value()));
-  __ mtlr(r0);
+  {
+    UseScratchRegisterScope temps(masm);
+    Register scratch = temps.Acquire();
+    __ addi(scratch, r5, Operand(interpreter_entry_return_pc_offset.value()));
+    __ mtlr(scratch);
+  }
 
   // Initialize the dispatch table register.
   __ Move(
@@ -2131,8 +2135,9 @@ void Generate_ContinueToBuiltinHelper(MacroAssembler* masm,
         BuiltinContinuationFrameConstants::kFixedSlotCount -
         kJSArgcReceiverSlots;
     __ addi(r3, r3, Operand(return_value_offset));
-    __ ShiftLeftU64(r0, r3, Operand(kSystemPointerSizeLog2));
-    __ StoreU64(scratch, MemOperand(sp, r0));
+    Register offset_scratch = temps.Acquire();
+    __ ShiftLeftU64(offset_scratch, r3, Operand(kSystemPointerSizeLog2));
+    __ StoreU64(scratch, MemOperand(sp, offset_scratch));
     // Recover arguments count.
     __ subi(r3, r3, Operand(return_value_offset));
   }
@@ -2145,8 +2150,7 @@ void Generate_ContinueToBuiltinHelper(MacroAssembler* masm,
   __ Pop(builtin);
   __ addi(sp, sp,
           Operand(BuiltinContinuationFrameConstants::kFixedFrameSizeFromFp));
-  __ Pop(r0);
-  __ mtlr(r0);
+  __ PopLR();
   __ LoadEntryFromBuiltinIndex(builtin, builtin);
   __ Jump(builtin);
 }
@@ -2475,13 +2479,15 @@ void Generate_AllocateSpaceAndShiftExistingArguments(
   Register dest = pointer_to_new_space_out;
   __ addi(dest, sp, Operand(-kSystemPointerSize));
   Label loop, skip;
-  __ mr(r0, argc_in_out);
-  __ cmpi(r0, Operand::Zero());
+  UseScratchRegisterScope temps(masm);
+  Register scratch = temps.Acquire();
+  __ mr(scratch, argc_in_out);
+  __ cmpi(scratch, Operand::Zero());
   __ ble(&skip);
-  __ mtctr(r0);
+  __ mtctr(scratch);
   __ bind(&loop);
-  __ LoadU64WithUpdate(r0, MemOperand(old_sp, kSystemPointerSize));
-  __ StoreU64WithUpdate(r0, MemOperand(dest, kSystemPointerSize));
+  __ LoadU64WithUpdate(scratch, MemOperand(old_sp, kSystemPointerSize));
+  __ StoreU64WithUpdate(scratch, MemOperand(dest, kSystemPointerSize));
   __ bdnz(&loop);
 
   __ bind(&skip);
@@ -2696,9 +2702,13 @@ void Builtins::Generate_CallFunction(MacroAssembler* masm,
   // We need to convert the receiver for non-native sloppy mode functions.
   Label done_convert;
   __ lwz(r6, FieldMemOperand(r5, offsetof(SharedFunctionInfo, flags_)));
-  __ andi(r0, r6,
-          Operand(SharedFunctionInfo::IsStrictBit::kMask |
-                  SharedFunctionInfo::IsNativeBit::kMask));
+  {
+    UseScratchRegisterScope temps(masm);
+    Register scratch = temps.Acquire();
+    __ andi(scratch, r6,
+            Operand(SharedFunctionInfo::IsStrictBit::kMask |
+                    SharedFunctionInfo::IsNativeBit::kMask));
+  }
   __ bne(&done_convert, cr0);
   {
     // ----------- S t a t e -------------
@@ -2795,12 +2805,16 @@ void Generate_PushBoundArguments(MacroAssembler* masm) {
     {
       Label done;
       __ ShiftLeftU64(r10, r7, Operand(kSystemPointerSizeLog2));
-      __ sub(r0, sp, r10);
-      // Check the stack for overflow. We are not trying to catch interruptions
-      // (i.e. debug break and preemption) here, so check the "real stack
-      // limit".
-      __ LoadStackLimit(scratch, StackLimitKind::kRealStackLimit);
-      __ CmpU64(r0, scratch);
+      {
+        UseScratchRegisterScope temps(masm);
+        Register new_sp = temps.Acquire();
+        __ sub(new_sp, sp, r10);
+        // Check the stack for overflow. We are not trying to catch
+        // interruptions (i.e. debug break and preemption) here, so check the
+        // "real stack limit".
+        __ LoadStackLimit(scratch, StackLimitKind::kRealStackLimit);
+        __ CmpU64(new_sp, scratch);
+      }
       __ bgt(&done);  // Signed comparison.
       {
         FrameScope scope(masm, StackFrame::MANUAL);
@@ -3073,8 +3087,9 @@ void Builtins::Generate_WasmLiftoffFrameSetup(MacroAssembler* masm) {
     // Increment the total invocation count of the function.
     __ LoadTaggedField(
         scratch, FieldMemOperand(vector, OFFSET_OF_DATA_START(FixedArray)));
-    __ Move(r0, Smi::FromInt(1));
-    __ AddS64(scratch, scratch, r0);
+    Register smi_val = inner_temps.Acquire();
+    __ Move(smi_val, Smi::FromInt(1));
+    __ AddS64(scratch, scratch, smi_val);
     __ StoreTaggedField(
         scratch, FieldMemOperand(vector, OFFSET_OF_DATA_START(FixedArray)));
   }
