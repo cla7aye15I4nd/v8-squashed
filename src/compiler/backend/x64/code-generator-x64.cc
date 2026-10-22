@@ -572,7 +572,7 @@ int EmitStore(MacroAssembler* masm, Operand operand, Register value,
         masm->StoreSandboxedPointerField(operand, value);
         break;
       case MachineRepresentation::kTrustedPointer:
-        masm->StoreIndirectPointerField(operand, value);
+        masm->StoreTrustedPointerField(operand, value);
         break;
       default:
         UNREACHABLE();
@@ -2588,9 +2588,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kSSEFloat32Div:
       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
       ASSEMBLE_SSE_BINOP(divss);
-      // Don't delete this mov. It may improve performance on some CPUs,
-      // when there is a (v)mulss depending on the result.
-      __ movaps(i.OutputDoubleRegister(), i.OutputDoubleRegister());
       break;
     case kSSEFloat32Sqrt:
       ASSEMBLE_SSE_UNOP(sqrtss);
@@ -2638,9 +2635,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kSSEFloat64Div:
       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
       ASSEMBLE_SSE_BINOP(divsd);
-      // Don't delete this mov. It may improve performance on some CPUs,
-      // when there is a (v)mulsd depending on the result.
-      __ Movapd(i.OutputDoubleRegister(), i.OutputDoubleRegister());
       break;
     case kSSEFloat64Mod: {
       __ AllocateStackSpace(kDoubleSize);
@@ -3155,9 +3149,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kAVXFloat32Div:
       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
       ASSEMBLE_AVX_BINOP(vdivss);
-      // Don't delete this mov. It may improve performance on some CPUs,
-      // when there is a (v)mulss depending on the result.
-      __ Movaps(i.OutputDoubleRegister(), i.OutputDoubleRegister());
       break;
     case kAVXFloat64Cmp: {
       CpuFeatureScope avx_scope(masm(), AVX);
@@ -3183,9 +3174,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kAVXFloat64Div:
       RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
       ASSEMBLE_AVX_BINOP(vdivsd);
-      // Don't delete this mov. It may improve performance on some CPUs,
-      // when there is a (v)mulsd depending on the result.
-      __ Movapd(i.OutputDoubleRegister(), i.OutputDoubleRegister());
       break;
     case kX64Float32Abs: {
       __ Absps(i.OutputDoubleRegister(), i.InputDoubleRegister(0),
@@ -4677,6 +4665,18 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       break;
     }
     case kX64F16x8Qfma: {
+      if (UseAvx10_1()) {
+        CpuFeatureScope avx10_scope(masm(), AVX10_1);
+        DCHECK_EQ(i.OutputSimd128Register(), i.InputSimd128Register(0));
+        if (instr->InputAt(2)->IsSimd128Register()) {
+          __ vfmadd213ph(i.OutputSimd128Register(), i.InputSimd128Register(1),
+                         i.InputSimd128Register(2));
+        } else {
+          __ vfmadd213ph(i.OutputSimd128Register(), i.InputSimd128Register(1),
+                         i.InputOperand(2));
+        }
+        break;
+      }
       YMMRegister ydst =
           YMMRegister::from_code(i.OutputSimd128Register().code());
       __ F16x8Qfma(ydst, i.InputSimd128Register(0), i.InputSimd128Register(1),
@@ -4685,6 +4685,18 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       break;
     }
     case kX64F16x8Qfms: {
+      if (UseAvx10_1()) {
+        CpuFeatureScope avx10_scope(masm(), AVX10_1);
+        DCHECK_EQ(i.OutputSimd128Register(), i.InputSimd128Register(0));
+        if (instr->InputAt(2)->IsSimd128Register()) {
+          __ vfnmadd213ph(i.OutputSimd128Register(), i.InputSimd128Register(1),
+                          i.InputSimd128Register(2));
+        } else {
+          __ vfnmadd213ph(i.OutputSimd128Register(), i.InputSimd128Register(1),
+                          i.InputOperand(2));
+        }
+        break;
+      }
       YMMRegister ydst =
           YMMRegister::from_code(i.OutputSimd128Register().code());
       __ F16x8Qfms(ydst, i.InputSimd128Register(0), i.InputSimd128Register(1),

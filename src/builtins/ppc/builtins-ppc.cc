@@ -1768,11 +1768,12 @@ void Builtins::Generate_ConstructForwardAllArgsImpl(
   // Copy arguments on the stack. r8 is a scratch register.
   Register argc_without_receiver = scratch;
   __ subi(argc_without_receiver, r3, Operand(kJSArgcReceiverSlots));
-  __ PushArray(r7, argc_without_receiver, r8, r0);
+  Register scratch2 = temps.Acquire();
+  __ PushArray(r7, argc_without_receiver, r8, scratch2);
 
   // Push a slot for the receiver to be constructed.
-  __ li(r0, Operand::Zero());
-  __ push(r0);
+  __ li(scratch, Operand::Zero());
+  __ push(scratch);
 
   // Call the constructor with r3, r4, and r6 unmodified.
   __ TailCallBuiltin(Builtin::kConstruct);
@@ -1873,7 +1874,7 @@ void Builtins::Generate_InterpreterPushArgsThenFastConstructFunction(
     UseScratchRegisterScope temps(masm);
     Register scratch = temps.Acquire();
     __ mov(scratch, Operand(SharedFunctionInfo::ConstructAsBuiltinBit::kMask));
-    __ and_(r0, r5, scratch, SetRC);
+    __ and_(scratch, r5, scratch, SetRC);
   }
   __ bne(&builtin_call, cr0);
 
@@ -2668,8 +2669,8 @@ void Builtins::Generate_CallOrConstructForwardVarargs(MacroAssembler* masm,
       {
         __ subi(r8, r8, Operand(1));
         __ ShiftLeftU64(scratch, r8, Operand(kSystemPointerSizeLog2));
-        __ LoadU64(r0, MemOperand(r7, scratch));
-        __ StoreU64(r0, MemOperand(r5, scratch));
+        __ LoadU64(scratch2, MemOperand(r7, scratch));
+        __ StoreU64(scratch2, MemOperand(r5, scratch));
         __ cmpi(r8, Operand::Zero());
         __ bne(&loop);
       }
@@ -2800,22 +2801,14 @@ void Generate_PushBoundArguments(MacroAssembler* masm) {
     //  -- r7 : the number of [[BoundArguments]]
     // -----------------------------------
 
-    Register scratch = r9;
-    // Reserve stack space for the [[BoundArguments]].
+    // Check the stack for overflow.
     {
+      Label stack_overflow;
+      __ StackOverflowCheck(r7, &stack_overflow);
       Label done;
-      __ ShiftLeftU64(r10, r7, Operand(kSystemPointerSizeLog2));
-      {
-        UseScratchRegisterScope temps(masm);
-        Register new_sp = temps.Acquire();
-        __ sub(new_sp, sp, r10);
-        // Check the stack for overflow. We are not trying to catch
-        // interruptions (i.e. debug break and preemption) here, so check the
-        // "real stack limit".
-        __ LoadStackLimit(scratch, StackLimitKind::kRealStackLimit);
-        __ CmpU64(new_sp, scratch);
-      }
-      __ bgt(&done);  // Signed comparison.
+      __ b(&done);
+
+      __ bind(&stack_overflow);
       {
         FrameScope scope(masm, StackFrame::MANUAL);
         __ EnterFrame(StackFrame::INTERNAL);
@@ -2830,6 +2823,7 @@ void Generate_PushBoundArguments(MacroAssembler* masm) {
     // Push [[BoundArguments]].
     {
       Label loop, done;
+      Register scratch = r9;
       __ add(r3, r3, r7);  // Adjust effective number of arguments.
       __ addi(r5, r5,
               Operand(OFFSET_OF_DATA_START(FixedArray) - kHeapObjectTag));

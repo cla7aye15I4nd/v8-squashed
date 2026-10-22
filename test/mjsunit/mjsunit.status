@@ -690,6 +690,7 @@
   'wasm/atomics-memory64': [SKIP],
   'compiler/inlining-exponential': [SKIP],
   # Profiler test is flaky on simulators.
+  'regress/wasm/regress-574704749': [SKIP],
   'wasm/log-wasm-to-js-wrapper-callref': [SKIP],
   'wasm/log-wasm-to-js-wrapper-indirect': [SKIP],
   'es6/big-weakmap': [SKIP],
@@ -721,6 +722,7 @@
   # Skip tests not suitable for GC stress.
   'allocation-site-info': [SKIP],
   'array-constructor-feedback': [SKIP],
+  'array-literal-transitions-no-pretenuring': [SKIP],
   'd8/d8-performance-now': [SKIP],
   'opt-elements-kind': [SKIP],
   'regress/regress-trap-allocation-memento': [SKIP],
@@ -1267,8 +1269,6 @@
   'regress/wasm/regress-403308742': [SKIP],
   'regress/wasm/regress-488943662': [SKIP],
   'regress/wasm/regress-505124865': [SKIP], # --wasm-compilation-hints
-  'regress/wasm/regress-526163463': [SKIP], # --wasm-code-coverage
-  'wasm/regression-521715545': [SKIP], # --wasm-code-coverage
   'wasm/async-compile': [SKIP],
   'wasm/log-code-after-post-message': [SKIP],
   'wasm/multiple-code-spaces': [SKIP],
@@ -1276,6 +1276,7 @@
   'wasm/wrapper-compilation': [SKIP],
 
   # Tests that expect different profiling samples.
+  'regress/wasm/regress-574704749': [SKIP],
   'wasm/log-wasm-to-js-wrapper-indirect': [SKIP],
 
   # Interpreter stack trace not fully implemented yet.
@@ -1284,8 +1285,6 @@
 
   # d8.exe --no-wasm-trap-handler.
   'regress/wasm/regress-842501': [SKIP],
-  'regress/wasm/regress-513413942': [SKIP],
-  'regress/wasm/regress-534275413': [SKIP],
 
   # TODO(paolosev): Support Wasm to JS calls to JSApiObjects.
   'wasm/ffi': [SKIP],
@@ -1321,7 +1320,6 @@
   'regress/wasm/regress-511772679': [SKIP],
   'regress/wasm/regress-518697709': [SKIP],
   'regress/wasm/regress-524792614': [SKIP],
-  'regress/wasm/regress-530658019': [SKIP],
   'regress/wasm/regress-535659723': [SKIP],
   'regress/wasm/regress-538378084': [SKIP],
   'regress/wasm/regress-540446645': [SKIP],
@@ -1393,13 +1391,6 @@
 
   # Wasm-to-JS type incompatibility in jitless mode with shadow realms.
   'harmony/regress/regress-511329274': [SKIP],
-
-  # Test runs with --no-wasm-trap-handler, but the interpreter's no-bounds-check
-  # memory builtins require the trap handler
-  # (CHECK(trap_handler::IsTrapHandlerEnabled()) in wasm-interpreter.cc).
-  'regress/wasm/regress-519715438': [SKIP],
-  'regress/wasm/regress-527985808': [SKIP],
-  'regress/wasm/regress-529880019': [SKIP],
 
  }],  # has_wasm_interpreter and variant == jitless
 
@@ -2097,6 +2088,7 @@
 
   # The test enables the global profiler, and there can only exist one profiler
   # at a time.
+  'regress/wasm/regress-574704749': [SKIP],
   'wasm/log-code-after-post-message': [SKIP],
 
   # These test cases assert on the exact amount of deopts happening between two
@@ -2202,6 +2194,7 @@
 
   # Tests that fail some assertions due to checking internal state sensitive
   # to GC.
+  'array-literal-transitions-no-pretenuring': [SKIP],
   'compiler/native-context-specialization-hole-check': [SKIP],
   'compiler/serializer-apply': [SKIP],
   'compiler/serializer-call': [SKIP],
@@ -2378,6 +2371,7 @@
   # allocations.
   'regress/regress-1394663': [SKIP],
   'regress/wasm/regress-crbug-1502180': [SKIP],
+  'regress/wasm/regress-574704749': [SKIP],
   'wasm/log-wasm-to-js-wrapper-callref': [SKIP],
   'wasm/log-wasm-to-js-wrapper-indirect': [SKIP],
 
@@ -2410,8 +2404,6 @@
   # Wasm code coverage is not supported yet.
   'regress/wasm/regress-488943662': [SKIP],
   'wasm/wasm-code-coverage': [SKIP],
-  'wasm/regression-521715545': [SKIP],
-  'regress/wasm/regress-526163463': [SKIP]
 }],  # arch in [ppc64, s390x]'
 
 ##############################################################################
@@ -3005,6 +2997,7 @@
 ['single_generation', {
   # These tests rely on allocation site tracking which only works in the young generation.
   'array-constructor-feedback': [SKIP],
+  'array-literal-transitions-no-pretenuring': [SKIP],
   'wasm/generic-wrapper': [SKIP],
   'wasm/gc-casts-invalid': [SKIP],
   'regress/regress-trap-allocation-memento': [SKIP],
@@ -3038,6 +3031,7 @@
   'regress/wasm/regress-543901836': [SKIP],
   'regress/wasm/regress-560536735': [SKIP],
   'regress/wasm/regress-561660149': [SKIP],
+  'regress/wasm/regress-574223268': [SKIP],
   'compiler/regress-347724915': [SKIP],
   'regress/regress-crbug-418520151': [SKIP],
   'regress/regress-535000102': [SKIP],
@@ -3277,6 +3271,7 @@
 ##############################################################################
 ['variant == stress_wasm_stack_switching', {
   # TODO(thibaudm): Fix profiler.
+  'regress/wasm/regress-574704749': [SKIP],
   'wasm/log-wasm-to-js-wrapper-callref': [SKIP],
   'wasm/log-wasm-to-js-wrapper-indirect': [SKIP],
 }],
@@ -3402,7 +3397,6 @@
   # Wasm code coverage is not currently supported.
   'regress/wasm/regress-488943662': [SKIP],
   'wasm/wasm-code-coverage': [SKIP],
-  'regress/wasm/regress-526163463': [SKIP],
 
   # Tests that require the sampler/profiler, which doesn't work on older kernel
   # versions if hardware sandboxing is active. See https://crbug.com/429173713.
@@ -3415,6 +3409,7 @@
   'regress/wasm/regress-406043349': [SKIP],
   'regress/wasm/regress-413963387': [SKIP],
   'regress/wasm/regress-562455563': [SKIP],
+  'regress/wasm/regress-574704749': [SKIP],
   'wasm/interrupt-worker-with-perf': [SKIP],
   'wasm/liftoff-trap-handler': [SKIP],
   'wasm/log-code-after-post-message': [SKIP],

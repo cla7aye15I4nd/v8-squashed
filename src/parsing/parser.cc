@@ -1266,6 +1266,9 @@ FunctionLiteral* Parser::DoParseFunction(Isolate* isolate, ParseInfo* info,
     }
 
     if (has_error()) return nullptr;
+    if (V8_UNLIKELY(flags().private_name_lookup_skips_outer_class())) {
+      result->scope()->RecordNeedsPrivateNameContextChainRecalc();
+    }
     result->set_requires_instance_members_initializer(
         flags().requires_instance_members_initializer());
     result->set_class_scope_has_private_brand(
@@ -2959,7 +2962,8 @@ FunctionLiteral* Parser::ParseFunctionLiteral(
   DeclarationScope* scope = NewFunctionScope(kind, parse_zone);
   SetLanguageMode(scope, language_mode);
   if (function_syntax_kind == FunctionSyntaxKind::kDeclaration) {
-    if (flags().is_reparse()) {
+    if (flags().is_reparse() && !flags().is_toplevel() &&
+        scope->outer_scope() == original_scope_) {
       scope->set_is_hoisted_in_context(flags().is_hoisted_in_context());
     } else {
       scope->set_is_hoisted_in_context(true);
@@ -3711,6 +3715,8 @@ void Parser::ParseOnBackground(LocalIsolate* isolate, ParseInfo* info,
                                info->function_name());
     }
     if (result == nullptr) return;
+    result->scope()->set_is_hoisted_in_context(
+        info->flags().is_hoisted_in_context());
     MaybeProcessSourceRanges(info, result, stack_limit_);
   });
   // We need to unpark by now though, to be able to internalize.
