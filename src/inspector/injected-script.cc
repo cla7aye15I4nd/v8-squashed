@@ -305,8 +305,7 @@ class InjectedScript::ProtocolPromiseHandler {
     std::unique_ptr<protocol::Runtime::RemoteObject> wrappedValue;
     {
       std::optional<v8::debug::SideEffectCheckScope> sideEffectCheckScope;
-      if (m_throwOnSideEffect && (m_wrapOptions->mode == WrapMode::kJson ||
-                                  m_wrapOptions->mode == WrapMode::kDeep)) {
+      if (m_throwOnSideEffect) {
         sideEffectCheckScope.emplace(m_inspector->isolate());
       }
       response = scope.injectedScript()->wrapObject(
@@ -646,10 +645,23 @@ Response InjectedScript::wrapObject(
     std::unique_ptr<protocol::Runtime::RemoteObject>* result) {
   v8::Local<v8::Context> context = m_context->context();
   v8::Context::Scope contextScope(context);
-  std::unique_ptr<ValueMirror> mirror = ValueMirror::create(context, value);
-  if (!mirror) return Response::InternalError();
-  return wrapObjectMirror(*mirror, groupName, wrapOptions, customPreviewConfig,
-                          maxCustomPreviewDepth, budget, result);
+  v8::Isolate* isolate = m_context->isolate();
+  bool terminated = false;
+  Response response = Response::InternalError();
+  {
+    v8::TryCatch tryCatch(isolate);
+    std::unique_ptr<ValueMirror> mirror = ValueMirror::create(context, value);
+    if (mirror) {
+      response =
+          wrapObjectMirror(*mirror, groupName, wrapOptions, customPreviewConfig,
+                           maxCustomPreviewDepth, budget, result);
+    }
+    terminated = tryCatch.HasTerminated();
+  }
+  if (terminated && !isolate->IsExecutionTerminating()) {
+    m_context->inspector()->debugger()->reportTermination();
+  }
+  return response;
 }
 
 Response InjectedScript::wrapObjectMirror(
@@ -758,6 +770,7 @@ std::unique_ptr<protocol::Runtime::RemoteObject> InjectedScript::wrapTable(
   std::unordered_set<String16> columnSet;
   v8::Local<v8::Array> v8Columns;
   if (maybeColumns.ToLocal(&v8Columns)) {
+    v8::TryCatch tryCatch(isolate);
     for (uint32_t i = 0; i < v8Columns->Length(); ++i) {
       v8::Local<v8::Value> column;
       if (v8Columns->Get(context, i).ToLocal(&column) && column->IsString()) {
@@ -886,7 +899,7 @@ Response InjectedScript::resolveCallArgument(
         RemoteObjectId::parse(callArgument->getObjectId(""), &remoteObjectId);
     if (!response.IsSuccess()) return response;
     if (remoteObjectId->contextId() != m_context->contextId() ||
-        remoteObjectId->isolateId() != m_context->inspector()->isolateId()) {
+        remoteObjectId->isolateId() != isolateId()) {
       return Response::ServerError(
           "Argument should belong to the same JavaScript world as target "
           "object");
@@ -1010,8 +1023,7 @@ Response InjectedScript::wrapEvaluateResult(
     Response response = Response::Success();
     {
       std::optional<v8::debug::SideEffectCheckScope> sideEffectCheckScope;
-      if (throwOnSideEffect && (wrapOptions.mode == WrapMode::kJson ||
-                                wrapOptions.mode == WrapMode::kDeep)) {
+      if (throwOnSideEffect) {
         sideEffectCheckScope.emplace(m_context->isolate());
       }
       response = wrapObject(resultValue, objectGroup, wrapOptions, result);
@@ -1023,7 +1035,10 @@ Response InjectedScript::wrapEvaluateResult(
       }
       return Response::Success();
     }
-    if (!throwOnSideEffect || !tryCatch.HasCaught()) return response;
+    if (!tryCatch.HasTerminated() &&
+        (!throwOnSideEffect || !tryCatch.HasCaught())) {
+      return response;
+    }
   }
   if (tryCatch.HasTerminated() || !tryCatch.CanContinue()) {
     return Response::ServerError("Execution was terminated");
@@ -1205,6 +1220,12 @@ Response InjectedScript::CallFrameScope::findInjectedScript(
                                      &m_inspectedContext);
 }
 
+uint64_t InjectedScript::isolateId() const {
+  V8InspectorSessionImpl* session = m_context->inspector()->sessionById(
+      m_context->contextGroupId(), m_sessionId);
+  return session ? session->isolateId() : 0;
+}
+
 String16 InjectedScript::bindObject(v8::Local<v8::Value> value,
                                     const String16& groupName) {
   if (m_lastBoundObjectId <= 0) m_lastBoundObjectId = 1;
@@ -1215,8 +1236,7 @@ String16 InjectedScript::bindObject(v8::Local<v8::Value> value,
     m_idToObjectGroupName[id] = groupName;
     m_nameToObjectGroup[groupName].push_back(id);
   }
-  return RemoteObjectId::serialize(m_context->inspector()->isolateId(),
-                                   m_context->contextId(), id);
+  return RemoteObjectId::serialize(isolateId(), m_context->contextId(), id);
 }
 
 // static

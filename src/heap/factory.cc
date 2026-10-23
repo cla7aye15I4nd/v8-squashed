@@ -65,7 +65,6 @@
 #include "src/objects/instance-type-inl.h"
 #include "src/objects/js-array-buffer-inl.h"
 #include "src/objects/js-array-inl.h"
-#include "src/objects/js-atomics-synchronization-inl.h"
 #include "src/objects/js-collection-inl.h"
 #include "src/objects/js-disposable-stack-inl.h"
 #include "src/objects/js-generator-inl.h"
@@ -3082,7 +3081,12 @@ Handle<T> Factory::CopyArrayAndGrow(DirectHandle<T> src, uint32_t grow_by,
   DisallowGarbageCollection no_gc;
   new_object->set_map_after_allocation(isolate(), src->map(),
                                        SKIP_WRITE_BARRIER);
-  Tagged<T> result = TrustedCast<T>(new_object);
+  Tagged<T> result;
+  if constexpr (is_subtype_v<T, TrustedObject>) {
+    result = TrustedCast<T>(new_object);
+  } else {
+    result = Cast<T>(new_object);
+  }
   initialize_length(result, new_len);
   // Copy the content.
   WriteBarrierModeScope mode = result->GetWriteBarrierMode(no_gc);
@@ -5127,27 +5131,6 @@ DirectHandle<JSSharedArray> Factory::NewJSSharedArray(
       InternalIndex(JSSharedArray::kLengthFieldIndex));
   instance->FastPropertyAtPut(index, Smi::FromInt(length), SKIP_WRITE_BARRIER);
   return instance;
-}
-
-Handle<JSAtomicsMutex> Factory::NewJSAtomicsMutex() {
-  SharedObjectSafePublishGuard publish_guard;
-  DirectHandle<Map> map = js_atomics_mutex_map();
-  auto mutex =
-      Cast<JSAtomicsMutex>(NewJSObjectFromMap(map, AllocationType::kSharedOld));
-  mutex->set_state(JSAtomicsMutex::kUnlockedUncontended);
-  mutex->set_owner_thread_id(ThreadId::Invalid().ToInteger());
-  mutex->SetNullWaiterQueueHead();
-  return mutex;
-}
-
-Handle<JSAtomicsCondition> Factory::NewJSAtomicsCondition() {
-  SharedObjectSafePublishGuard publish_guard;
-  DirectHandle<Map> map = js_atomics_condition_map();
-  Handle<JSAtomicsCondition> cond = Cast<JSAtomicsCondition>(
-      NewJSObjectFromMap(map, AllocationType::kSharedOld));
-  cond->set_state(JSAtomicsCondition::kEmptyState);
-  cond->SetNullWaiterQueueHead();
-  return cond;
 }
 
 namespace {

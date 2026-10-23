@@ -45,7 +45,6 @@
 #include "src/maglev/maglev-concurrent-dispatcher.h"
 #endif  // V8_ENABLE_MAGLEV
 #include "src/objects/js-array-buffer-inl.h"
-#include "src/objects/js-atomics-synchronization-inl.h"
 #include "src/objects/js-function-inl.h"
 #include "src/objects/js-regexp-inl.h"
 #include "src/objects/smi.h"
@@ -1248,7 +1247,6 @@ int FixedArrayLenFromSize(int size) {
 
 void FillUpOneNewSpacePage(Isolate* isolate, Heap* heap,
                            SemiSpaceNewSpace* space) {
-  DCHECK(!v8_flags.single_generation);
   heap->FreeMainThreadLinearAllocationAreas();
   PauseAllocationObserversScope pause_observers(heap);
   while (space->GetSpaceRemainingOnCurrentPageForTesting() > 0) {
@@ -1270,6 +1268,12 @@ void FillUpOneNewSpacePage(Isolate* isolate, Heap* heap,
 }  // namespace
 
 RUNTIME_FUNCTION(Runtime_SimulateNewspaceFull) {
+  if (v8_flags.single_generation) {
+    PrintF(
+        "Warning: %%SimulateNewspaceFull does nothing in single-generation "
+        "mode\n");
+    return ReadOnlyRoots(isolate).undefined_value();
+  }
   HandleScope scope(isolate);
   Heap* heap = isolate->heap();
   heap->FreeMainThreadLinearAllocationAreas();
@@ -2338,15 +2342,6 @@ RUNTIME_FUNCTION(Runtime_SharedGC) {
   isolate->heap()->CollectGarbageShared(isolate->main_thread_local_heap(),
                                         GarbageCollectionReason::kTesting);
   return ReadOnlyRoots(isolate).undefined_value();
-}
-
-RUNTIME_FUNCTION(Runtime_AtomicsSynchronizationPrimitiveNumWaitersForTesting) {
-  HandleScope scope(isolate);
-  CHECK_UNLESS_FUZZING(args.length() == 1);
-  CHECK_UNLESS_FUZZING(IsJSSynchronizationPrimitive(*args.at(0)));
-  DirectHandle<JSSynchronizationPrimitive> primitive =
-      args.at<JSSynchronizationPrimitive>(0);
-  return primitive->NumWaitersForTesting(isolate);
 }
 
 RUNTIME_FUNCTION(Runtime_GetWeakCollectionSize) {

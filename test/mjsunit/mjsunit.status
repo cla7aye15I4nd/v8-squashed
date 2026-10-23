@@ -103,7 +103,6 @@
 
   # TODO(572988458): Skip --harmony-struct/--shared-string-table tests.
   # To be removed soon.
-  'harmony/regress/regress-520728938': [SKIP],
   'regress/regress-476509600': [SKIP],
   'regress/regress-499155348': [SKIP],
   'regress/regress-505101417': [SKIP],
@@ -113,26 +112,18 @@
   'shared-memory/brand-checks': [SKIP],
   'shared-memory/builtins': [SKIP],
   'shared-memory/cannot-redefine-properties': [SKIP],
-  'shared-memory/condition': [SKIP],
-  'shared-memory/condition-workers': [SKIP],
-  'shared-memory/mutex': [SKIP],
-  'shared-memory/mutex-lock-twice': [SKIP],
-  'shared-memory/mutex-workers': [SKIP],
   'shared-memory/optimize-non-instance': [SKIP],
   'shared-memory/private-brand': [SKIP],
   'shared-memory/private-field': [SKIP],
   'shared-memory/private-name': [SKIP],
   'shared-memory/regress-488754149': [SKIP],
-  'shared-memory/regress-524783017': [SKIP],
   'shared-memory/regress-crbug-1394741': [SKIP],
   'shared-memory/regress-crbug-1395117': [SKIP],
   'shared-memory/regress-crbug-1425710': [SKIP],
   'shared-memory/regress-crbug-1429570': [SKIP],
   'shared-memory/regress-crbug-1441241': [SKIP],
-  'shared-memory/regress-crbug-1449611': [SKIP],
   'shared-memory/regress-crbug-1487973': [SKIP],
   'shared-memory/regress-crbug-1492013': [SKIP],
-  'shared-memory/regress-crbug-333007256': [SKIP],
   'shared-memory/regress/regress-468231509': [SKIP],
   'shared-memory/regress/regress-469804007': [SKIP],
   'shared-memory/regress/regress-541880797': [SKIP],
@@ -1227,7 +1218,6 @@
   'regress/wasm/regress-561662099': [SKIP],
   'regress/wasm/regress-563427048*': [SKIP],
   'regress/wasm/regress-567171844': [SKIP],
-  'regress/wasm/regress-569886678': [SKIP],
   'wasm/custom-descriptors*': [SKIP],
   'wasm/exact-types': [SKIP],
   'wasm/wasm-gc-js-roundtrip': [SKIP],
@@ -2829,6 +2819,9 @@
 
 ##############################################################################
 ['variant == stress_concurrent_allocation', {
+  # Concurrent allocations trigger GCs that clear AllocationMementos before
+  # elements kind transitions occur.
+  'array-literal-transitions-no-pretenuring': [SKIP],
   # This test manually forces pretenuring of allocation sites.
   # stress-concurrent-allocation reverts the pretenuring decision due to low
   # survival rate in old generation.
@@ -2998,43 +2991,19 @@
   # These tests rely on allocation site tracking which only works in the young generation.
   'array-constructor-feedback': [SKIP],
   'array-literal-transitions-no-pretenuring': [SKIP],
-  'wasm/generic-wrapper': [SKIP],
   'wasm/gc-casts-invalid': [SKIP],
   'regress/regress-trap-allocation-memento': [SKIP],
-  'regress/regress-crbug-1151890': [SKIP],
-  'regress/regress-crbug-1163184': [SKIP],
-  'regress/regress-11519': [SKIP],
   'regress/regress-4121': [SKIP],
-  'packed-elements': [SKIP],
   'compiler/native-context-specialization-hole-check': [SKIP],
   'compiler/test-literal-map-migration': [SKIP],
   'compiler/deopt-pretenure': [SKIP],
   'compiler/fast-api-sequences-x64': [SKIP],
-  'compiler/regress-store-store-elim': [SKIP],
 
   # TODO(v8:12031): Reimplement elements kinds transitions when concurrent
   # inlining.
   'default-nospec': [SKIP],
   'es6/collections-constructor-*': [SKIP],
   'es6/map-constructor-entry-side-effect*': [SKIP],
-  # These tests use %SimulateNewspaceFull, which only works in the young generation
-  'regress/regress-1424415': [SKIP],
-  'regress/wasm/regress-375314963': [SKIP],
-  'wasm/jspi-export': [SKIP],
-  'wasm/jspi-generic-wrapper': [SKIP],
-  'wasm/jspi-no-stress': [SKIP],
-  'regress/wasm/regress-v8-14471': [SKIP],
-  'regress/wasm/regress-346597059': [SKIP],
-  'regress/wasm/regress-349640002': [SKIP],
-  'regress/wasm/regress-455832038': [SKIP],
-  'regress/wasm/regress-483269968': [SKIP],
-  'regress/wasm/regress-543901836': [SKIP],
-  'regress/wasm/regress-560536735': [SKIP],
-  'regress/wasm/regress-561660149': [SKIP],
-  'regress/wasm/regress-574223268': [SKIP],
-  'compiler/regress-347724915': [SKIP],
-  'regress/regress-crbug-418520151': [SKIP],
-  'regress/regress-535000102': [SKIP],
 
   # TODO(v8:14581): Re-enable this test once TransitionElementsKindOrCheckMap is
   # supported by the Maglev->Turboshaft graph builder.
@@ -3354,9 +3323,6 @@
   # Negative tests are not supported, because we pass --no-fail.
   'bugs/*': [SKIP],
   'es6/unicode-regexp-ignore-case-noi18n': [SKIP],
-
-  # Hangs when --enable-inspector is reset by --fuzzing.
-  'regress/wasm/regress-570538338': [SKIP],
 }],  # variant in [jit_fuzzing, jit_fuzzing_maglev]
 
 ##############################################################################
@@ -3409,6 +3375,7 @@
   'regress/wasm/regress-406043349': [SKIP],
   'regress/wasm/regress-413963387': [SKIP],
   'regress/wasm/regress-562455563': [SKIP],
+  'regress/wasm/regress-573446890': [SKIP],
   'regress/wasm/regress-574704749': [SKIP],
   'wasm/interrupt-worker-with-perf': [SKIP],
   'wasm/liftoff-trap-handler': [SKIP],

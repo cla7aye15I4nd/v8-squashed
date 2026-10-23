@@ -39,7 +39,6 @@
 #include "src/objects/instance-type.h"
 #include "src/objects/js-array-buffer-inl.h"
 #include "src/objects/js-array-inl.h"
-#include "src/objects/js-atomics-synchronization-inl.h"
 #include "src/objects/js-disposable-stack.h"
 #include "src/objects/js-proxy-inl.h"
 #include "src/objects/literal-objects.h"
@@ -329,9 +328,13 @@ void HeapObject::HeapObjectVerify(Isolate* isolate) {
       Cast<HashSeedWrapper>(this)->HashSeedWrapperVerify(isolate);
       break;
 
-#define MAKE_VERIFY_CASE(Name, TYPE)                \
-  case TYPE:                                        \
-    TrustedCast<Name>(this)->Name##Verify(isolate); \
+#define MAKE_VERIFY_CASE(Name, TYPE)                   \
+  case TYPE:                                           \
+    if constexpr (is_subtype_v<Name, TrustedObject>) { \
+      TrustedCast<Name>(this)->Name##Verify(isolate);  \
+    } else {                                           \
+      Cast<Name>(this)->Name##Verify(isolate);         \
+    }                                                  \
     break;
       HEAP_OBJECT_DIAGNOSTIC_DISPATCH_LIST(MAKE_VERIFY_CASE)
 #undef MAKE_VERIFY_CASE
@@ -839,8 +842,7 @@ void Map::MapVerify(Isolate* isolate) {
                  JSObject::GetEmbedderFieldCount(this) * kEmbedderDataSlotSize,
              inobject_fields_start_offset);
 
-    if (IsJSSharedStructMap(this) || IsJSSharedArrayMap(this) ||
-        Is<JSAtomicsMutex>(this) || Is<JSAtomicsCondition>(this)) {
+    if (IsJSSharedStructMap(this) || IsJSSharedArrayMap(this)) {
       if (COMPRESS_POINTERS_IN_MULTIPLE_CAGES_BOOL) {
         // TODO(v8:14089): Verify what should be checked in this configuration
         // and again merge with the else-branch below.
@@ -2341,18 +2343,6 @@ void JSSharedStruct::JSSharedStructVerify(Isolate* isolate) {
   }
 }
 
-void JSAtomicsMutex::JSAtomicsMutexVerify(Isolate* isolate) {
-  CHECK(Is<JSAtomicsMutex>(this));
-  CHECK(HeapLayout::InWritableSharedSpace(Tagged<HeapObject>(this)));
-  JSObjectVerify(isolate);
-}
-
-void JSAtomicsCondition::JSAtomicsConditionVerify(Isolate* isolate) {
-  CHECK(Is<JSAtomicsCondition>(this));
-  CHECK(HeapLayout::InAnySharedSpace(Tagged<HeapObject>(this)));
-  JSObjectVerify(isolate);
-}
-
 void JSDisposableStackBase::JSDisposableStackBaseVerify(Isolate* isolate) {
   JSObjectVerify(isolate);
   const int len = length();
@@ -3338,7 +3328,7 @@ void WasmTrustedInstanceData::WasmTrustedInstanceDataVerify(Isolate* isolate) {
     CHECK_EQ(size_or_address,
              reinterpret_cast<Address>(
                  TrustedCast<TrustedManaged<BackingStore>>(backing_store_obj)
-                     ->raw()
+                     ->raw(DisallowGarbageCollection{})
                      ->byte_length_address()));
   }
 }

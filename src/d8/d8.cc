@@ -3528,6 +3528,8 @@ void Shell::WasmDeserializeModule(
   i::wasm::CompileTimeImports compile_time_imports =
       i::WasmJs::CompileTimeImportsFromArgument(
           Utils::OpenDirectHandle(*info[2]), i_isolate, enabled_features);
+  // Evaluating compile-time imports calls into JS and can throw.
+  if (i_isolate->has_exception()) return;
 
   Local<ArrayBuffer> serialized_bytes_buffer = info[0].As<ArrayBuffer>();
   Local<ArrayBufferView> wire_bytes_view = info[1].As<ArrayBufferView>();
@@ -3579,15 +3581,20 @@ void Shell::WasmDeserializeModule(
 
   // For correctness fuzzing, the `serializeModule` function always returns an
   // empty buffer. We thus have to accept this empty buffer again here, and
-  // produce a valid module.
+  // compile the wire bytes directly.
   if (i::v8_flags.correctness_fuzzer_suppressions) {
     CHECK(serialized_bytes_vec.empty());
     i::wasm::ErrorThrower thrower{i_isolate, "d8.wasm.deserializeModule"};
-    module_object =
-        i::wasm::GetWasmEngine()
-            ->SyncCompile(i_isolate, enabled_features, compile_time_imports,
-                          &thrower, std::move(wire_bytes_vec))
-            .ToHandleChecked();
+    if (!i::wasm::GetWasmEngine()
+             ->SyncCompile(i_isolate, enabled_features,
+                           std::move(compile_time_imports), &thrower,
+                           std::move(wire_bytes_vec))
+             .ToHandle(&module_object)) {
+      // Compilation can still fail if compile-time imports do not match;
+      // `thrower` schedules the exception on destruction.
+      CHECK(thrower.error());
+      return;
+    }
     DCHECK(!thrower.error());
   } else {
     // Note that {wasm::DeserializeNativeModule} will allocate. We assume the
@@ -8432,6 +8439,10 @@ int Shell::Main(int argc, char* argv[]) {
     }
   }
 
+  if (i::v8_flags.fuzzilli_enable_optimized_code_coverage) {
+    cov_init_optimized_code_edges(kFuzzilliNumOptimizedCodeEdges);
+  }
+
   // Let the parent process (Fuzzilli) know we are ready.
   char helo[] = "HELO";
   if (write(REPRL_CWFD, helo, 4) != 4 || read(REPRL_CRFD, helo, 4) != 4) {
@@ -8627,6 +8638,13 @@ int Shell::Main(int argc, char* argv[]) {
       // Send result to parent (fuzzilli) and reset edge guards.
       if (fuzzilli_reprl) {
         int status = result << 8;
+
+        size_t num_optimized_code_edges = 0;
+        if (i::v8_flags.fuzzilli_enable_optimized_code_coverage) {
+          num_optimized_code_edges =
+              cov_update_and_reset_optimized_code_coverage();
+        }
+
         // With inline-bool-flag coverage, the edges are only written to the
         // shared memory bitmap here (or when crashing), so this must happen
         // before the bitmap is read, i.e. before the coverage statistics are
@@ -8644,7 +8662,8 @@ int Shell::Main(int argc, char* argv[]) {
           std::ofstream covlog("covlog.txt", std::ios::app);
           covlog << iteration_counter << "\t" << tot << "\t"
                  << sanitizer_cov_count_discovered_edges() << "\t"
-                 << bitmap.size() << std::endl;
+                 << bitmap.size() << "\t" << num_optimized_code_edges
+                 << std::endl;
           iteration_counter++;
         }
         // This is run once per REPRL loop. In case of crash the coverage of

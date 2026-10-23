@@ -235,6 +235,86 @@ class TestChannel : public V8Inspector::Channel {
   v8_inspector::String16 expected_response_matcher_;
 };
 
+class DeepSerializeEmbedderClient : public v8_inspector::V8InspectorClient {
+ public:
+  std::unique_ptr<v8_inspector::DeepSerializationResult> deepSerialize(
+      v8::Local<v8::Value> v8Value, int maxDepth,
+      v8::Local<v8::Object> additionalParameters) override {
+    v8::Isolate* isolate = v8::Isolate::GetCurrent();
+    v8::Local<v8::Context> context = isolate->GetCurrentContext();
+    if (v8Value->IsObject()) {
+      v8::Local<v8::Object> obj = v8Value.As<v8::Object>();
+      v8::Local<v8::Value> marker;
+      if (obj->Get(context,
+                   v8::String::NewFromUtf8Literal(isolate, "embedder_marker"))
+              .ToLocal(&marker) &&
+          marker->IsTrue()) {
+        // Return an array of 60,000 items. If the budget (100,000) is shared
+        // across embedder-serialized objects in a single deep-serialization
+        // request, two such objects will exceed the budget and fail.
+        v8::Local<v8::Array> arr = v8::Array::New(isolate, 60000);
+        for (int i = 0; i < 60000; i++) {
+          arr->Set(context, i, v8::Integer::New(isolate, i)).Check();
+        }
+        auto deep_val = std::make_unique<v8_inspector::DeepSerializedValue>(
+            v8_inspector::StringBuffer::create(toStringView("embedder_node")),
+            arr);
+        return std::make_unique<v8_inspector::DeepSerializationResult>(
+            std::move(deep_val));
+      }
+    }
+    return nullptr;
+  }
+};
+
+class OOMTestChannel : public v8_inspector::V8Inspector::Channel {
+ public:
+  ~OOMTestChannel() override = default;
+  void sendResponse(
+      int callId,
+      std::unique_ptr<v8_inspector::StringBuffer> message) override {
+    response_ = v8_inspector::toString16(message->string());
+  }
+  void sendNotification(
+      std::unique_ptr<v8_inspector::StringBuffer> message) override {}
+  void flushProtocolNotifications() override {}
+
+  v8_inspector::String16 response_;
+};
+
+TEST_F(InspectorTest, RegressDeepSerializeBudget) {
+  v8::Isolate* isolate = v8_isolate();
+  v8::HandleScope handle_scope(isolate);
+
+  DeepSerializeEmbedderClient client;
+  std::unique_ptr<V8Inspector> inspector =
+      V8Inspector::create(isolate, &client);
+  V8ContextInfo context_info(v8_context(), 1, toStringView(""));
+  inspector->contextCreated(context_info);
+
+  OOMTestChannel channel;
+  std::unique_ptr<V8InspectorSession> session =
+      inspector->connect(1, &channel, toStringView("{}"),
+                         v8_inspector::V8Inspector::kFullyTrusted);
+
+  const char kCommand[] = R"({
+    "id": 1,
+    "method": "Runtime.evaluate",
+    "params": {
+      "expression": "const arr = []; for(let i=0; i<2; i++) arr.push({embedder_marker: true}); arr;",
+      "contextId": 1,
+      "generatePreview": false,
+      "serializationOptions": {"serialization": "deep"}
+    }
+  })";
+
+  session->dispatchProtocolMessage(toStringView(kCommand));
+
+  CHECK_NE(
+      channel.response_.find(toString16(toStringView("Object is too large"))),
+      String16::kNotFound);
+}
+
 TEST_F(InspectorTest, NoConsoleAPIForUntrustedClient) {
   v8::Isolate* isolate = v8_isolate();
   v8::HandleScope handle_scope(isolate);
@@ -617,6 +697,78 @@ TEST_F(InspectorTest, WrapObjectWithCustomPreviewNoPreview) {
   EXPECT_FALSE(remote_object->hasPreview());
   EXPECT_FALSE(remote_object->hasCustomPreview());
   EXPECT_EQ(channel.triggerCount(), 0);
+}
+
+namespace {
+
+void TerminateExecutionCallback(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  info.GetIsolate()->TerminateExecution();
+}
+
+}  // namespace
+
+// Regression test for the dangling termination exception left behind by
+// generateCustomPreview() when it runs at call depth zero without an outer
+// v8::TryCatch (e.g. an embedder calling V8InspectorSession::wrapObject with
+// generatePreview=true from C++).
+TEST_F(InspectorTest, TerminationInCustomPreviewAtCallDepthZero) {
+  v8::Isolate* isolate = v8_isolate();
+  v8::HandleScope handle_scope(isolate);
+
+  v8_inspector::V8InspectorClient default_client;
+  std::unique_ptr<V8Inspector> inspector =
+      V8Inspector::create(isolate, &default_client);
+  V8ContextInfo context_info(v8_context(), 1, toStringView(""));
+  inspector->contextCreated(context_info);
+
+  NoopChannel channel;
+  std::unique_ptr<V8InspectorSession> session =
+      inspector->connect(1, &channel, toStringView("{}"),
+                         v8_inspector::V8Inspector::kFullyTrusted);
+  session->dispatchProtocolMessage(toStringView(R"({
+    "id": 1,
+    "method": "Runtime.enable"
+  })"));
+  session->dispatchProtocolMessage(toStringView(R"({
+    "id": 2,
+    "method": "Runtime.setCustomObjectFormatterEnabled",
+    "params": {"enabled": true}
+  })"));
+
+  v8::Local<v8::Function> terminate =
+      v8::Function::New(v8_context(), &TerminateExecutionCallback)
+          .ToLocalChecked();
+  CHECK(v8_context()
+            ->Global()
+            ->Set(v8_context(), NewString("terminate"), terminate)
+            .FromJust());
+
+  // The custom formatter terminates execution while generateCustomPreview()
+  // calls into it.
+  TryRunJS(R"(
+    this.devtoolsFormatters = [{
+      header: (x) => { terminate(); return ['span', 'header']; },
+      hasBody: (x) => false,
+    }];
+    this.obj = {a: 1};
+  )");
+  CHECK(!isolate->IsExecutionTerminating());
+
+  v8::Local<v8::Value> obj = v8_context()
+                                 ->Global()
+                                 ->Get(v8_context(), NewString("obj"))
+                                 .ToLocalChecked();
+
+  // No enclosing v8::TryCatch and no JavaScript on the stack: call depth is
+  // zero here.
+  session->wrapObject(v8_context(), obj, toStringView("testGroup"),
+                      /*generatePreview=*/true);
+
+  // The termination must not be left pending on the isolate after the API
+  // call returned at call depth zero: the next V8 API call would hit
+  // DCHECK(!is_execution_terminating()) in EnterV8InternalScope.
+  CHECK(!isolate->IsExecutionTerminating());
 }
 
 namespace {

@@ -281,11 +281,13 @@ void V8Debugger::continueProgram(int targetContextGroupId,
     } else if (terminateOnResume) {
       v8::debug::SetTerminateOnResume(m_isolate);
 
-      v8::HandleScope handles(m_isolate);
-      v8::Local<v8::Context> context =
-          m_inspector->client()->ensureDefaultContextInGroup(
-              targetContextGroupId);
-      installTerminateExecutionCallbacks(context);
+      if (m_terminateExecutionReported) {
+        v8::HandleScope handles(m_isolate);
+        v8::Local<v8::Context> context =
+            m_inspector->client()->ensureDefaultContextInGroup(
+                targetContextGroupId);
+        installTerminateExecutionCallbacks(context);
+      }
 
       m_inspector->client()->quitMessageLoopOnPause();
     } else {
@@ -297,6 +299,7 @@ void V8Debugger::continueProgram(int targetContextGroupId,
 void V8Debugger::breakProgramOnAssert(int targetContextGroupId) {
   if (!enabled()) return;
   if (m_pauseOnExceptionsState == v8::debug::NoBreakOnException) return;
+  if (m_isolate->IsExecutionTerminating()) return;
   // Don't allow nested breaks.
   if (isPaused()) return;
   if (!canBreakProgram()) return;

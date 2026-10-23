@@ -122,10 +122,12 @@ class DataChannel {
       close(fd);
       return nullptr;
     }
-    // Seal against shrinking so a child cannot truncate the backing file and
-    // fault our mapping with SIGBUS.
-    if (fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK) != 0) {
-      *error = Errno("fcntl(F_SEAL_SHRINK)");
+    // Seal the size of the file to the size of our mapping. A child cannot
+    // shrink the file, which would make the mapping fault with SIGBUS. A child
+    // also cannot grow it: a write past the end fails with EPERM. Thus each
+    // channel uses at most kMaxDataSize of memory.
+    if (fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW) != 0) {
+      *error = Errno("fcntl(F_ADD_SEALS)");
       close(fd);
       return nullptr;
     }
@@ -148,21 +150,7 @@ class DataChannel {
   int fd() const { return fd_; }
   char* mapping() { return mapping_; }
 
-  void Rewind() {
-    if (lseek(fd_, 0, SEEK_CUR) > static_cast<off_t>(kMaxDataSize)) {
-      Truncate();
-    }
-    lseek(fd_, 0, SEEK_SET);
-  }
-
-  // Keeps the backing file from growing beyond the mapping if the child
-  // wrote more than kMaxDataSize.
-  void Truncate() {
-    if (ftruncate(fd_, static_cast<off_t>(kMaxDataSize)) != 0) {
-      REDLINE_WARN(kLog, "ftruncate on data channel failed: %s",
-                   strerror(errno));
-    }
-  }
+  void Rewind() { lseek(fd_, 0, SEEK_SET); }
 
   std::string_view Content() const {
     off_t pos = lseek(fd_, 0, SEEK_CUR);
@@ -271,16 +259,6 @@ void ReprlChild::Kill() {
 }
 
 bool ReprlChild::Spawn(std::string* error) {
-  // Keep the backing files of the data channels bounded.
-  script_channel_->Truncate();
-  fuzzout_channel_->Truncate();
-  if (stdout_channel_) {
-    stdout_channel_->Truncate();
-  }
-  if (stderr_channel_) {
-    stderr_channel_->Truncate();
-  }
-
   int child_to_parent[2] = {-1, -1};
   int parent_to_child[2] = {-1, -1};
   if (pipe2(child_to_parent, O_CLOEXEC) != 0) {

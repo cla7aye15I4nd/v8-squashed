@@ -422,9 +422,13 @@ void HeapObject::HeapObjectPrint(std::ostream& os) {
     case JS_MAP_VALUE_ITERATOR_TYPE:
       Cast<JSMapIterator>(this)->JSMapIteratorPrint(os);
       break;
-#define MAKE_PRINT_CASE(Name, TYPE)           \
-  case TYPE:                                  \
-    TrustedCast<Name>(this)->Name##Print(os); \
+#define MAKE_PRINT_CASE(Name, TYPE)                    \
+  case TYPE:                                           \
+    if constexpr (is_subtype_v<Name, TrustedObject>) { \
+      TrustedCast<Name>(this)->Name##Print(os);        \
+    } else {                                           \
+      Cast<Name>(this)->Name##Print(os);               \
+    }                                                  \
     break;
       HEAP_OBJECT_DIAGNOSTIC_DISPATCH_LIST(MAKE_PRINT_CASE)
 #undef MAKE_PRINT_CASE
@@ -2407,25 +2411,6 @@ void JSSharedStruct::JSSharedStructPrint(std::ostream& os) {
   if (HeapLayout::InWritableSharedSpace(Tagged<HeapObject>(this))) {
     os << " (shared)";
   }
-  JSObjectPrintBody(os, this);
-}
-
-void JSAtomicsMutex::JSAtomicsMutexPrint(std::ostream& os) {
-  JSObjectPrintHeader(os, this, "JSAtomicsMutex");
-  if (HeapLayout::InWritableSharedSpace(Tagged<HeapObject>(this))) {
-    os << " (shared)";
-  }
-  os << "\n - state: " << this->state();
-  os << "\n - owner_thread_id: " << this->owner_thread_id();
-  JSObjectPrintBody(os, this);
-}
-
-void JSAtomicsCondition::JSAtomicsConditionPrint(std::ostream& os) {
-  JSObjectPrintHeader(os, this, "JSAtomicsCondition");
-  if (HeapLayout::InWritableSharedSpace(Tagged<HeapObject>(this))) {
-    os << " (shared)";
-  }
-  os << "\n - state: " << this->state();
   JSObjectPrintBody(os, this);
 }
 
