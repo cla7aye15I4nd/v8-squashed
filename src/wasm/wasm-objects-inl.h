@@ -31,10 +31,10 @@
 #include "src/objects/slots-inl.h"
 #include "src/objects/tagged-field-inl.h"
 #include "src/objects/trusted-object-inl.h"
-#include "src/objects/trusted-pointer-inl.h"
 #include "src/roots/roots.h"
 #include "src/sandbox/check.h"
 #include "src/sandbox/isolate-inl.h"
+#include "src/sandbox/trusted-pointer-inl.h"
 #include "src/wasm/wasm-code-manager.h"
 #include "src/wasm/wasm-module.h"
 #include "third_party/fp16/src/include/fp16.h"
@@ -438,7 +438,7 @@ size_t WasmTrustedInstanceData::memory_size(uint32_t memory_index) const {
 }
 
 wasm::NativeModule* WasmTrustedInstanceData::native_module() const {
-  return managed_native_module()->get().get();
+  return managed_native_module()->unsafe_raw();
 }
 
 Tagged<WasmModuleObject> WasmTrustedInstanceData::module_object() const {
@@ -574,11 +574,11 @@ void WasmDispatchTableForImports::clear_protected_offheap_data() {
 
 WasmDispatchTableData* WasmDispatchTable::offheap_data() const {
   if (!has_protected_offheap_data()) return nullptr;
-  return protected_offheap_data()->get().get();
+  return protected_offheap_data()->unsafe_raw();
 }
 WasmDispatchTableData* WasmDispatchTableForImports::offheap_data() const {
   if (!has_protected_offheap_data()) return nullptr;
-  return protected_offheap_data()->get().get();
+  return protected_offheap_data()->unsafe_raw();
 }
 
 Tagged<ProtectedWeakFixedArray> WasmDispatchTable::protected_uses() const {
