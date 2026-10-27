@@ -37,6 +37,7 @@
   'regress/regress-507490539': [PASS, ['not memory_corruption_api', SKIP]],
   'regress/regress-513048538': [PASS, ['not memory_corruption_api', SKIP]],
   'regress/regress-568338771': [PASS, ['not memory_corruption_api', SKIP]],
+  'regress/regress-570558888': [PASS, ['not memory_corruption_api', SKIP]],
   'regress/regress-crbug-568986689': [PASS, ['not memory_corruption_api', SKIP]],
 }],  # ALWAYS
 
@@ -94,10 +95,14 @@
   'regress/regress-537219980': [SKIP],
   'regress/regress-569886678': [SKIP],
   'regress/regress-570538338': [SKIP],
+  'regress/regress-570547314': [SKIP],
   'regress/regress-571965281': [SKIP],
   'regress/regress-572276045': [SKIP],
+  'regress/regress-572403047': [SKIP],
   'regress/regress-572834323': [SKIP],
+  'regress/regress-crbug-1032042': [SKIP],
   'regress/regress-crbug-349248170': [SKIP],
+  'regress/regress-crbug-840288': [SKIP],
   'regress/regress-nested-stack-switch-catch': [SKIP],
 }],  # not has_webassembly or variant == jitless
 

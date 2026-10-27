@@ -318,6 +318,7 @@
   'regress/regress-1034322': [PASS, HEAVY, NO_VARIANTS, ['mode != release', SKIP]],
   'regress/regress-1320641': [PASS, HEAVY],
   'regress/regress-1447343': [PASS, HEAVY],
+  'regress/regress-571944332': [PASS, HEAVY],
   'regress/wasm/regress-523591366': [PASS, HEAVY],
   'wasm/grow-huge-memory': [PASS, HEAVY],
   'wasm/grow-huge-memory-resizable-buffer': [PASS, HEAVY],
@@ -879,6 +880,7 @@
   'sandbox/regress/regress-572826713': [SKIP],
   'sandbox/regress/regress-574792351': [SKIP],
   'sandbox/regress-537948358': [SKIP],
+  'sandbox/regress-558640961': [SKIP],
   'sandbox/wasm-inlining-sigcheck': [SKIP],
   'sandbox/wasm-signature-verification': [SKIP],
   'sandbox/wasm-table-import': [SKIP],
@@ -2120,6 +2122,10 @@
   'compiler/regress-519664497': [SKIP],
   'turboshaft/regress-539984773': [SKIP],
 
+  # Exhausts 32-bit virtual address space across concurrent isolates, causing
+  # Worker thread creation to fail (https://crbug.com/577898450).
+  'regress/regress-571944332': [SKIP],
+
 }],  # 'isolates'
 
 ##############################################################################
@@ -2321,6 +2327,7 @@
   'd8/d8-worker-shutdown-gc': [SKIP],
   'd8/d8-worker-onmessage-ping-pong': [SKIP],
   'harmony/futex': [SKIP],
+  'regress/regress-571944332': [SKIP],
   'typedarray-growablesharedarraybuffer-atomics': [SKIP],
 
   # Tests using a shared heap are inherently non-deterministic.
@@ -2812,6 +2819,9 @@
 
 ##############################################################################
 ['variant == stress_incremental_marking', {
+  # Incremental marking GCs can clear young-generation AllocationMementos
+  # before elements kind transitions occur.
+  'array-literal-transitions-no-pretenuring': [SKIP],
   'harmony/sharedarraybuffer-worker-gc-stress': [PASS, ['gc_stress', SKIP]],
   'regress/regress-crbug-540324230': [SKIP],
   'regress/regress-crbug-820312': [PASS, SLOW],
@@ -3132,6 +3142,7 @@
   'regress/regress-425583995': [SKIP],
   'regress/regress-490446682': [SKIP],
   'regress/regress-506499280-extended': [SKIP],
+  'regress/regress-571944332': [SKIP],
   # These tests fail because of a different ArrayBufferAllocator is used in
   # google3.
   'huge-typedarrays-*': [SKIP],
@@ -3155,10 +3166,6 @@
   # TODO(b/201757247):
   'array-constructor-feedback': [FAIL],
   'compiler/deopt-pretenure': [FAIL],
-  'compiler/native-context-specialization-hole-check': [FAIL],
-  'compiler/test-literal-map-migration': [FAIL],
-  'regress/regress-4121': [FAIL],
-  'regress/regress-trap-allocation-memento': [FAIL],
 
   # TODO(v8:14581): Re-enable this once turboshaft frontend is done.
   'turbolev/*': [SKIP],

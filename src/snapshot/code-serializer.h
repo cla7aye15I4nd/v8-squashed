@@ -234,6 +234,7 @@ class CodeSerializer : public Serializer {
 
  private:
   void SerializeObjectImpl(Handle<HeapObject> o, SlotType slot_type) override;
+  void SerializeDeferredObject(Handle<HeapObject> obj) override;
   bool SerializeTrustedExport(Tagged<HeapObject> obj);
   bool SerializeTrustedExternalReference(
       ExternalReferenceEncoder::Value reference,
@@ -242,6 +243,12 @@ class CodeSerializer : public Serializer {
     sink_.Put(kSynchronize, "EndOfUntrustedSection");
     OptimizeBackReferences();
     Pad();
+  }
+  // Slices usually refer to the script source (e.g. debug magic comment
+  // values), which is an attached object: off-thread deserialization attaches
+  // a placeholder instead of the source.
+  bool SerializeSlicedStringsAsSequentialStrings() const override {
+    return true;
   }
 
   DISALLOW_GARBAGE_COLLECTION(no_gc_)

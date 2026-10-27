@@ -1664,15 +1664,19 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kPPC_CmpDouble:
       ASSEMBLE_FLOAT_COMPARE(fcmpu);
       break;
-    case kPPC_Tst32:
+    case kPPC_Tst32: {
+      UseScratchRegisterScope temps(masm());
+      Register scratch = temps.Acquire();
       if (HasRegisterInput(instr, 1)) {
-        __ and_(r0, i.InputRegister(0), i.InputRegister(1), i.OutputRCBit());
+        __ and_(scratch, i.InputRegister(0), i.InputRegister(1),
+                i.OutputRCBit());
       } else {
-        __ andi(r0, i.InputRegister(0), i.InputImmediate(1));
+        __ andi(scratch, i.InputRegister(0), i.InputImmediate(1));
       }
-      __ extsw(r0, r0, i.OutputRCBit());
+      __ extsw(scratch, scratch, i.OutputRCBit());
       DCHECK_EQ(SetRC, i.OutputRCBit());
       break;
+    }
     case kPPC_Tst64:
       if (HasRegisterInput(instr, 1)) {
         __ and_(r0, i.InputRegister(0), i.InputRegister(1), i.OutputRCBit());
@@ -2885,8 +2889,9 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kPPC_I8x16BitMask: {
       UseScratchRegisterScope temps(masm());
       Register scratch = temps.Acquire();
+      Register scratch2 = temps.Acquire();
       __ I8x16BitMask(i.OutputRegister(), i.InputSimd128Register(0), scratch,
-                      r0, kScratchSimd128Reg);
+                      scratch2, kScratchSimd128Reg);
       break;
     }
     case kPPC_I32x4DotI8x16AddS: {
@@ -3179,13 +3184,15 @@ void CodeGenerator::AssembleConstructFrame() {
     if (false) {
 #endif  // V8_ENABLE_WEBASSEMBLY
     } else {
-      __ mflr(r0);
+      UseScratchRegisterScope temps(masm());
+      Register scratch = temps.Acquire();
+      __ mflr(scratch);
       if (V8_EMBEDDED_CONSTANT_POOL_BOOL) {
-        __ Push(r0, fp, kConstantPoolRegister);
+        __ Push(scratch, fp, kConstantPoolRegister);
         // Adjust FP to point to saved FP.
         __ SubS64(fp, sp, Operand(StandardFrameConstants::kConstantPoolOffset));
       } else {
-        __ Push(r0, fp);
+        __ Push(scratch, fp);
         __ mr(fp, sp);
       }
     }
