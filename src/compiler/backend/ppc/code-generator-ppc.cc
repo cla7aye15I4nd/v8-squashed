@@ -2466,13 +2466,14 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
   V(I32x4AllTrue)             \
   V(I16x8AllTrue)             \
   V(I8x16AllTrue)
-#define EMIT_SIMD_ALL_TRUE(name)                                        \
-  case kPPC_##name: {                                                   \
-    UseScratchRegisterScope temps(masm());                              \
-    Register scratch = temps.Acquire();                                 \
-    __ name(i.OutputRegister(), i.InputSimd128Register(0), r0, scratch, \
-            kScratchSimd128Reg);                                        \
-    break;                                                              \
+#define EMIT_SIMD_ALL_TRUE(name)                                              \
+  case kPPC_##name: {                                                         \
+    UseScratchRegisterScope temps(masm());                                    \
+    Register scratch = temps.Acquire();                                       \
+    Register scratch2 = temps.Acquire();                                      \
+    __ name(i.OutputRegister(), i.InputSimd128Register(0), scratch, scratch2, \
+            kScratchSimd128Reg);                                              \
+    break;                                                                    \
   }
       SIMD_ALL_TRUE_LIST(EMIT_SIMD_ALL_TRUE)
 #undef EMIT_SIMD_ALL_TRUE
@@ -2749,8 +2750,9 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kPPC_I64x2Mul: {
       UseScratchRegisterScope temps(masm());
       Register scratch = temps.Acquire();
+      Register scratch2 = temps.Acquire();
       __ I64x2Mul(i.OutputSimd128Register(), i.InputSimd128Register(0),
-                  i.InputSimd128Register(1), scratch, r0,
+                  i.InputSimd128Register(1), scratch, scratch2,
                   i.ToRegister(instr->TempAt(0)), kScratchSimd128Reg);
       break;
     }
@@ -2769,9 +2771,10 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kPPC_S128Const: {
       UseScratchRegisterScope temps(masm());
       Register scratch = temps.Acquire();
+      Register scratch2 = temps.Acquire();
       uint64_t low = make_uint64(i.InputUint32(1), i.InputUint32(0));
       uint64_t high = make_uint64(i.InputUint32(3), i.InputUint32(2));
-      __ S128Const(i.OutputSimd128Register(), high, low, r0, scratch);
+      __ S128Const(i.OutputSimd128Register(), high, low, scratch, scratch2);
       break;
     }
     case kPPC_S128Zero: {
@@ -2795,8 +2798,9 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kPPC_V128AnyTrue: {
       UseScratchRegisterScope temps(masm());
       Register scratch = temps.Acquire();
-      __ V128AnyTrue(i.OutputRegister(), i.InputSimd128Register(0), r0, scratch,
-                     kScratchSimd128Reg);
+      Register scratch2 = temps.Acquire();
+      __ V128AnyTrue(i.OutputRegister(), i.InputSimd128Register(0), scratch,
+                     scratch2, kScratchSimd128Reg);
       break;
     }
     case kPPC_F64x2ConvertLowI32x4U: {
@@ -2860,8 +2864,9 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       uint64_t high = make_uint64(i.InputUint32(5), i.InputUint32(4));
       UseScratchRegisterScope temps(masm());
       Register scratch = temps.Acquire();
+      Register scratch2 = temps.Acquire();
       __ I8x16Shuffle(i.OutputSimd128Register(), i.InputSimd128Register(0),
-                      i.InputSimd128Register(1), high, low, r0, scratch,
+                      i.InputSimd128Register(1), high, low, scratch, scratch2,
                       kScratchSimd128Reg);
       break;
     }
@@ -3135,9 +3140,10 @@ void CodeGenerator::AssembleArchTableSwitch(Instruction* instr) {
   __ bge(GetLabel(i.InputRpo(1)));
   UseScratchRegisterScope temps(masm());
   Register scratch = temps.Acquire();
+  Register offset = temps.Acquire();
   __ GetLabelAddress(scratch, table);
-  __ ShiftLeftU64(r0, input, Operand(kSystemPointerSizeLog2));
-  __ LoadU64(scratch, MemOperand(scratch, r0));
+  __ ShiftLeftU64(offset, input, Operand(kSystemPointerSizeLog2));
+  __ LoadU64(scratch, MemOperand(scratch, offset));
   __ Jump(scratch);
 }
 

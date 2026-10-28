@@ -15,6 +15,7 @@
 #include "src/inspector/v8-inspector-impl.h"
 #include "src/inspector/v8-inspector-session-impl.h"
 #include "src/inspector/v8-runtime-agent-impl.h"
+#include "test/common/flag-utils.h"
 #include "test/unittests/test-utils.h"
 #include "testing/gtest/include/gtest/gtest.h"
 
@@ -256,9 +257,54 @@ class DeepSerializeEmbedderClient : public v8_inspector::V8InspectorClient {
         return std::make_unique<v8_inspector::DeepSerializationResult>(
             std::move(deep_val));
       }
+      if (obj->Get(context,
+                   v8::String::NewFromUtf8Literal(isolate, "embedder_exceed"))
+              .ToLocal(&marker) &&
+          marker->IsTrue()) {
+        v8::Local<v8::Array> arr = v8::Array::New(isolate, 2);
+        v8::Local<v8::Array> a1 = v8::Array::New(isolate, 1);
+        v8::Local<v8::Array> a2 = v8::Array::New(isolate, 10'000'000 - 3);
+        CHECK(arr->Set(context, 0, a1).FromJust());
+        CHECK(arr->Set(context, 1, a2).FromJust());
+        auto deep_val = std::make_unique<v8_inspector::DeepSerializedValue>(
+            v8_inspector::StringBuffer::create(toStringView("embedder_node")),
+            arr);
+        return std::make_unique<v8_inspector::DeepSerializationResult>(
+            std::move(deep_val));
+      }
+      if (obj->Get(context,
+                   v8::String::NewFromUtf8Literal(isolate, "embedder_one"))
+              .ToLocal(&marker) &&
+          marker->IsTrue()) {
+        v8::Local<v8::Array> arr = v8::Array::New(isolate, 1);
+        auto deep_val = std::make_unique<v8_inspector::DeepSerializedValue>(
+            v8_inspector::StringBuffer::create(toStringView("embedder_node")),
+            arr);
+        return std::make_unique<v8_inspector::DeepSerializationResult>(
+            std::move(deep_val));
+      }
     }
     return nullptr;
   }
+};
+
+class SubtypeDescriptionClient : public v8_inspector::V8InspectorClient {
+ public:
+  std::unique_ptr<v8_inspector::StringBuffer> valueSubtype(
+      v8::Local<v8::Value> value) override {
+    if (value->IsObject() && !value->IsArray() && !value->IsMap()) {
+      return v8_inspector::StringBuffer::create(toStringView("node"));
+    }
+    return nullptr;
+  }
+
+  std::unique_ptr<v8_inspector::StringBuffer> descriptionForValueSubtype(
+      v8::Local<v8::Context>, v8::Local<v8::Value>) override {
+    description_calls_++;
+    return v8_inspector::StringBuffer::create(toStringView("node_desc"));
+  }
+
+  int description_calls_ = 0;
 };
 
 class OOMTestChannel : public v8_inspector::V8Inspector::Channel {
@@ -305,6 +351,70 @@ TEST_F(InspectorTest, RegressDeepSerializeBudget) {
   CHECK_NE(
       channel.response_.find(toString16(toStringView("Object is too large"))),
       String16::kNotFound);
+}
+
+TEST_F(InspectorTest, RegressDeepSerializeValuesBudget) {
+  v8::Isolate* isolate = v8_isolate();
+  v8::HandleScope handle_scope(isolate);
+
+  DeepSerializeEmbedderClient client;
+  std::unique_ptr<V8Inspector> inspector =
+      V8Inspector::create(isolate, &client);
+  V8ContextInfo context_info(v8_context(), 1, toStringView(""));
+  inspector->contextCreated(context_info);
+
+  std::vector<std::string> expressions = {
+      "[new Array(1), {embedder_exceed: true}]",
+      "[{a: 1}, {embedder_exceed: true}]",
+      "[new Map([[1, 1]]), {embedder_exceed: true}]",
+      "[{embedder_one: true}, new Array(10000000)]",
+  };
+
+  for (const auto& expr : expressions) {
+    OOMTestChannel channel;
+    std::unique_ptr<V8InspectorSession> session =
+        inspector->connect(1, &channel, toStringView("{}"),
+                           v8_inspector::V8Inspector::kFullyTrusted);
+
+    std::string command =
+        "{\"id\": 1, \"method\": \"Runtime.evaluate\", \"params\": "
+        "{\"expression\": \"" +
+        expr +
+        "\", \"contextId\": 1, \"generatePreview\": false, "
+        "\"serializationOptions\": {\"serialization\": \"deep\"}}}";
+
+    session->dispatchProtocolMessage(toStringView(String16(command.c_str())));
+
+    CHECK_NE(
+        channel.response_.find(toString16(toStringView("Object is too large"))),
+        String16::kNotFound);
+  }
+}
+
+TEST_F(InspectorTest, DeepSerializeDoesNotDescribeChildObjects) {
+  v8::Isolate* isolate = v8_isolate();
+  v8::HandleScope handle_scope(isolate);
+
+  SubtypeDescriptionClient client;
+  std::unique_ptr<V8Inspector> inspector =
+      V8Inspector::create(isolate, &client);
+  V8ContextInfo context_info(v8_context(), 1, toStringView(""));
+  inspector->contextCreated(context_info);
+
+  OOMTestChannel channel;
+  std::unique_ptr<V8InspectorSession> session =
+      inspector->connect(1, &channel, toStringView("{}"),
+                         v8_inspector::V8Inspector::kFullyTrusted);
+
+  std::string command =
+      "{\"id\": 1, \"method\": \"Runtime.evaluate\", \"params\": "
+      "{\"expression\": \"const x = {}; [x, x, {a: x}, new Map([[x, x]])]\","
+      "\"contextId\": 1, \"generatePreview\": false, "
+      "\"serializationOptions\": {\"serialization\": \"deep\"}}}";
+
+  session->dispatchProtocolMessage(toStringView(String16(command.c_str())));
+
+  CHECK_EQ(client.description_calls_, 0);
 }
 
 TEST_F(InspectorTest, NoConsoleAPIForUntrustedClient) {
@@ -765,6 +875,66 @@ TEST_F(InspectorTest, TerminationInCustomPreviewAtCallDepthZero) {
 
 namespace {
 
+class DefaultContextClient : public v8_inspector::V8InspectorClient {
+ public:
+  DefaultContextClient(v8::Isolate* isolate, v8::Local<v8::Context> context)
+      : m_isolate(isolate), m_context(isolate, context) {}
+  v8::Local<v8::Context> ensureDefaultContextInGroup(
+      int contextGroupId) override {
+    return m_context.Get(m_isolate);
+  }
+
+ private:
+  v8::Isolate* m_isolate;
+  v8::Global<v8::Context> m_context;
+};
+
+}  // namespace
+
+TEST_F(InspectorTest, TerminateExecutionWithDetachedDefaultContext) {
+  v8::Isolate* isolate = v8_isolate();
+  v8::HandleScope handle_scope(isolate);
+
+  v8::Local<v8::Context> context = v8::Context::New(isolate);
+  DefaultContextClient client(isolate, context);
+  std::unique_ptr<V8Inspector> inspector =
+      V8Inspector::create(isolate, &client);
+  V8ContextInfo context_info(context, 1, toStringView(""));
+  inspector->contextCreated(context_info);
+
+  NoopChannel channel;
+  std::unique_ptr<V8InspectorSession> session =
+      inspector->connect(1, &channel, toStringView("{}"),
+                         v8_inspector::V8Inspector::kFullyTrusted);
+
+  // 1. Detach default context while terminateExecution callback is registered.
+  session->dispatchProtocolMessage(toStringView(R"({
+    "id": 1,
+    "method": "Runtime.terminateExecution"
+  })"));
+  context->DetachGlobal();
+  // Destroying session and inspector should not crash when removing the
+  // callback from the detached context's microtask queue.
+  session.reset();
+  inspector.reset();
+
+  // 2. Calling Runtime.terminateExecution when the default context is already
+  // detached.
+  std::unique_ptr<V8Inspector> inspector2 =
+      V8Inspector::create(isolate, &client);
+  std::unique_ptr<V8InspectorSession> session2 =
+      inspector2->connect(1, &channel, toStringView("{}"),
+                          v8_inspector::V8Inspector::kFullyTrusted);
+  session2->dispatchProtocolMessage(toStringView(R"({
+    "id": 2,
+    "method": "Runtime.terminateExecution"
+  })"));
+  session2.reset();
+  inspector2.reset();
+}
+
+namespace {
+
 // Calls into JavaScript for every Debugger.paused and Debugger.resumed
 // notification, like an embedder that exposes an in-process session to JS.
 class JSCallbackChannel : public V8Inspector::Channel {
@@ -850,6 +1020,117 @@ TEST_F(InspectorTest, ChannelCanRunJSWhenPausedOnInterrupt) {
       "for (let i = 0; i < 1e7 && notifications === 0; i++) {}"
       "notifications");
   CHECK_EQ(result->Int32Value(v8_context()).FromJust(), 2);
+}
+
+namespace {
+
+class DeoptOnRestartFrameChannel : public V8Inspector::Channel,
+                                   public v8_inspector::V8InspectorClient {
+ public:
+  DeoptOnRestartFrameChannel(v8::Isolate* isolate,
+                             v8::Local<v8::Context> context)
+      : isolate_(isolate), context_(isolate, context) {}
+  ~DeoptOnRestartFrameChannel() override = default;
+
+  void set_session(V8InspectorSession* session) { session_ = session; }
+
+  void DispatchRestartFrame() {
+    if (!call_frame_id_.empty() && session_) {
+      std::string msg =
+          "{\"id\": 2, \"method\": \"Debugger.restartFrame\", \"params\": "
+          "{\"callFrameId\": \"" +
+          call_frame_id_ + "\", \"mode\": \"StepInto\"}}";
+      StringView msg_view(reinterpret_cast<const uint8_t*>(msg.data()),
+                          msg.size());
+      session_->dispatchProtocolMessage(msg_view);
+    }
+  }
+
+  void sendResponse(int callId,
+                    std::unique_ptr<StringBuffer> message) override {
+    if (callId == 2) {
+      i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate_);
+      CHECK(!i_isolate->debug()->IsRestartFrameScheduled());
+      response_received_ = true;
+    }
+  }
+
+  void sendNotification(std::unique_ptr<StringBuffer> message) override {
+    StringView str_view = message->string();
+    std::string message_str;
+    if (str_view.is8Bit()) {
+      message_str =
+          std::string(reinterpret_cast<const char*>(str_view.characters8()),
+                      str_view.length());
+    } else {
+      for (size_t i = 0; i < str_view.length(); i++) {
+        message_str += static_cast<char>(str_view.characters16()[i]);
+      }
+    }
+    if (message_str.find("Debugger.paused") != std::string::npos) {
+      const char kTarget[] = "\"callFrameId\":\"";
+      size_t pos = message_str.find(kTarget);
+      if (pos != std::string::npos) {
+        size_t start = pos + strlen(kTarget);
+        size_t end = message_str.find("\"", start);
+        if (end != std::string::npos) {
+          call_frame_id_ = message_str.substr(start, end - start);
+        }
+      }
+    }
+  }
+
+  void runMessageLoopOnPause(int contextGroupId) override {
+    if (!restarted_ && !call_frame_id_.empty() && session_) {
+      restarted_ = true;
+      DispatchRestartFrame();
+    }
+  }
+
+  void quitMessageLoopOnPause() override {}
+
+  void flushProtocolNotifications() override {}
+
+  bool response_received() const { return response_received_; }
+
+ private:
+  v8::Isolate* isolate_;
+  v8::Global<v8::Context> context_;
+  V8InspectorSession* session_ = nullptr;
+  std::string call_frame_id_;
+  bool restarted_ = false;
+  bool response_received_ = false;
+};
+
+}  // namespace
+
+TEST_F(InspectorTest, ChannelCanDeoptWhenRestartingFrame) {
+  FlagScope<bool> allow_natives_syntax(&v8_flags.allow_natives_syntax, true);
+
+  v8::Isolate* isolate = v8_isolate();
+  v8::HandleScope handle_scope(isolate);
+
+  DeoptOnRestartFrameChannel channel(isolate, v8_context());
+  std::unique_ptr<V8Inspector> inspector =
+      V8Inspector::create(isolate, &channel);
+  V8ContextInfo context_info(v8_context(), 1, toStringView(""));
+  inspector->contextCreated(context_info);
+
+  std::unique_ptr<V8InspectorSession> session = inspector->connect(
+      1, &channel, toStringView("{}"), v8_inspector::V8Inspector::kFullyTrusted,
+      v8_inspector::V8Inspector::kNotWaitingForDebugger);
+  channel.set_session(session.get());
+
+  session->dispatchProtocolMessage(
+      toStringView(R"({"id": 1, "method": "Debugger.enable"})"));
+
+  TryRunJS(R"(
+    function target() { debugger; return 42; }
+  )");
+
+  v8::Local<v8::Value> result = TryRunJS("target()").ToLocalChecked();
+  CHECK_EQ(result->Int32Value(v8_context()).FromJust(), 42);
+  CHECK(channel.response_received());
 }
 }  // namespace internal
 }  // namespace v8

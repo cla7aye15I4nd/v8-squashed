@@ -506,23 +506,6 @@ LSXSize LaneSizeToLSXSize(LaneSize size) {
     __ dbar(0);                                                          \
   } while (0)
 
-// only use for sub_w and sub_d
-#define ASSEMBLE_ATOMIC_BINOP(load_linked, store_conditional, bin_instr)       \
-  do {                                                                         \
-    Label binop;                                                               \
-    __ Add_d(i.TempRegister(0), i.InputRegister(0), i.InputRegister(1));       \
-    __ dbar(0);                                                                \
-    __ bind(&binop);                                                           \
-    __ load_linked(i.OutputRegister(0), MemOperand(i.TempRegister(0), 0),      \
-                   &trap_pc);                                                  \
-    RecordTrapInfoIfNeeded(zone(), this, opcode, instr, trap_pc);              \
-    __ bin_instr(i.TempRegister(1), i.OutputRegister(0),                       \
-                 Operand(i.InputRegister(2)));                                 \
-    __ store_conditional(i.TempRegister(1), MemOperand(i.TempRegister(0), 0)); \
-    __ BranchShort(&binop, eq, i.TempRegister(1), Operand(zero_reg));          \
-    __ dbar(0);                                                                \
-  } while (0)
-
 // TODO(LOONG_dev): remove second dbar?
 #define ASSEMBLE_ATOMIC_BINOP_EXT(load_linked, store_conditional, sign_extend, \
                                   size, bin_instr, representation)             \
@@ -1558,6 +1541,12 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kLoong64Clz_d:
       __ clz_d(i.OutputRegister(), i.InputRegister(0));
       break;
+    case kLoong64Ctz_w:
+      __ ctz_w(i.OutputRegister(), i.InputRegister(0));
+      break;
+    case kLoong64Ctz_d:
+      __ ctz_d(i.OutputRegister(), i.InputRegister(0));
+      break;
     case kLoong64Popcnt_w:
       __ Popcnt_w(i.OutputRegister(), i.InputRegister(0));
       break;
@@ -2246,7 +2235,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
           __ Fst_d(i.InputDoubleRegister(0), MemOperand(sp, i.InputInt32(1)));
         }
       } else {
-        __ St_d(i.InputRegister(0), MemOperand(sp, i.InputInt32(1)));
+        __ St_d(i.InputOrZeroRegister(0), MemOperand(sp, i.InputInt32(1)));
       }
       break;
     }
@@ -4296,7 +4285,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kAtomicSubWord32:
       switch (AtomicWidthField::decode(opcode)) {
         case AtomicWidth::kWord32:
-          ASSEMBLE_ATOMIC_BINOP(Ll_w, Sc_w, Sub_w);
+          __ Add_d(i.TempRegister(0), i.InputRegister(0), i.InputRegister(1));
+          __ Sub_w(i.TempRegister(1), zero_reg, Operand(i.InputRegister(2)));
+          RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
+          __ amadd_db_w(i.OutputRegister(0), i.TempRegister(1),
+                        i.TempRegister(0));
           break;
         case AtomicWidth::kWord64:
           ASSEMBLE_ATOMIC_BINOP_EXT(Ll_d, Sc_d, false, 32, Sub_d, 64);
@@ -4395,7 +4388,10 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
 #undef ATOMIC_BINOP_CASE
 
     case kLoong64Word64AtomicSubUint64:
-      ASSEMBLE_ATOMIC_BINOP(Ll_d, Sc_d, Sub_d);
+      __ Add_d(i.TempRegister(0), i.InputRegister(0), i.InputRegister(1));
+      __ Sub_d(i.TempRegister(1), zero_reg, Operand(i.InputRegister(2)));
+      RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
+      __ amadd_db_d(i.OutputRegister(0), i.TempRegister(1), i.TempRegister(0));
       break;
     case kLoong64Word64AtomicAddUint64:
       __ Add_d(i.TempRegister(0), i.InputRegister(0), i.InputRegister(1));
@@ -5574,6 +5570,15 @@ void CodeGenerator::AssembleMove(InstructionOperand* source,
   } else if (source->IsConstant()) {
     Constant src = g.ToConstant(source);
     if (destination->IsRegister() || destination->IsStackSlot()) {
+      // A relocatable constant (e.g. a Wasm canonical signature id) is a
+      // placeholder that is patched later, so it must be materialized even
+      // when its value is zero.
+      if (destination->IsStackSlot() && RelocInfo::IsNoInfo(src.rmode()) &&
+          ((src.type() == Constant::kInt32 && src.ToInt32() == 0) ||
+           (src.type() == Constant::kInt64 && src.ToInt64() == 0))) {
+        __ St_d(zero_reg, g.ToMemOperand(destination));
+        return;
+      }
       UseScratchRegisterScope temps(masm());
       Register scratch = temps.Acquire();
       Register dst =
@@ -5801,7 +5806,6 @@ void CodeGenerator::AssembleJumpTable(base::Vector<Label*> targets) {
 
 #undef ASSEMBLE_ATOMIC_LOAD_INTEGER
 #undef ASSEMBLE_ATOMIC_STORE_INTEGER
-#undef ASSEMBLE_ATOMIC_BINOP
 #undef ASSEMBLE_ATOMIC_BINOP_EXT
 #undef ASSEMBLE_ATOMIC_EXCHANGE_INTEGER
 #undef ASSEMBLE_ATOMIC_EXCHANGE_INTEGER_EXT

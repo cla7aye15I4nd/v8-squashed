@@ -434,7 +434,6 @@
   'compiler/function-apply-constant-slow-array': [SKIP],
 
   # Various missing lowerings/specializations in Maglev.
-  'compiler/deopt-pretenure': [SKIP, SLOW],
   'compiler/opt-higher-order-functions': [SKIP],
   'compiler/constant-fold-cow-array': [SKIP],
   'compiler/promise-resolve-stable-maps': [SKIP],
@@ -445,7 +444,6 @@
   'compiler/string-from-code-point': [SKIP],
   'compiler/regress-9945-1': [SKIP],
   'es6/iterator-eager-deopt': [SKIP],
-  'es6/array-iterator-turbo': [SKIP],
   'compiler/typedarray-resizablearraybuffer': [SKIP],
   'optimized-filter': [SKIP],
   'optimized-map': [SKIP],
@@ -1693,6 +1691,9 @@
   # Flaky due to huge string allocation.
   'regress/regress-748069': [SKIP],
 
+  # Deep Maglev inlining might overflow the C++ stack with ASan on Windows.
+  'maglev/regress-563882510': [PASS, ['system == windows', SKIP]],
+
   # Tests that need to run sequentially (e.g. due to memory consumption).
 }],  # 'asan == True'
 
@@ -2334,6 +2335,7 @@
   'shared-memory/*': [SKIP],
   'wasm/shared-everything/post-message': [SKIP],
   'wasm/shared-everything/spin-lock': [SKIP],
+  'wasm/shared-everything/wait-queue': [SKIP],
 
   # BUG(v8:7166).
   'd8/enable-tracing': [SKIP],
@@ -2347,6 +2349,9 @@
   'wasm/atomics-memory64': [SKIP],
   'wasm/futex': [SKIP],
   'wasm/grow-shared-memory': [SKIP],
+  'wasm/regress-576453351': [SKIP],
+  'wasm/shared-memory-size-atomic': [SKIP],
+  'wasm/shared-memory-worker-stress': [SKIP],
   'wasm/wasm-interpreter': [SKIP],
   'regress/regress-1205290': [SKIP],
   'regress/regress-1212404': [SKIP],
@@ -2356,6 +2361,9 @@
   'regress/regress-crbug-1237153': [SKIP],
   'regress/wasm/regress-1067621': [SKIP],
   'regress/wasm/regress-377942344': [SKIP],
+  'regress/wasm/regress-461547336': [SKIP],
+  'regress/wasm/regress-476461881': [SKIP],
+  'regress/wasm/regress-568806936': [SKIP],
   'regress/wasm/regress-575514140': [SKIP],
 
   # BUG(v8:9975).
@@ -2632,22 +2640,9 @@
 
 ##############################################################################
 ['system != linux', {
-  # Multi-mapped mock allocator is only available on Linux. These tests allocate
-  # >2 GiB ArrayBuffer backing stores (exceeding PartitionAlloc's max allocation
-  # size) and access elements beyond the single OS page allocated by
-  # --mock-arraybuffer-allocator.
-  'maglev/regress-525732296': [SKIP],
-  'maglev/typed-array-length-index-into-typed-array': [SKIP],
-  'maglev/typed-array-length-index-into-typed-array-large': [SKIP],
-  'regress/regress-499527555': [SKIP],
-  'regress/regress-499527555-2': [SKIP],
-  'regress/regress-509312809': [SKIP],
+  # Multi-mapped mock allocator is only available on Linux.
   'regress/regress-crbug-1041232': [SKIP],
   'regress/regress-crbug-1104608': [SKIP],
-  'turbolev/dataview-deopt-oob': [SKIP],
-  'turbolev/regress-488090094': [SKIP],
-  'turbolev/typed-array-length-index-into-typed-array': [SKIP],
-  'turbolev/typed-array-length-index-into-typed-array-large': [SKIP],
 
   # WebAssembly memory control is only implemented on Linux so far.
   'wasm/memory-control': [SKIP],
@@ -2833,10 +2828,6 @@
   # Concurrent allocations trigger GCs that clear AllocationMementos before
   # elements kind transitions occur.
   'array-literal-transitions-no-pretenuring': [SKIP],
-  # This test manually forces pretenuring of allocation sites.
-  # stress-concurrent-allocation reverts the pretenuring decision due to low
-  # survival rate in old generation.
-  'compiler/deopt-pretenure': [SKIP],
   # BUG(v8:9506): slow tests.
   'wasm/shared-memory-worker-gc-stress': [SKIP],
   # BUG(v8:12607): flaky test.
@@ -3007,7 +2998,6 @@
   'regress/regress-4121': [SKIP],
   'compiler/native-context-specialization-hole-check': [SKIP],
   'compiler/test-literal-map-migration': [SKIP],
-  'compiler/deopt-pretenure': [SKIP],
   'compiler/fast-api-sequences-x64': [SKIP],
 
   # TODO(v8:12031): Reimplement elements kinds transitions when concurrent
@@ -3165,7 +3155,6 @@
 
   # TODO(b/201757247):
   'array-constructor-feedback': [FAIL],
-  'compiler/deopt-pretenure': [FAIL],
 
   # TODO(v8:14581): Re-enable this once turboshaft frontend is done.
   'turbolev/*': [SKIP],
@@ -3349,24 +3338,9 @@
 ['sandbox_hardware_support', {
   # Skip tests for unsupported features. See https://crbug.com/428674890.
 
-  # Multi-mapped mock allocator is not currently supported with hardware
-  # sandboxing (mremap overwrites the sandbox pkey on the remapped pages).
-  # These tests allocate >2 GiB ArrayBuffer backing stores (exceeding
-  # PartitionAlloc's max allocation size) and access elements beyond the single
-  # OS page allocated by --mock-arraybuffer-allocator.
-  'maglev/regress-525732296': [SKIP],
-  'maglev/typed-array-length-index-into-typed-array': [SKIP],
-  'maglev/typed-array-length-index-into-typed-array-large': [SKIP],
-  'regress/regress-499527555': [SKIP],
-  'regress/regress-499527555-2': [SKIP],
-  'regress/regress-509312809': [SKIP],
+  # Multi-mapped mock allocator is not currently supported.
   'regress/regress-crbug-1041232': [SKIP],
-  'regress/regress-crbug-1104608': [SKIP],
   'regress/regress-crbug-1209152': [SKIP],
-  'turbolev/dataview-deopt-oob': [SKIP],
-  'turbolev/regress-488090094': [SKIP],
-  'turbolev/typed-array-length-index-into-typed-array': [SKIP],
-  'turbolev/typed-array-length-index-into-typed-array-large': [SKIP],
 
   # Wasm code coverage is not currently supported.
   'regress/wasm/regress-488943662': [SKIP],

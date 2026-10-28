@@ -23,7 +23,6 @@
 #include "src/heap/heap-inl.h"
 #include "src/heap/heap-layout-inl.h"
 #include "src/heap/mutable-page.h"
-#include "src/heap/pretenuring-handler-inl.h"
 #include "src/heap/read-only-heap.h"
 #include "src/init/bootstrapper.h"
 #include "src/logging/counters.h"
@@ -4834,7 +4833,7 @@ DirectHandle<JSAny> JSObject::FastPropertyAt(Isolate* isolate,
 Handle<Object> JSObject::DictionaryPropertyAt(Isolate* isolate,
                                               DirectHandle<JSObject> object,
                                               InternalIndex dict_index) {
-  DCHECK_EQ(ThreadId::Current(), isolate->thread_id());
+  DCHECK_EQ(base::ThreadId::Current(), isolate->thread_id());
   if constexpr (V8_ENABLE_SWISS_NAME_DICTIONARY_BOOL) {
     Tagged<SwissNameDictionary> dict = object->property_dictionary_swiss();
     return handle(dict->ValueAt(dict_index), isolate);
@@ -5717,8 +5716,6 @@ bool JSObject::UpdateAllocationSite(Isolate* isolate,
                                     DirectHandle<JSObject> object,
                                     ElementsKind to_kind) {
   if (!IsJSArray(*object)) return false;
-  if (!HeapLayout::InYoungGeneration(*object)) return false;
-  if (HeapLayout::InAnyLargeSpace(*object)) return false;
 
   DirectHandle<AllocationSite> site;
   {
@@ -5726,8 +5723,7 @@ bool JSObject::UpdateAllocationSite(Isolate* isolate,
 
     Heap* heap = isolate->heap();
     Tagged<AllocationMemento> memento =
-        PretenuringHandler::FindAllocationMemento<
-            PretenuringHandler::kForRuntime>(heap, object->map(), *object);
+        heap->FindAllocationMemento(Cast<JSArray>(*object));
     if (memento.is_null()) return false;
 
     // Walk through to the Allocation Site

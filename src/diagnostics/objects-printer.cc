@@ -3800,18 +3800,8 @@ void StoreHandler::StoreHandlerPrint(std::ostream& os) {
 
 void AllocationSite::AllocationSitePrint(std::ostream& os) {
   PrintHeader(os, "AllocationSite");
-  if (this->HasWeakNext()) {
-    os << "\n - weak_next: "
-       << Brief(Cast<AllocationSiteWithWeakNext>(this)->weak_next());
-  }
   os << "\n - dependent code: " << Brief(dependent_code());
   os << "\n - nested site: " << Brief(nested_site());
-  os << "\n - memento found count: "
-     << Brief(Smi::FromInt(memento_found_count()));
-  os << "\n - memento create count: "
-     << Brief(Smi::FromInt(memento_create_count()));
-  os << "\n - pretenure decision: "
-     << Brief(Smi::FromInt(pretenure_decision()));
   os << "\n - transition_info: ";
   if (!PointsToLiteral()) {
     ElementsKind kind = GetElementsKind();
@@ -3939,7 +3929,6 @@ void Script::ScriptPrint(std::ostream& os) {
   os << "\n - name: " << Brief(name());
   os << "\n - line_offset: " << line_offset();
   os << "\n - column_offset: " << column_offset();
-  os << "\n - context data: " << Brief(context_data());
   os << "\n - type: " << static_cast<int>(type());
   os << "\n - line ends: " << Brief(line_ends());
   if (!has_line_ends()) os << " (not set)";

@@ -2285,8 +2285,6 @@ void V8HeapExplorer::ExtractScriptReferences(HeapEntry* entry,
   SetInternalReference(entry, "source", script->source(),
                        offsetof(Script, source_));
   SetInternalReference(entry, "name", script->name(), offsetof(Script, name_));
-  SetInternalReference(entry, "context_data", script->context_data(),
-                       offsetof(Script, context_data_));
   TagObject(script->line_ends(), "(script line ends)", HeapEntry::kCode);
   SetInternalReference(entry, "line_ends", script->line_ends(),
                        offsetof(Script, line_ends_));
@@ -3188,10 +3186,6 @@ bool V8HeapExplorer::IsEssentialObject(Tagged<Object> object) {
 
 bool V8HeapExplorer::IsEssentialHiddenReference(Tagged<Object> parent,
                                                 int field_offset) {
-  if (IsAllocationSite(parent) &&
-      field_offset == offsetof(AllocationSiteWithWeakNext, weak_next_)) {
-    return false;
-  }
   if (IsContext(parent) &&
       field_offset == Context::OffsetOfElementAt(Context::NEXT_CONTEXT_LINK)) {
     return false;

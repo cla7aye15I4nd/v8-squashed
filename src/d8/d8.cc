@@ -453,11 +453,14 @@ class PAInSandboxAllocator final : public v8::Allocator {
     // out-of-line metadata.
     partition_alloc::internal::PartitionAddressSpace::Init();
     partition_alloc::internal::PartitionAddressSpace::InitConfigurablePool(
-        pool_base, pool_size);
+        pool_base, pool_size,
+        sandbox->address_space()->ActiveMemoryProtectionKey().value_or(
+            partition_alloc::internal::kInvalidPkey));
 
     partition_alloc::PartitionOptions opts;
     opts.backup_ref_ptr = partition_alloc::PartitionOptions::kDisabled;
     opts.use_configurable_pool = partition_alloc::PartitionOptions::kAllowed;
+    opts.allow_giga_allocations = partition_alloc::PartitionOptions::kAllowed;
     partition_.init(std::move(opts));
 
     // Also adjust the limits for dirty bytes and slot span ring size in the
@@ -511,7 +514,8 @@ class PAInSandboxAllocator final : public v8::Allocator {
     // memory tool (e.g. ASan) overrides malloc, so disable both.
     constexpr auto new_flags =
         flags | partition_alloc::AllocFlags::kNoOverrideHooks |
-        partition_alloc::AllocFlags::kNoMemoryToolOverride;
+        partition_alloc::AllocFlags::kNoMemoryToolOverride |
+        partition_alloc::AllocFlags::kAllowGigaAllocations;
     return partition_.root()->Alloc<new_flags>(length, "PAInSandboxAllocator");
   }
 
@@ -8183,14 +8187,17 @@ int Shell::Main(int argc, char* argv[]) {
   ConfigurePartitionAllocIfEnabled();
   v8::base::EnsureConsoleOutput();
 
-  // TODO(40925855): Enable this more broadly outside of d8. Android is
-  // disabled for now as test bots run OS versions <17 that do not support the
-  // user space zero segment.
+  // TODO(40925855): Enable this more broadly outside of d8.
+  // - Android is disabled for now as test bots run OS versions <17 that do not
+  //   support the user space zero segment.
+  // - Windows is disabled because 64-bit bottom-up ASLR can place early OS
+  //   mappings in [2GB, 4GB) before PartitionAlloc initializes.
 #if defined(V8_ENABLE_PARTITION_ALLOC)
-#if PA_BUILDFLAG(ENABLE_USER_SPACE_ZERO_SEGMENT) && !defined(V8_OS_ANDROID)
+#if PA_BUILDFLAG(ENABLE_USER_SPACE_ZERO_SEGMENT) && !defined(V8_OS_ANDROID) && \
+    !defined(V8_OS_WIN)
   i::v8_flags.sandbox_prohibit_insecure_mode = true;
 #endif  // PA_BUILDFLAG(ENABLE_USER_SPACE_ZERO_SEGMENT) &&
-        // !defined(V8_OS_ANDROID)
+        // !defined(V8_OS_ANDROID) && !defined(V8_OS_WIN)
 #endif  // defined(V8_ENABLE_PARTITION_ALLOC)
 
   if (!v8::Shell::SetOptions(argc, argv)) return 1;
@@ -8482,6 +8489,7 @@ int Shell::Main(int argc, char* argv[]) {
 #ifdef V8_FUZZILLI
       internal_isolate->descriptor_lookup_cache()->Clear();
       internal_isolate->compilation_cache()->Clear();
+      internal_isolate->set_force_slow_path(i::v8_flags.force_slow_path);
       if (fuzzilli_reprl) {
         unsigned action = 0;
         ssize_t nread = read(REPRL_CRFD, &action, 4);
