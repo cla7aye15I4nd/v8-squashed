@@ -2988,10 +2988,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> IsJSPrimitiveWrapperInstanceType(TNode<Int32T> instance_type);
   TNode<BoolT> IsJSPrimitiveWrapperMap(TNode<Map> map);
   TNode<BoolT> IsJSPrimitiveWrapper(TNode<HeapObject> object);
-  TNode<BoolT> IsJSSharedArrayInstanceType(TNode<Int32T> instance_type);
-  TNode<BoolT> IsJSSharedArrayMap(TNode<Map> map);
-  TNode<BoolT> IsJSSharedArray(TNode<HeapObject> object);
-  TNode<BoolT> IsJSSharedArray(TNode<Object> object);
   TNode<BoolT> IsJSSharedStructInstanceType(TNode<Int32T> instance_type);
   TNode<BoolT> IsJSSharedStructMap(TNode<Map> map);
   TNode<BoolT> IsJSSharedStruct(TNode<HeapObject> object);
@@ -4467,9 +4463,9 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> IsJSArrayBufferViewDetachedOrOutOfBoundsBoolean(
       TNode<JSArrayBufferView> array_buffer_view);
 
-  void CheckJSTypedArrayIndex(TNode<JSTypedArray> typed_array,
-                              TNode<UintPtrT> index,
-                              Label* detached_or_out_of_bounds);
+  void CheckIsValidIntegerIndex(TNode<JSTypedArray> typed_array,
+                                TNode<UintPtrT> index,
+                                Label* detached_or_out_of_bounds);
 
   TNode<Uint8T> ElementsKindToElementByteShift(TNode<Int32T> elementsKind);
   TNode<RawPtrT> LoadJSTypedArrayDataPtr(TNode<JSTypedArray> typed_array);
@@ -4827,6 +4823,12 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   void LookupBinary(TNode<Name> unique_name, TNode<Array> array,
                     TNode<Uint32T> number_of_valid_entries, Label* if_found,
                     TVariable<IntPtrT>* var_name_index, Label* if_not_found);
+
+#ifdef V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
+  void LookupTable(TNode<Name> unique_name, TNode<DescriptorArray> descriptors,
+                   TNode<Uint32T> number_of_valid_entries, Label* if_found,
+                   TVariable<IntPtrT>* var_name_index, Label* if_not_found);
+#endif  // V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
 
   // Converts [Descriptor/Transition]Array entry number to a fixed array index.
   template <typename Array>

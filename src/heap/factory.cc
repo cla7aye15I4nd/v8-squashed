@@ -72,7 +72,7 @@
 #include "src/objects/js-objects.h"
 #include "src/objects/js-proxy-inl.h"
 #include "src/objects/js-regexp-inl.h"
-#include "src/objects/js-shared-array.h"
+#include "src/objects/js-struct.h"
 #include "src/objects/js-weak-refs-inl.h"
 #include "src/objects/literal-objects-inl.h"
 #include "src/objects/managed-inl.h"
@@ -2501,8 +2501,9 @@ Handle<WasmCustomMap> Factory::NewWasmCustomMapUninitialized(
   DirectHandle<WasmTypeInfo> type_info = NewWasmTypeInfo(
       heaptype, no_array_element, rtt_parent, num_supertypes, shared);
 
+  // Allocate in old space because we expect descriptors to be long-lived.
   AllocationType allocation =
-      shared ? AllocationType::kSharedMap : AllocationType::kMap;
+      shared ? AllocationType::kSharedOld : AllocationType::kOld;
   AllocationAlignment alignment = shared ? kDoubleAligned : kTaggedAligned;
   const int descriptor_size = WasmCustomMap::Size(descriptor);
   DCHECK_EQ(descriptor_size, WasmStruct::DecodeInstanceSizeFromMap(*map));
@@ -2671,8 +2672,7 @@ Handle<Map> Factory::NewMapImpl(MetaMapProviderFunc&& meta_map_provider,
   DCHECK_IMPLIES(InstanceTypeChecker::IsJSObject(type) &&
                      !Map::CanHaveFastTransitionableElementsKind(type),
                  IsDictionaryElementsKind(elements_kind) ||
-                     IsTerminalElementsKind(elements_kind) ||
-                     IsSharedArrayElementsKind(elements_kind));
+                     IsTerminalElementsKind(elements_kind));
   DCHECK(allocation_type == AllocationType::kMap ||
          allocation_type == AllocationType::kSharedMap);
   Tagged<HeapObject> result =
@@ -3640,8 +3640,7 @@ Handle<JSObject> Factory::NewJSObjectFromMap(
                       ->js_array_template_literal_object_map()) ||
          js_obj->HasTypedArrayOrRabGsabTypedArrayElements() ||
          js_obj->HasFastStringWrapperElements() ||
-         js_obj->HasFastArgumentsElements() ||
-         js_obj->HasDictionaryElements() || js_obj->HasSharedArrayElements());
+         js_obj->HasFastArgumentsElements() || js_obj->HasDictionaryElements());
   return handle(js_obj, isolate());
 }
 
@@ -5102,21 +5101,6 @@ DirectHandle<JSSharedStruct> Factory::NewJSSharedStruct(
   if (!property_array.is_null()) instance->SetProperties(*property_array);
   if (has_elements_dictionary) instance->set_elements(*elements_dictionary);
 
-  return instance;
-}
-
-DirectHandle<JSSharedArray> Factory::NewJSSharedArray(
-    DirectHandle<JSFunction> constructor, int length) {
-  SharedObjectSafePublishGuard publish_guard;
-  DirectHandle<FixedArrayBase> storage =
-      NewFixedArray(length, AllocationType::kSharedOld);
-  auto instance =
-      Cast<JSSharedArray>(NewJSObject(constructor, AllocationType::kSharedOld));
-  instance->set_elements(*storage);
-  FieldIndex index = FieldIndex::ForDescriptor(
-      constructor->initial_map(),
-      InternalIndex(JSSharedArray::kLengthFieldIndex));
-  instance->FastPropertyAtPut(index, Smi::FromInt(length), SKIP_WRITE_BARRIER);
   return instance;
 }
 

@@ -1434,8 +1434,10 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
           __ sub(i.OutputRegister(), i.InputRegister(0), i.InputRegister(1),
                  SetOE);
         } else {
-          __ mov(r0, i.InputImmediate(1));
-          __ sub(i.OutputRegister(), i.InputRegister(0), r0, SetOE);
+          UseScratchRegisterScope temps(masm());
+          Register scratch = temps.Acquire();
+          __ mov(scratch, i.InputImmediate(1));
+          __ sub(i.OutputRegister(), i.InputRegister(0), scratch, SetOE);
         }
         __ MoveToCrFromXer(cr0);
       } else {
@@ -2202,12 +2204,13 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kPPC_ByteRev32: {
       Register input = i.InputRegister(0);
       Register output = i.OutputRegister();
-      Register temp1 = r0;
       if (CpuFeatures::IsSupported(PPC_10_PLUS)) {
         __ brw(output, input);
         __ extsw(output, output);
         break;
       }
+      UseScratchRegisterScope temps(masm());
+      Register temp1 = temps.Acquire();
       __ rotlwi(temp1, input, 8);
       __ rlwimi(temp1, input, 24, 0, 7);
       __ rlwimi(temp1, input, 24, 16, 23);
@@ -3490,8 +3493,10 @@ AllocatedOperand CodeGenerator::Push(InstructionOperand* source) {
   int slot_id = frame_access_state()->GetSPSlotCount() - 1 + new_slots;
   AllocatedOperand stack_slot(LocationOperand::STACK_SLOT, rep, slot_id);
   if (source->IsFloatStackSlot() || source->IsDoubleStackSlot()) {
-    __ LoadU64(r0, g.ToMemOperand(source));
-    __ Push(r0);
+    UseScratchRegisterScope temps(masm());
+    Register scratch = temps.Acquire();
+    __ LoadU64(scratch, g.ToMemOperand(source));
+    __ Push(scratch);
     frame_access_state()->IncreaseSPDelta(new_slots);
   } else {
     // Bump the stack pointer and assemble the move.

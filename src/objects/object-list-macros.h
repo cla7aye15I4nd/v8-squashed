@@ -203,7 +203,6 @@ namespace internal {
   V(JSSet)                                      \
   V(JSSetIterator)                              \
   V(JSShadowRealm)                              \
-  V(JSSharedArray)                              \
   V(JSSharedStruct)                             \
   V(JSSpecialObject)                            \
   V(JSStringIterator)                           \
@@ -321,6 +320,7 @@ namespace internal {
   V(BooleanWrapper)                 \
   V(Callable)                       \
   V(Constructor)                    \
+  V(DescriptorLookupTable)          \
   V(Filler)                         \
   V(HandlerTable)                   \
   V(JSContextExtensionObject)       \

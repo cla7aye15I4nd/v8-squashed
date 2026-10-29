@@ -1759,6 +1759,9 @@ DEFINE_EXPERIMENTAL_FEATURE(turboshaft_random_rescheduling,
                             "enable Turboshaft's random rescheduling phase")
 DEFINE_BOOL(turboshaft_string_concat_escape_analysis, true,
             "enable Turboshaft's escape analysis for string concatenation")
+DEFINE_UINT(turboshaft_max_inline_string_equal_length, 16,
+            "maximum length of a one-byte constant string to inline in "
+            "Turboshaft StringEqual")
 
 DEFINE_BOOL(turboshaft_trusted_load_elimination, true,
             "enable Turboshaft's low level load elimination for trusted loads "
@@ -2931,8 +2934,6 @@ DEFINE_FLOAT(memory_balancer_c_value, 3e-10,
              "The smaller the more memory it uses.")
 DEFINE_NEG_IMPLICATION(memory_balancer, memory_reducer)
 DEFINE_DEVELOPER_FLAG(trace_memory_balancer, "print memory balancer behavior.")
-DEFINE_BOOL(late_heap_limit_check, true,
-            "skips heap limit check for early GCs on allocation failure.")
 
 // assembler-ia32.cc / assembler-arm.cc / assembler-arm64.cc / assembler-x64.cc
 #ifdef V8_ENABLE_DEBUG_CODE

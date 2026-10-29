@@ -82,7 +82,6 @@
 #endif  // V8_INTL_SUPPORT
 #include "src/objects/hole.h"
 #include "src/objects/js-raw-json-inl.h"
-#include "src/objects/js-shared-array.h"
 #include "src/objects/js-struct.h"
 #ifdef V8_TEMPORAL_SUPPORT
 #include "src/objects/js-temporal-objects-inl.h"
@@ -741,13 +740,13 @@ void Map::MapVerify(Isolate* isolate) {
         CHECK_EQ(IsInobjectSlackTrackingInProgress(),
                  parent->IsInobjectSlackTrackingInProgress());
       }
-      if (descriptors == parent->instance_descriptors()) {
-        if (NumberOfOwnDescriptors() == parent->NumberOfOwnDescriptors() + 1) {
-          // Descriptors sharing through property transitions takes over
-          // ownership from the parent map.
-          CHECK(!parent->owns_descriptors());
-        } else {
-          CHECK_EQ(NumberOfOwnDescriptors(), parent->NumberOfOwnDescriptors());
+      if (NumberOfOwnDescriptors() == parent->NumberOfOwnDescriptors()) {
+        // Special transition maps (such as an elements kind transition maps)
+        // must not have descriptors in the descriptor array that do not belong
+        // to the map.
+        CHECK_EQ(NumberOfOwnDescriptors(),
+                 descriptors->number_of_descriptors());
+        if (descriptors == parent->instance_descriptors()) {
           // Descriptors sharing through special transitions properly takes over
           // ownership from the parent map unless it uses the canonical empty
           // descriptor array.
@@ -756,13 +755,30 @@ void Map::MapVerify(Isolate* isolate) {
             CHECK_IMPLIES(parent->owns_descriptors(), !owns_descriptors());
           }
         }
+      } else {
+        CHECK_EQ(NumberOfOwnDescriptors(),
+                 parent->NumberOfOwnDescriptors() + 1);
+        if (descriptors == parent->instance_descriptors()) {
+          // Descriptors sharing through property transitions takes over
+          // ownership from the parent map, which must not be a root map or a
+          // special transition map.
+          CHECK(!parent->owns_descriptors());
+          CHECK(!IsUndefined(parent->GetBackPointer()));
+          CHECK_NE(
+              parent->NumberOfOwnDescriptors(),
+              Cast<Map>(parent->GetBackPointer())->NumberOfOwnDescriptors());
+        }
       }
     }
   }
   if (!is_wasm_struct) {
     VerifyDescriptorInObjectBits(instance_descriptors(),
                                  NumberOfOwnDescriptors());
+#ifdef V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
+    SLOW_DCHECK(instance_descriptors()->VerifyLookupTable());
+#else
     SLOW_DCHECK(instance_descriptors()->IsSortedNoDuplicates());
+#endif  // V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
   }
   SLOW_DCHECK(TransitionsAccessor(isolate, this).IsSortedNoDuplicates());
   SLOW_DCHECK(
@@ -842,7 +858,7 @@ void Map::MapVerify(Isolate* isolate) {
                  JSObject::GetEmbedderFieldCount(this) * kEmbedderDataSlotSize,
              inobject_fields_start_offset);
 
-    if (IsJSSharedStructMap(this) || IsJSSharedArrayMap(this)) {
+    if (IsJSSharedStructMap(this)) {
       if (COMPRESS_POINTERS_IN_MULTIPLE_CAGES_BOOL) {
         // TODO(v8:14089): Verify what should be checked in this configuration
         // and again merge with the else-branch below.
@@ -854,9 +870,6 @@ void Map::MapVerify(Isolate* isolate) {
         CHECK(!is_prototype_map());
         CHECK(OnlyHasSimpleProperties());
         // CHECK(instance_descriptors().InSharedHeap());
-        if (IsJSSharedArrayMap(this)) {
-          CHECK(has_shared_array_elements());
-        }
       } else {
         CHECK(HeapLayout::InAnySharedSpace(this));
         CHECK(IsUndefined(GetBackPointer()));
@@ -868,9 +881,6 @@ void Map::MapVerify(Isolate* isolate) {
         CHECK(!is_prototype_map());
         CHECK(OnlyHasSimpleProperties());
         CHECK(HeapLayout::InAnySharedSpace(instance_descriptors()));
-        if (IsJSSharedArrayMap(this)) {
-          CHECK(has_shared_array_elements());
-        }
       }
     }
 
@@ -901,8 +911,7 @@ void Map::MapVerify(Isolate* isolate) {
   CHECK_IMPLIES(IsJSObjectMap(this) && !CanHaveFastTransitionableElementsKind(),
                 IsDictionaryElementsKind(elements_kind()) ||
                     IsTerminalElementsKind(elements_kind()) ||
-                    IsAnyHoleyNonextensibleElementsKind(elements_kind()) ||
-                    IsSharedArrayElementsKind(elements_kind()));
+                    IsAnyHoleyNonextensibleElementsKind(elements_kind()));
   CHECK_IMPLIES(is_deprecated(), !is_stable());
   if (is_prototype_map()) {
     CHECK(prototype_info() == Smi::zero() ||
@@ -1277,6 +1286,11 @@ void DescriptorArray::DescriptorArrayEntryTypesVerify(Isolate* isolate) {
   // Header: enum_cache_ is strong.
   Object::VerifyPointer(isolate, enum_cache());
   CHECK(IsEnumCache(enum_cache()));
+#ifdef V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
+  Object::VerifyPointer(isolate, lookup_table());
+  CHECK(Is<DescriptorLookupTable>(lookup_table()) ||
+        IsUndefined(lookup_table()));
+#endif  // V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
   // Descriptors tail: verify each (key, details, value) triple. Key and
   // details slots are always strong; only the value slot may be weak.
   const int nof = number_of_all_descriptors();
@@ -2357,20 +2371,6 @@ void JSSyncDisposableStack::JSSyncDisposableStackVerify(Isolate* isolate) {
 
 void JSAsyncDisposableStack::JSAsyncDisposableStackVerify(Isolate* isolate) {
   JSDisposableStackBaseVerify(isolate);
-}
-
-void JSSharedArray::JSSharedArrayVerify(Isolate* isolate) {
-  CHECK(Is<JSSharedArray>(this));
-  JSObjectVerify(isolate);
-  CHECK(HasFastProperties());
-  // Shared arrays can only point to primitives or other shared HeapObjects,
-  // even internally.
-  Tagged<FixedArray> storage = Cast<FixedArray>(elements());
-  uint32_t length = storage->ulength().value();
-  for (uint32_t j = 0; j < length; j++) {
-    Tagged<Object> element_value = storage->get(j);
-    VerifyElementIsShared(element_value);
-  }
 }
 
 // TODO(42203505): Review and improve the verifiers for the hierarchy of
@@ -4095,8 +4095,7 @@ void JSObject::IncrementSpillStatistics(Isolate* isolate,
     case PACKED_FROZEN_ELEMENTS:
     case PACKED_SEALED_ELEMENTS:
     case PACKED_NONEXTENSIBLE_ELEMENTS:
-    case FAST_STRING_WRAPPER_ELEMENTS:
-    case SHARED_ARRAY_ELEMENTS: {
+    case FAST_STRING_WRAPPER_ELEMENTS: {
       info->number_of_objects_with_fast_elements_++;
       int holes = 0;
       Tagged<FixedArray> e = Cast<FixedArray>(elements());
@@ -4172,6 +4171,27 @@ void JSObject::SpillInformation::Print() {
 
   PrintF("\n");
 }
+
+#ifdef V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
+bool DescriptorArray::VerifyLookupTable() {
+  int nof = number_of_descriptors();
+  if (nof <= kMaxElementsForLinearSearch) {
+    if (!IsUndefined(lookup_table())) {
+      Print(this);
+      return false;
+    }
+    return true;
+  }
+  if (!Is<DescriptorLookupTable>(lookup_table()) ||
+      !Cast<DescriptorLookupTable>(lookup_table())
+           ->Verify(nof, number_of_all_descriptors(),
+                    [this](uint32_t i) { return GetKey(InternalIndex(i)); })) {
+    Print(this);
+    return false;
+  }
+  return true;
+}
+#endif  // V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
 
 bool DescriptorArray::IsSortedNoDuplicates() {
   // Up to the linear search limit the array is not sorted and that's fine.

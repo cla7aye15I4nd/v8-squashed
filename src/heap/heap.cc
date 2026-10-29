@@ -1326,14 +1326,11 @@ void Heap::CollectAllAvailableGarbage(GarbageCollectionReason gc_reason) {
     gc_flags |= GCFlag::kForced;
   }
 
-  const auto perform_heap_limit_check = v8_flags.late_heap_limit_check
-                                            ? PerformHeapLimitCheck{false}
-                                            : PerformHeapLimitCheck{true};
   for (int attempt = 0; attempt < kMaxNumberOfAttempts; attempt++) {
     const size_t roots_before = num_roots();
     current_gc_flags_ = gc_flags;
     CollectGarbage(OLD_SPACE, gc_reason, gc_callback_flags,
-                   perform_heap_limit_check,
+                   PerformHeapLimitCheck{false},
                    PerformIneffectiveMarkCompactCheck{false});
     DCHECK_EQ(GCFlags(GCFlag::kNoFlags), current_gc_flags_);
 
@@ -4410,7 +4407,17 @@ void ClearStaleLeftTrimmedPointerVisitor::ClearLeftTrimmedOrForward(
   if (!IsHeapObject(*p)) return;
 
   if (IsLeftTrimmed(p)) {
+#if defined(V8_COMPRESS_POINTERS) || defined(V8_ENABLE_SANDBOX)
+    // Overwrite stale slots with decompressed Smi 0 (the upper 32-bit point
+    // into the cage). This ensures we remain in the sandbox for stores like
+    // `base + index * 8`. If base would be 0 here, we could write to an address
+    // outside the sandbox (address 0 to 32GB). If base is the
+    // cage base instead, the store can't escape the 1 TB sandbox.
+    p.store(Tagged<Object>(
+        V8HeapCompressionScheme::DecompressTagged(Smi::zero().ptr())));
+#else
     p.store(Smi::zero());
+#endif
   } else {
     visitor_->VisitRootPointer(root, description, p);
   }

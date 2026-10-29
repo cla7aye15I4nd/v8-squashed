@@ -837,41 +837,13 @@ template <typename BaseT>
 ReduceResult MaglevReducer<BaseT>::ConvertForField(ValueNode* value,
                                                    const vobj::Field& desc) {
   switch (desc.type) {
-    case vobj::FieldType::kTagged: {
-      // Subtle: we don't use `NodeTypeIs(...)` since the predicate must NOT
-      // be true for NodeType::kNone.
-      // TODO(jgruber): NodeType::kNone should never reach here.
-      if (GetType(value) == NodeType::kSmi) {
-        // TODO(jgruber): This is needed because HoleyFloat64ToTagged does not
-        // canonicalize smis by default in GetTaggedValue. We rely on
-        // canonicalization though in TryReduceConstructArrayConstructor.
-        // We should make this more robust.
-        // TODO(454485895): Consider removing this workaround since
-        // HoleyFloat64ToTagged now canonicalizes by default.
-        MaybeReduceResult res = GetSmiValue(value);
-        CHECK(res.IsDoneWithValue());
-        return res.value();
-      }
-      if (value->Is<Float64Constant>()) {
-        // Note that NodeType::kSmi MUST go through GetSmiValue for proper
-        // canonicalization. If we see a Float64Constant with type kSmi, it has
-        // passed BuildCheckSmi, i.e. the runtime value is guaranteed to be
-        // convertible to smi (we would have deoptimized otherwise).
-        //
-        // TODO(jgruber): We have to allocate a new object since the
-        // object field could contain a mutable HeapNumber and thus cannot
-        // share instances. However, we could specify such mutable fields
-        // through vobj::Field; and then only allocate a new object here
-        // if needed.
-        return BuildInlinedAllocation(CreateHeapNumber(value));
-      }
+    case vobj::FieldType::kTagged:
+      // Canonicalizes Smis and deopts on empty types.
       return GetTaggedValue(value);
-    }
     case vobj::FieldType::kTrustedPointer:
       DCHECK(value->Is<TrustedConstant>());
       return value;
     case vobj::FieldType::kInt32:
-      // TODO(jgruber): Add conversions here once needed.
       DCHECK_EQ(value->properties().value_representation(),
                 ValueRepresentation::kInt32);
       return value;
@@ -3664,11 +3636,7 @@ MaybeReduceResult MaglevReducer<BaseT>::TryFoldInt32BinaryOperation(
     }
 
     // Deopt if {left} is not an Int32.
-    RETURN_IF_ABORT(EnsureInt32(left));
-    if (left->is_conversion()) {
-      return left->input(0).node();
-    }
-    return left;
+    return EnsureInt32(left);
   }
   // TODO(v8:7700): Add more peephole cases.
   switch (kOperation) {
@@ -4025,7 +3993,7 @@ MaglevReducer<BaseT>::TryFoldFloat64BinaryOperationForToNumber(
       if (left->MayBeHoleOrUndefinedNan()) {
         GET_VALUE_OR_ABORT(left, AddNewNode<Float64ToSilencedFloat64>({left}));
       }
-      return left->Unwrap();
+      return left;
     }
     // TODO(dmercadier): we could still do strength reduction, like
     //     x * 2  ==> x + x
@@ -4068,7 +4036,7 @@ MaybeReduceResult MaglevReducer<BaseT>::TryFoldFloat64Min(ValueNode* lhs,
     if (lhs->MayBeHoleOrUndefinedNan()) {
       GET_VALUE_OR_ABORT(lhs, AddNewNode<Float64ToSilencedFloat64>({lhs}));
     }
-    return lhs->Unwrap();
+    return lhs;
   }
 
   std::optional<Float64> lhs_const =
@@ -4109,7 +4077,7 @@ MaybeReduceResult MaglevReducer<BaseT>::TryFoldFloat64Max(ValueNode* lhs,
     if (lhs->MayBeHoleOrUndefinedNan()) {
       GET_VALUE_OR_ABORT(lhs, AddNewNode<Float64ToSilencedFloat64>({lhs}));
     }
-    return lhs->Unwrap();
+    return lhs;
   }
 
   std::optional<Float64> lhs_const =
@@ -4683,7 +4651,6 @@ MaybeReduceResult MaglevReducer<BaseT>::TryReduceMathMinMax(
   ValueNode* acc;
   GET_VALUE_OR_ABORT(
       acc, GetFloat64ForToNumber(args[0], NodeType::kNumberOrOddball));
-  acc = acc->Unwrap();
   for (size_t i = 1; i < args.count(); ++i) {
     GET_VALUE_OR_ABORT(acc, float64_case(acc, args[i]));
   }

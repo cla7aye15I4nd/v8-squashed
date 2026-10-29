@@ -936,14 +936,16 @@ void StartAsyncCompilationWithResolver(
           resolver));
   i::DirectHandle<i::CppGCManaged<WasmStreaming>> data =
       i::CppGCManaged<WasmStreaming>::Create(i_isolate, 0, streaming);
+  Local<Data> callback_data =
+      Utils::Convert<i::Object, v8::Data>(i::Cast<i::Object>(data));
 
   DCHECK_NOT_NULL(i_isolate->wasm_streaming_callback());
   Local<v8::Function> compile_callback, reject_callback;
   if (!v8::Function::New(context, i_isolate->wasm_streaming_callback(),
-                         Utils::ToLocal(i::Cast<i::Object>(data)), 1)
+                         callback_data, 1)
            .ToLocal(&compile_callback) ||
       !v8::Function::New(context, WasmStreamingPromiseFailedCallback,
-                         Utils::ToLocal(i::Cast<i::Object>(data)), 1)
+                         callback_data, 1)
            .ToLocal(&reject_callback)) {
     return js_api_scope.AssertException();
   }
@@ -1325,7 +1327,6 @@ void WebAssemblyInstantiateImpl(
 
   auto InstantiateThenCallback =
       [](const v8::FunctionCallbackInfo<v8::Value>& info) {
-        DCHECK_EQ(info.Length(), 1);
         Isolate* isolate2 = info.GetIsolate();
         HandleScope scope(isolate2);
         Local<FixedArray> data = info.DataV2().As<FixedArray>();
@@ -1366,7 +1367,6 @@ void WebAssemblyInstantiateImpl(
 
   auto RejectInstantiation =
       [](const v8::FunctionCallbackInfo<v8::Value>& info) {
-        DCHECK_EQ(1, info.Length());
         HandleScope scope(info.GetIsolate());
         Local<Promise::Resolver> instantiation_promise_resolver =
             info.DataV2().As<Value>().As<Promise::Resolver>();
