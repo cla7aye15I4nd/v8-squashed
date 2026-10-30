@@ -1407,8 +1407,10 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
           __ add(i.OutputRegister(), i.InputRegister(0), i.InputRegister(1),
                  SetOE);
         } else {
-          __ mov(r0, i.InputImmediate(1));
-          __ add(i.OutputRegister(), i.InputRegister(0), r0, SetOE);
+          UseScratchRegisterScope temps(masm());
+          Register scratch = temps.Acquire();
+          __ mov(scratch, i.InputImmediate(1));
+          __ add(i.OutputRegister(), i.InputRegister(0), scratch, SetOE);
         }
         __ MoveToCrFromXer(cr0);
       } else {
@@ -2228,8 +2230,8 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kPPC_ByteRev64: {
       Register input = i.InputRegister(0);
       Register output = i.OutputRegister();
-      Register temp1 = r0;
       UseScratchRegisterScope temps(masm());
+      Register temp1 = temps.Acquire();
       Register temp2 = temps.Acquire();
       Register temp3 = i.TempRegister(0);
       if (CpuFeatures::IsSupported(PPC_10_PLUS)) {

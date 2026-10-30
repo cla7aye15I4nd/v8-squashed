@@ -1256,9 +1256,8 @@ MaybeDirectHandle<String> Factory::NewStringFromTwoByteLittleEndian(
 DirectHandle<InternalizedString> Factory::NewInternalizedStringImpl(
     DirectHandle<String> string, int len, uint32_t hash_field,
     bool known_one_byte_content) {
-  const bool one_byte =
-      string->IsOneByteRepresentation() || known_one_byte_content;
-  if (one_byte) {
+  DCHECK_IMPLIES(string->IsOneByteRepresentation(), known_one_byte_content);
+  if (known_one_byte_content) {
     DirectHandle<SeqOneByteString> result =
         AllocateRawOneByteInternalizedString(len, hash_field);
     DisallowGarbageCollection no_gc;
@@ -1270,6 +1269,7 @@ DirectHandle<InternalizedString> Factory::NewInternalizedStringImpl(
       AllocateRawTwoByteInternalizedString(len, hash_field);
   DisallowGarbageCollection no_gc;
   String::WriteToFlat(*string, result->GetChars(no_gc), 0, len);
+  DCHECK(!String::IsOneByte(result->GetChars(no_gc), len));
   return Cast<InternalizedString>(result);
 }
 
@@ -3460,7 +3460,11 @@ DirectHandle<BytecodeArray> Factory::CopyBytecodeArray(
     copy->set_source_position_table(
         raw_source->source_position_table(kAcquireLoad), kReleaseStore);
   } else {
+    // Initialize the slot before set_source_positions_coverage_flags reads it.
     copy->clear_source_position_table(kReleaseStore);
+    copy->set_source_positions_coverage_flags(
+        raw_source->coverage_enabled_for_source_positions(),
+        raw_source->block_coverage_enabled_for_source_positions());
   }
   raw_source->CopyBytecodesTo(copy);
   copy->InitAndPublish(isolate());

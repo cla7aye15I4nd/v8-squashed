@@ -82,9 +82,26 @@ i::Handle<i::String> GetBigIntStringPresentationHandle(
   // For large BigInts computing the decimal string representation
   // can take a long time, so we go with hexadecimal in that case.
   int radix = (i_bigint->Words64Count() > 100 * 1000) ? 16 : 10;
-  i::Handle<i::String> string_value =
-      i::BigInt::ToString(i_isolate, i_bigint, radix, i::kDontThrow)
-          .ToHandleChecked();
+  i::Handle<i::String> string_value;
+  if (!i::BigInt::ToString(i_isolate, i_bigint, radix, i::kDontThrow)
+           .ToHandle(&string_value)) {
+    // If ToString was interrupted by a termination request, clear the
+    // internal termination exception from V8 so subsequent allocations do
+    // not fail, but re-arm the stack guard so that termination will be
+    // delivered at the next interrupt check.
+    if (i_isolate->is_execution_terminating()) {
+      i_isolate->clear_internal_exception();
+      i_isolate->stack_guard()->RequestTerminateExecution();
+    }
+    // Retry with radix 16. Power-of-two radix conversion in the bigint
+    // processor uses the linear base-case algorithm which does not check
+    // InterruptRequested() and therefore cannot be interrupted.
+    radix = 16;
+    if (!i::BigInt::ToString(i_isolate, i_bigint, radix, i::kDontThrow)
+             .ToHandle(&string_value)) {
+      return i_isolate->factory()->empty_string();
+    }
+  }
   if (radix == 16) {
     if (i_bigint->IsNegative()) {
       string_value =
@@ -402,7 +419,8 @@ void PrepareStep(Isolate* v8_isolate, StepAction action, bool enter_functions) {
   // Clear all current stepping setup.
   isolate->debug()->ClearStepping();
   // Prepare step.
-  isolate->debug()->set_step_over_enters_functions(enter_functions);
+  isolate->debug()->set_step_over_enters_functions(action == StepOver &&
+                                                   enter_functions);
   isolate->debug()->PrepareStep(static_cast<i::StepAction>(action));
 }
 
@@ -416,6 +434,7 @@ bool PrepareRestartFrame(Isolate* v8_isolate, int callFrameOrdinal) {
 
   // Clear all current stepping setup.
   isolate->debug()->ClearStepping();
+  isolate->debug()->set_step_over_enters_functions(false);
   it.PrepareRestart();
   return true;
 }
@@ -425,17 +444,19 @@ void ClearStepping(Isolate* v8_isolate) {
   EnterV8NoScriptNoExceptionScope api_scope(isolate);
   // Clear all current stepping setup.
   isolate->debug()->ClearStepping();
+  isolate->debug()->set_step_over_enters_functions(false);
 }
 
-void BreakRightNow(Isolate* v8_isolate,
+bool BreakRightNow(Isolate* v8_isolate,
                    base::EnumSet<debug::BreakReason> break_reasons) {
   i::Isolate* isolate = reinterpret_cast<i::Isolate*>(v8_isolate);
   EnterV8BasicScope api_scope(isolate);
-  isolate->debug()->HandleDebugBreak(i::kIgnoreIfAllFramesBlackboxed,
-                                     break_reasons);
+  bool delivered = isolate->debug()->HandleDebugBreak(
+      i::kIgnoreIfAllFramesBlackboxed, break_reasons);
   if (isolate->debug()->IsRestartFrameScheduled()) {
     isolate->TerminateExecution();
   }
+  return delivered;
 }
 
 void SetTerminateOnResume(Isolate* v8_isolate) {
@@ -1297,6 +1318,22 @@ bool IsAPIFunctionWithSideEffects(v8::Local<v8::Value> value) {
   i::Tagged<i::FunctionTemplateInfo> info =
       js_function->shared()->api_func_data();
   return info->has_side_effects();
+}
+
+bool IsBuiltinOrApiFunction(v8::Local<v8::Function> function) {
+  if (function.IsEmpty()) return false;
+  auto self = v8::Utils::OpenDirectHandle(*function);
+  if (!i::IsJSFunction(*self)) return false;
+  i::DirectHandle<i::JSFunction> js_function = i::Cast<i::JSFunction>(self);
+  i::Tagged<i::SharedFunctionInfo> shared = js_function->shared();
+  return (shared->HasBuiltinId() &&
+          shared->builtin_id() != i::Builtin::kCompileLazy) ||
+         shared->IsApiFunction();
+}
+
+bool IsBuiltinOrApiFunction(v8::Local<v8::Value> value) {
+  if (value.IsEmpty() || !value->IsFunction()) return false;
+  return IsBuiltinOrApiFunction(value.As<v8::Function>());
 }
 
 void GlobalLexicalScopeNames(v8::Local<v8::Context> v8_context,

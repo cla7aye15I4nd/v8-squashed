@@ -273,7 +273,11 @@ class V8_EXPORT_PRIVATE Debug {
   void OnCompileError(DirectHandle<Script> script);
   void OnAfterCompile(DirectHandle<Script> script);
 
-  void HandleDebugBreak(IgnoreBreakMode ignore_break_mode,
+  // Breaks execution at the current statement if possible, or schedules a break
+  // on function entry / next function call. Returns true if the break was
+  // delivered or scheduled; false if it was dropped (e.g. breaks disabled,
+  // ignore_events, or stack overflow).
+  bool HandleDebugBreak(IgnoreBreakMode ignore_break_mode,
                         debug::BreakReasons break_reasons);
 
   // The break target may not be the top-most frame, since we may be
@@ -480,6 +484,9 @@ class V8_EXPORT_PRIVATE Debug {
   bool scheduled_break_on_function_call() const {
     return !thread_local_.scheduled_break_on_next_function_call_.empty();
   }
+  v8::debug::BreakReasons scheduled_break_on_next_function_call() const {
+    return thread_local_.scheduled_break_on_next_function_call_;
+  }
 
   bool IsRestartFrameScheduled() const {
     return !in_debug_scope() &&
@@ -674,8 +681,9 @@ class V8_EXPORT_PRIVATE Debug {
     bool fast_forward_to_return_;
 
     // If set, StepOver also enters functions selected by the delegate. Set by
-    // every step command and not reset by ClearStepping, so that re-prepared
-    // steps keep it.
+    // StepOver with enter_functions and preserved across internally re-prepared
+    // steps (e.g. stepping out of entered functions or generator initial
+    // yield).
     bool step_over_enters_functions_;
 
     // Source statement position from last step next action.

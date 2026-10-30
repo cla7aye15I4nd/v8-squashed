@@ -4894,15 +4894,17 @@ Isolate::Isolate(IsolateGroup* isolate_group)
 }
 
 void Isolate::CheckIsolateLayout() {
-#ifdef V8_ENABLE_SANDBOX
+#ifdef V8_COMPRESS_POINTERS
   static_assert(static_cast<int>(ExternalPointerTable::BaseOffset()) ==
                 Internals::kExternalEntityTableBasePointerOffset);
+  static_assert(static_cast<int>(sizeof(ExternalPointerTable)) ==
+                Internals::kExternalEntityTableSize);
+#endif
+#ifdef V8_ENABLE_SANDBOX
   static_assert(static_cast<int>(TrustedPointerTable::BaseOffset()) ==
                 Internals::kExternalEntityTableBasePointerOffset);
   static_assert(static_cast<int>(JSDispatchTable::BaseOffset()) ==
                 Internals::kExternalEntityTableBasePointerOffset);
-  static_assert(static_cast<int>(sizeof(ExternalPointerTable)) ==
-                Internals::kExternalEntityTableSize);
   static_assert(static_cast<int>(sizeof(TrustedPointerTable)) ==
                 Internals::kExternalEntityTableSize);
   static_assert(static_cast<int>(sizeof(JSDispatchTable)) ==
@@ -5419,6 +5421,8 @@ Isolate::~Isolate() {
   store_stub_cache_ = nullptr;
   delete define_own_stub_cache_;
   define_own_stub_cache_ = nullptr;
+  delete has_stub_cache_;
+  has_stub_cache_ = nullptr;
 
   delete materialized_object_store_;
   materialized_object_store_ = nullptr;
@@ -6228,6 +6232,7 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
   load_stub_cache_ = new StubCache(this);
   store_stub_cache_ = new StubCache(this);
   define_own_stub_cache_ = new StubCache(this);
+  has_stub_cache_ = new StubCache(this);
   materialized_object_store_ = new MaterializedObjectStore(this);
   regexp_stack_ = regexp::Stack::New();
   isolate_data_.set_regexp_static_result_offsets_vector(

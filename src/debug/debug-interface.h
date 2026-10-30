@@ -54,10 +54,12 @@ void SetInspector(Isolate* isolate, v8_inspector::V8Inspector*);
 v8_inspector::V8Inspector* GetInspector(Isolate* isolate);
 
 // Returns a debug string representation of the bigint without tailing `n`.
-Local<String> GetBigIntStringValue(Isolate* isolate, Local<BigInt> bigint);
+V8_EXPORT_PRIVATE Local<String> GetBigIntStringValue(Isolate* isolate,
+                                                     Local<BigInt> bigint);
 
 // Returns a debug string representation of the bigint.
-Local<String> GetBigIntDescription(Isolate* isolate, Local<BigInt> bigint);
+V8_EXPORT_PRIVATE Local<String> GetBigIntDescription(Isolate* isolate,
+                                                     Local<BigInt> bigint);
 
 // Returns a debug string representation of the date.
 Local<String> GetDateDescription(Local<Date> date);
@@ -153,7 +155,11 @@ V8_EXPORT_PRIVATE void PrepareStep(Isolate* isolate, StepAction action,
                                    bool enter_functions = false);
 bool PrepareRestartFrame(Isolate* isolate, int callFrameOrdinal);
 void ClearStepping(Isolate* isolate);
-V8_EXPORT_PRIVATE void BreakRightNow(
+// Breaks execution at the current statement if possible, or schedules a break
+// on function entry / next function call. Returns true if the break was
+// delivered or scheduled; false if it was dropped (e.g. breaks disabled,
+// ignore_events, or stack overflow).
+V8_EXPORT_PRIVATE bool BreakRightNow(
     Isolate* isolate, base::EnumSet<BreakReason> break_reason = {});
 
 // Use `SetTerminateOnResume` to indicate that an TerminateExecution interrupt
@@ -553,6 +559,8 @@ class V8_EXPORT_PRIVATE StackTraceIterator {
 };
 
 V8_EXPORT_PRIVATE bool IsAPIFunctionWithSideEffects(v8::Local<v8::Value> value);
+V8_EXPORT_PRIVATE bool IsBuiltinOrApiFunction(v8::Local<v8::Function> function);
+V8_EXPORT_PRIVATE bool IsBuiltinOrApiFunction(v8::Local<v8::Value> value);
 
 void GlobalLexicalScopeNames(v8::Local<v8::Context> context,
                              std::vector<v8::Global<v8::String>>* names);

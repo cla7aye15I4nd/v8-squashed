@@ -41,6 +41,7 @@
 #include "src/snapshot/embedded/embedded-data.h"
 
 #if V8_ENABLE_WEBASSEMBLY
+#include "src/wasm/wasm-code-manager.h"
 #include "src/wasm/wasm-debug.h"
 #include "src/wasm/wasm-objects-inl.h"
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -1496,14 +1497,18 @@ void Debug::PrepareStepOnThrow() {
 
   int current_frame_count = CurrentFrameCount();
 
-  // Iterate through the JavaScript stack looking for handlers.
-  JavaScriptStackFrameIterator it(isolate_);
+  // Iterate through the stack looking for handlers.
+  // To keep current_frame_count consistent with CurrentFrameCount() and
+  // target_frame_count_, iterate with DebuggableStackFrameIterator and
+  // decrement by it.FrameFunctionCount() for every frame visited (including
+  // Wasm frames, which cannot contain JS catch handlers).
+  DebuggableStackFrameIterator it(isolate_);
   while (!it.done()) {
-    JavaScriptFrame* frame = it.frame();
-    if (frame->LookupExceptionHandlerInTable(nullptr, nullptr) > 0) break;
-    std::vector<Tagged<SharedFunctionInfo>> infos;
-    frame->GetFunctions(&infos);
-    current_frame_count -= infos.size();
+    if (it.is_javascript()) {
+      JavaScriptFrame* frame = it.javascript_frame();
+      if (frame->LookupExceptionHandlerInTable(nullptr, nullptr) > 0) break;
+    }
+    current_frame_count -= it.FrameFunctionCount();
     it.Advance();
   }
 
@@ -1514,8 +1519,12 @@ void Debug::PrepareStepOnThrow() {
   // Iterate frames, including inlined frames. First, find the handler frame.
   // Then skip to the frame we want to break in, then instrument for stepping.
   for (; !it.done(); it.Advance()) {
-    JavaScriptFrame* frame = JavaScriptFrame::cast(it.frame());
-    if (last_step_action() == StepInto) {
+    if (!it.is_javascript()) {
+      current_frame_count -= it.FrameFunctionCount();
+      continue;
+    }
+    JavaScriptFrame* frame = it.javascript_frame();
+    if (last_step_action() == StepInto || step_over_enters_functions()) {
       // Deoptimize frame to ensure calls are checked for step-in.
       Deoptimizer::DeoptimizeFunction(frame->function(),
                                       LazyDeoptimizeReason::kDebugger,
@@ -1608,7 +1617,9 @@ void Debug::PrepareStep(StepAction step_action) {
         thread_local_.ignore_step_into_function_ = *function;
       }
       step_action = StepOut;
-      thread_local_.last_step_action_ = StepInto;
+      if (!step_over_enters_functions()) {
+        thread_local_.last_step_action_ = StepInto;
+      }
     }
 
     // We need to schedule DebugOnFunction call callback
@@ -1719,7 +1730,7 @@ void Debug::PrepareStep(StepAction step_action) {
         }
 #endif  // V8_ENABLE_WEBASSEMBLY
         JavaScriptFrame* js_frame = JavaScriptFrame::cast(frames_it.frame());
-        if (last_step_action() == StepInto) {
+        if (last_step_action() == StepInto || step_over_enters_functions()) {
           // Deoptimize frame to ensure calls are checked for step-in.
           Deoptimizer::DeoptimizeFunction(js_frame->function(),
                                           LazyDeoptimizeReason::kDebugger,
@@ -2778,6 +2789,7 @@ void Debug::OnException(DirectHandle<Object> exception,
       promise_object = isolate_->factory()->undefined_value();
     }
     RCS_SCOPE(isolate_, RuntimeCallCounterId::kDebuggerCallback);
+    thread_local_.step_over_enters_functions_ = false;
     debug_delegate_->ExceptionThrown(
         v8::Utils::ToLocal(isolate_->native_context()),
         v8::Utils::ToLocal(exception), v8::Utils::ToLocal(promise_object),
@@ -2816,6 +2828,7 @@ void Debug::OnDebugBreak(DirectHandle<FixedArray> break_points_hit,
     if (lastStepAction != StepAction::StepNone) {
       break_reasons.Add(debug::BreakReason::kStep);
     }
+    thread_local_.step_over_enters_functions_ = false;
     debug_delegate_->BreakProgramRequested(
         v8::Utils::ToLocal(isolate_->native_context()),
         inspector_break_points_hit, break_reasons);
@@ -3035,18 +3048,18 @@ void Debug::UpdateHookOnFunctionCall() {
       thread_local_.break_on_next_function_call_;
 }
 
-void Debug::HandleDebugBreak(IgnoreBreakMode ignore_break_mode,
+bool Debug::HandleDebugBreak(IgnoreBreakMode ignore_break_mode,
                              v8::debug::BreakReasons break_reasons) {
   RCS_SCOPE(isolate_, RuntimeCallCounterId::kDebugger);
   // Ignore debug break during bootstrapping.
-  if (isolate_->bootstrapper()->IsActive()) return;
+  if (isolate_->bootstrapper()->IsActive()) return false;
   // Just continue if breaks are disabled.
-  if (break_disabled() || IsRestartFrameScheduled()) return;
+  if (break_disabled() || IsRestartFrameScheduled()) return false;
   // Ignore debug break if debugger is not active.
-  if (!is_active()) return;
+  if (!is_active()) return false;
 
   StackLimitCheck check(isolate_);
-  if (check.HasOverflowed()) return;
+  if (check.HasOverflowed()) return false;
 
   HandleScope scope(isolate_);
   MaybeHandle<FixedArray> break_points;
@@ -3085,7 +3098,7 @@ void Debug::HandleDebugBreak(IgnoreBreakMode ignore_break_mode,
           (ignore_break_mode == kIgnoreIfTopFrameBlackboxed
                ? IsBlackboxed(shared)
                : AllFramesOnStackAreBlackboxed());
-      if (ignore_break) return;
+      if (ignore_break) return false;
 
       // kScheduled and kOOM breaks are triggered by the stack check. While we
       // could pause here, the JSFunction didn't have time yet to create and
@@ -3098,10 +3111,10 @@ void Debug::HandleDebugBreak(IgnoreBreakMode ignore_break_mode,
       if ((break_reasons.contains(v8::debug::BreakReason::kScheduled) ||
            break_reasons.contains(v8::debug::BreakReason::kOOM)) &&
           BreakLocation::IsPausedInJsFunctionEntry(frame)) {
-        if (ignore_events()) return;
+        if (ignore_events()) return false;
         thread_local_.scheduled_break_on_next_function_call_.Add(break_reasons);
         FloodWithOneShotIncludingBlackboxed(handle(*shared, isolate_));
-        return;
+        return true;
       }
 
       Handle<DebugInfo> debug_info;
@@ -3114,14 +3127,71 @@ void Debug::HandleDebugBreak(IgnoreBreakMode ignore_break_mode,
         BreakLocation::AllAtCurrentStatement(debug_info, frame,
                                              &break_locations);
 
-        if (IsMutedAtAnyBreakLocation(shared, break_locations)) {
+        if (!break_reasons.contains(v8::debug::BreakReason::kOOM) &&
+            IsMutedAtAnyBreakLocation(shared, break_locations)) {
           // If we get to this point, a break was triggered because e.g. of
           // a debugger statement, an assert, .. . However, we do not stop
           // if this position "is muted", which happens if a conditional
-          // breakpoint at this point evaluated to false.
-          return;
+          // breakpoint at this point evaluated to false. The exception are
+          // OOM breaks: They are a last resort before the process dies and
+          // the inspector relies on them to happen.
+          return false;
         }
       }
+#if V8_ENABLE_WEBASSEMBLY
+    } else if (!it.done() && it.frame()->is_wasm()) {
+#if V8_ENABLE_DRUMBRAKE
+      if (!it.frame()->is_wasm_interpreter_entry())
+#endif  // V8_ENABLE_DRUMBRAKE
+      {
+        WasmFrame* wasm_frame = WasmFrame::cast(it.frame());
+        wasm::WasmCodeRefScope code_ref_scope;
+        // Optimized Wasm frames cannot be deoptimized on-stack at loop stack
+        // checks. Defer the pause to the next function call (or return to a
+        // debuggable caller frame) so that JavaScript executed during the
+        // pause cannot invalidate load-eliminated state in the optimized Wasm
+        // frame.
+        if (!wasm_frame->wasm_code()->is_liftoff()) {
+          if (ignore_events()) return false;
+          thread_local_.scheduled_break_on_next_function_call_.Add(
+              break_reasons);
+          SetBreakOnNextFunctionCall();
+          for (it.Advance(); !it.done(); it.Advance()) {
+            if (it.frame()->is_wasm()) {
+#if V8_ENABLE_DRUMBRAKE
+              if (it.frame()->is_wasm_interpreter_entry()) continue;
+#endif  // V8_ENABLE_DRUMBRAKE
+              WasmFrame* caller_wasm = WasmFrame::cast(it.frame());
+              if (!caller_wasm->wasm_code()->is_inspectable()) continue;
+              wasm::DebugInfo* debug_info =
+                  caller_wasm->native_module()->GetDebugInfo();
+              if (debug_info->IsFrameBlackboxed(caller_wasm)) continue;
+              debug_info->PrepareStepOutTo(caller_wasm);
+              break;
+            }
+            JavaScriptFrame* js_frame = JavaScriptFrame::cast(it.frame());
+            if (js_frame->is_optimized()) {
+              Deoptimizer::DeoptimizeFunction(js_frame->function(),
+                                              LazyDeoptimizeReason::kDebugger,
+                                              js_frame->LookupCode());
+            }
+            HandleScope inner_scope(isolate_);
+            std::vector<Handle<SharedFunctionInfo>> infos;
+            js_frame->GetFunctions(&infos);
+            bool flooded = false;
+            for (; !infos.empty(); infos.pop_back()) {
+              Handle<SharedFunctionInfo> info = infos.back();
+              if (IsBlackboxed(info)) continue;
+              FloodWithOneShot(info);
+              flooded = true;
+              break;
+            }
+            if (flooded) break;
+          }
+          return true;
+        }
+      }
+#endif  // V8_ENABLE_WEBASSEMBLY
     }
   }
 
@@ -3134,6 +3204,7 @@ void Debug::HandleDebugBreak(IgnoreBreakMode ignore_break_mode,
   OnDebugBreak(break_points.is_null() ? isolate_->factory()->empty_fixed_array()
                                       : break_points.ToHandleChecked(),
                lastStepAction, break_reasons);
+  return true;
 }
 
 #ifdef DEBUG

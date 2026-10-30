@@ -9,13 +9,17 @@
 #include "include/v8-external.h"
 #include "include/v8-function.h"
 #include "include/v8-inspector.h"
+#include "include/v8-json.h"
 #include "include/v8-local-handle.h"
+#include "include/v8-microtask-queue.h"
 #include "include/v8-primitive.h"
+#include "src/heap/heap.h"
 #include "src/inspector/string-util.h"
 #include "src/inspector/v8-inspector-impl.h"
 #include "src/inspector/v8-inspector-session-impl.h"
 #include "src/inspector/v8-runtime-agent-impl.h"
 #include "test/common/flag-utils.h"
+#include "test/unittests/heap/heap-utils.h"
 #include "test/unittests/test-utils.h"
 #include "testing/gtest/include/gtest/gtest.h"
 
@@ -81,6 +85,142 @@ TEST_F(InspectorTest, WrapInsideWrapOnInterrupt) {
                       false);
 }
 
+using InspectorShadowRealmTest = TestShadowRealmWithContext;
+
+namespace {
+
+v8::MaybeLocal<v8::Context> CreateShadowRealmContext(
+    v8::Local<v8::Context> initiator_context) {
+  return v8::Context::New(v8::Isolate::GetCurrent());
+}
+
+// Collects every protocol response so the test can inspect the JSON.
+class CollectingChannel : public V8Inspector::Channel {
+ public:
+  ~CollectingChannel() override = default;
+  void sendResponse(int callId,
+                    std::unique_ptr<StringBuffer> message) override {
+    m_responses.push_back(toString16(message->string()));
+  }
+  void sendNotification(std::unique_ptr<StringBuffer> message) override {}
+  void flushProtocolNotifications() override {}
+
+  const String16& lastResponse() const { return m_responses.back(); }
+
+ private:
+  std::vector<String16> m_responses;
+};
+
+}  // namespace
+
+// Runtime.getProperties must not invoke a getter that is a ShadowRealm wrapped
+// function: such a getter runs user JavaScript in the shadow realm.
+TEST_F(InspectorShadowRealmTest,
+       GetPropertiesDoesNotCallWrappedFunctionGetter) {
+  v8::Isolate* isolate = v8_isolate();
+  v8::HandleScope handle_scope(isolate);
+  isolate->SetHostCreateShadowRealmContextCallback(CreateShadowRealmContext);
+
+  v8_inspector::V8InspectorClient default_client;
+  std::unique_ptr<V8Inspector> inspector =
+      V8Inspector::create(isolate, &default_client);
+  V8ContextInfo context_info(v8_context(), 1, StringView());
+  inspector->contextCreated(context_info);
+
+  CollectingChannel channel;
+  std::unique_ptr<V8InspectorSession> session =
+      inspector->connect(1, &channel, toStringView("{}"),
+                         v8_inspector::V8Inspector::kFullyTrusted);
+
+  // The holder is itself callable so that the wrapped getter's receiver can
+  // be wrapped for the shadow realm (GetWrappedValue requires a callable or a
+  // primitive).
+  RunJS(
+      "globalThis.realm = new ShadowRealm();"
+      "realm.evaluate('globalThis.calls = 0');"
+      "globalThis.obj = function holder() {};"
+      "Object.defineProperty(obj, 'x', {"
+      "  configurable: true, enumerable: true,"
+      "  get: realm.evaluate('() => { globalThis.calls++; return 42; }')"
+      "});");
+
+  session->dispatchProtocolMessage(
+      toStringView("{\"id\": 1, \"method\": \"Runtime.evaluate\", \"params\": "
+                   "{\"expression\": \"obj\", \"contextId\": 1}}"));
+  std::string response = channel.lastResponse().utf8();
+  const char kObjectIdKey[] = "\"objectId\":\"";
+  size_t object_id_start = response.find(kObjectIdKey);
+  CHECK_NE(object_id_start, std::string::npos);
+  object_id_start += strlen(kObjectIdKey);
+  size_t object_id_end = response.find("\"", object_id_start);
+  CHECK_NE(object_id_end, std::string::npos);
+  std::string object_id =
+      response.substr(object_id_start, object_id_end - object_id_start);
+
+  std::string command =
+      "{\"id\": 2, \"method\": \"Runtime.getProperties\", \"params\": "
+      "{\"ownProperties\": true, \"objectId\": \"" +
+      object_id + "\"}}";
+  session->dispatchProtocolMessage(toStringView(String16(command.c_str())));
+
+  // The property must be reported as an accessor, not as an eagerly evaluated
+  // value: the inspector must not run the wrapped getter.
+  CHECK_EQ(channel.lastResponse().utf8().find(
+               "\"name\":\"x\",\"value\":{\"type\":\"number\",\"value\":42"),
+           std::string::npos);
+
+  // And the wrapped function must not have run.
+  v8::Local<v8::Value> calls = RunJS("realm.evaluate('String(calls)')");
+  v8::String::Utf8Value calls_utf8(isolate, calls);
+  CHECK_EQ(std::string(*calls_utf8), std::string("0"));
+}
+
+// Runtime.getProperties still eagerly evaluates builtin getters (e.g.
+// Map.prototype.size).
+TEST_F(InspectorTest, GetPropertiesEagerlyEvaluatesBuiltinGetter) {
+  v8::Isolate* isolate = v8_isolate();
+  v8::HandleScope handle_scope(isolate);
+
+  v8_inspector::V8InspectorClient default_client;
+  std::unique_ptr<V8Inspector> inspector =
+      V8Inspector::create(isolate, &default_client);
+  V8ContextInfo context_info(v8_context(), 1, StringView());
+  inspector->contextCreated(context_info);
+
+  CollectingChannel channel;
+  std::unique_ptr<V8InspectorSession> session =
+      inspector->connect(1, &channel, toStringView("{}"),
+                         v8_inspector::V8Inspector::kFullyTrusted);
+
+  RunJS("globalThis.map = new Map([['a', 1], ['b', 2]]);");
+
+  session->dispatchProtocolMessage(
+      toStringView("{\"id\": 1, \"method\": \"Runtime.evaluate\", \"params\": "
+                   "{\"expression\": \"map\", \"contextId\": 1}}"));
+  std::string response = channel.lastResponse().utf8();
+  const char kObjectIdKey[] = "\"objectId\":\"";
+  size_t object_id_start = response.find(kObjectIdKey);
+  CHECK_NE(object_id_start, std::string::npos);
+  object_id_start += strlen(kObjectIdKey);
+  size_t object_id_end = response.find("\"", object_id_start);
+  CHECK_NE(object_id_end, std::string::npos);
+  std::string object_id =
+      response.substr(object_id_start, object_id_end - object_id_start);
+
+  std::string command =
+      "{\"id\": 2, \"method\": \"Runtime.getProperties\", \"params\": "
+      "{\"ownProperties\": false, \"accessorPropertiesOnly\": false, "
+      "\"objectId\": \"" +
+      object_id + "\"}}";
+  session->dispatchProtocolMessage(toStringView(String16(command.c_str())));
+
+  // Map.prototype.size is a builtin getter, so it must be eagerly evaluated to
+  // value: 2.
+  CHECK_NE(channel.lastResponse().utf8().find(
+               "\"name\":\"size\",\"value\":{\"type\":\"number\",\"value\":2"),
+           std::string::npos);
+}
+
 TEST_F(InspectorTest, BinaryFromBase64) {
   auto checkBinary = [](const v8_inspector::protocol::Binary& binary,
                         const std::vector<uint8_t>& values) {
@@ -144,6 +284,127 @@ TEST_F(InspectorTest, BinaryFromBase64) {
     auto binary = v8_inspector::protocol::Binary::fromBase64(" ", &success);
     CHECK(!success);
   }
+}
+
+namespace {
+
+class CustomPreviewChannel : public v8_inspector::V8Inspector::Channel {
+ public:
+  ~CustomPreviewChannel() override = default;
+  void sendResponse(
+      int callId,
+      std::unique_ptr<v8_inspector::StringBuffer> message) override {
+    responses_[callId] = v8_inspector::toString16(message->string());
+  }
+  void sendNotification(
+      std::unique_ptr<v8_inspector::StringBuffer> message) override {}
+  void flushProtocolNotifications() override {}
+
+  std::unordered_map<int, v8_inspector::String16> responses_;
+};
+
+}  // namespace
+
+TEST_F(InspectorTest, CrossContextCustomPreviewBody) {
+  v8::Isolate* isolate = v8_isolate();
+  v8::HandleScope handle_scope(isolate);
+
+  v8::Local<v8::Context> context_a = v8_context();
+  v8::Local<v8::Context> context_b = v8::Context::New(isolate);
+  v8::Local<v8::String> token = NewString("same-token");
+  context_a->SetSecurityToken(token);
+  context_b->SetSecurityToken(token);
+
+  {
+    v8::Context::Scope scope_b(context_b);
+    v8::Local<v8::Value> target_obj =
+        RunJS(context_b,
+              "globalThis.devtoolsFormatters = [{\n"
+              "  header: (x) => x && x.isTarget ? ['span', {}, 'custom "
+              "header'] : null,\n"
+              "  hasBody: (x) => x && x.isTarget,\n"
+              "  body: (x) => ['span', {}, 'custom body']\n"
+              "}];\n"
+              "({isTarget: true})");
+    context_a->Global()
+        ->Set(context_a, NewString("target"), target_obj)
+        .ToChecked();
+  }
+
+  v8_inspector::V8InspectorClient default_client;
+  std::unique_ptr<v8_inspector::V8InspectorImpl> inspector(
+      new v8_inspector::V8InspectorImpl(isolate, &default_client));
+  const char kContextAName[] = "contextA";
+  StringView name_a(reinterpret_cast<const uint8_t*>(kContextAName),
+                    strlen(kContextAName));
+  V8ContextInfo context_info_a(context_a, 1, name_a);
+  inspector->contextCreated(context_info_a);
+
+  const char kContextBName[] = "contextB";
+  StringView name_b(reinterpret_cast<const uint8_t*>(kContextBName),
+                    strlen(kContextBName));
+  V8ContextInfo context_info_b(context_b, 1, name_b);
+  inspector->contextCreated(context_info_b);
+
+  CustomPreviewChannel channel;
+  std::unique_ptr<V8InspectorSession> session = inspector->connect(
+      1, &channel, toStringView("{}"), v8_inspector::V8Inspector::kFullyTrusted,
+      v8_inspector::V8Inspector::kNotWaitingForDebugger);
+
+  session->dispatchProtocolMessage(
+      toStringView(R"({"id": 1, "method": "Runtime.enable"})"));
+  session->dispatchProtocolMessage(toStringView(
+      R"({"id": 2, "method": "Runtime.setCustomObjectFormatterEnabled", "params": {"enabled": true}})"));
+
+  session->dispatchProtocolMessage(toStringView(
+      R"({"id": 3, "method": "Runtime.evaluate", "params": {"expression": "target", "contextId": 1, "generatePreview": true}})"));
+
+  CHECK(channel.responses_.find(3) != channel.responses_.end());
+  v8_inspector::String16 evaluate_response = channel.responses_[3];
+
+  v8::Context::Scope scope_a(context_a);
+  v8::Local<v8::Object> eval_json =
+      v8::JSON::Parse(context_a, NewString(evaluate_response.utf8().c_str()))
+          .ToLocalChecked()
+          .As<v8::Object>();
+  v8::Local<v8::Object> result_obj =
+      eval_json->Get(context_a, NewString("result"))
+          .ToLocalChecked()
+          .As<v8::Object>()
+          ->Get(context_a, NewString("result"))
+          .ToLocalChecked()
+          .As<v8::Object>();
+  v8::Local<v8::String> object_id =
+      result_obj->Get(context_a, NewString("objectId"))
+          .ToLocalChecked()
+          .As<v8::String>();
+  v8::Local<v8::Object> custom_preview =
+      result_obj->Get(context_a, NewString("customPreview"))
+          .ToLocalChecked()
+          .As<v8::Object>();
+  v8::Local<v8::String> body_getter_id =
+      custom_preview->Get(context_a, NewString("bodyGetterId"))
+          .ToLocalChecked()
+          .As<v8::String>();
+
+  v8::String::Utf8Value object_id_utf8(isolate, object_id);
+  v8::String::Utf8Value body_getter_id_utf8(isolate, body_getter_id);
+
+  std::string call_command =
+      std::string(
+          R"({"id": 4, "method": "Runtime.callFunctionOn", "params": {)") +
+      R"("objectId": ")" + *object_id_utf8 + R"(", )" +
+      R"("functionDeclaration": "function(bodyGetter) { return bodyGetter.call(this); }", )" +
+      R"("arguments": [{"objectId": ")" + *body_getter_id_utf8 + R"("}], )" +
+      R"("returnByValue": true}})";
+
+  session->dispatchProtocolMessage(
+      toStringView(String16(call_command.c_str())));
+
+  CHECK(channel.responses_.find(4) != channel.responses_.end());
+  v8_inspector::String16 call_response = channel.responses_[4];
+  CHECK_NE(call_response.find(v8_inspector::String16("custom body")),
+           v8_inspector::String16::kNotFound);
 }
 
 TEST_F(InspectorTest, BinaryToBase64) {
@@ -933,6 +1194,76 @@ TEST_F(InspectorTest, TerminateExecutionWithDetachedDefaultContext) {
   inspector2.reset();
 }
 
+TEST_F(InspectorTest, TerminateExecutionWithDetachedCustomMicrotaskQueue) {
+  v8::Isolate* isolate = v8_isolate();
+  v8::HandleScope handle_scope(isolate);
+
+  // 1. Destroying session and inspector after DetachGlobal + GC.
+  {
+    v8::MicrotaskQueue* microtask_queue = v8::MicrotaskQueue::New(isolate);
+    v8::Local<v8::Context> context = v8::Context::New(
+        isolate, nullptr, MaybeLocal<ObjectTemplate>(), MaybeLocal<Value>(),
+        DeserializeInternalFieldsCallback(), microtask_queue);
+    DefaultContextClient client(isolate, context);
+    std::unique_ptr<V8Inspector> inspector =
+        V8Inspector::create(isolate, &client);
+    V8ContextInfo context_info(context, 1, toStringView(""));
+    inspector->contextCreated(context_info);
+
+    NoopChannel channel;
+    std::unique_ptr<V8InspectorSession> session =
+        inspector->connect(1, &channel, toStringView("{}"),
+                           v8_inspector::V8Inspector::kFullyTrusted);
+
+    session->dispatchProtocolMessage(toStringView(R"({
+      "id": 1,
+      "method": "Runtime.terminateExecution"
+    })"));
+    context->DetachGlobal();
+    {
+      EmbedderStackStateScope stack_scope(
+          i_isolate()->heap(), EmbedderStackStateOrigin::kExplicitInvocation,
+          StackState::kNoHeapPointers);
+      ::v8::internal::InvokeMajorGC(i_isolate(), GCFlag::kForced);
+    }
+    session.reset();
+    inspector.reset();
+  }
+
+  // 2. Running JS to trigger reportTermination after DetachGlobal + GC.
+  {
+    v8::MicrotaskQueue* microtask_queue = v8::MicrotaskQueue::New(isolate);
+    v8::Local<v8::Context> context = v8::Context::New(
+        isolate, nullptr, MaybeLocal<ObjectTemplate>(), MaybeLocal<Value>(),
+        DeserializeInternalFieldsCallback(), microtask_queue);
+    DefaultContextClient client(isolate, context);
+    std::unique_ptr<V8Inspector> inspector =
+        V8Inspector::create(isolate, &client);
+    V8ContextInfo context_info(context, 1, toStringView(""));
+    inspector->contextCreated(context_info);
+
+    NoopChannel channel;
+    std::unique_ptr<V8InspectorSession> session =
+        inspector->connect(1, &channel, toStringView("{}"),
+                           v8_inspector::V8Inspector::kFullyTrusted);
+
+    session->dispatchProtocolMessage(toStringView(R"({
+      "id": 1,
+      "method": "Runtime.terminateExecution"
+    })"));
+    context->DetachGlobal();
+    {
+      EmbedderStackStateScope stack_scope(
+          i_isolate()->heap(), EmbedderStackStateOrigin::kExplicitInvocation,
+          StackState::kNoHeapPointers);
+      ::v8::internal::InvokeMajorGC(i_isolate(), GCFlag::kForced);
+    }
+    TryRunJS("1");
+    session.reset();
+    inspector.reset();
+  }
+}
+
 namespace {
 
 // Calls into JavaScript for every Debugger.paused and Debugger.resumed
@@ -976,6 +1307,17 @@ void DispatchPause(const v8::FunctionCallbackInfo<v8::Value>& info) {
                                        v8::kExternalPointerTypeTagDefault))
       ->dispatchProtocolMessage(
           toStringView(R"({"id": 2, "method": "Debugger.pause"})"));
+}
+
+void CaptureIsTopScriptOpaque(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  auto* inspector =
+      static_cast<V8Inspector*>(info.DataV2().As<v8::External>()->Value(
+          v8::kExternalPointerTypeTagDefault));
+  std::unique_ptr<v8_inspector::V8StackTrace> stack_trace =
+      inspector->captureStackTrace(/*fullStack=*/false);
+  CHECK(stack_trace);
+  CHECK(!stack_trace->isEmpty());
+  info.GetReturnValue().Set(stack_trace->isTopScriptOpaque());
 }
 
 }  // namespace
@@ -1131,6 +1473,75 @@ TEST_F(InspectorTest, ChannelCanDeoptWhenRestartingFrame) {
   v8::Local<v8::Value> result = TryRunJS("target()").ToLocalChecked();
   CHECK_EQ(result->Int32Value(v8_context()).FromJust(), 42);
   CHECK(channel.response_received());
+}
+
+TEST_F(InspectorTest, IsTopScriptOpaque) {
+  v8::Isolate* isolate = v8_isolate();
+  v8::HandleScope handle_scope(isolate);
+
+  v8_inspector::V8InspectorClient default_client;
+  std::unique_ptr<V8Inspector> inspector =
+      V8Inspector::create(isolate, &default_client);
+  V8ContextInfo context_info(v8_context(), 1, toStringView(""));
+  inspector->contextCreated(context_info);
+
+  v8::Local<v8::Function> capture =
+      v8::Function::New(v8_context(), &CaptureIsTopScriptOpaque,
+                        v8::External::New(isolate, inspector.get(),
+                                          v8::kExternalPointerTypeTagDefault))
+          .ToLocalChecked();
+  CHECK(v8_context()
+            ->Global()
+            ->Set(v8_context(), NewString("captureIsTopScriptOpaque"), capture)
+            .FromJust());
+
+  auto compile_and_run = [&](const char* source, const char* url,
+                             bool is_opaque) -> v8::Local<v8::Value> {
+    v8::ScriptOrigin origin(NewString(url), /*resource_line_offset=*/0,
+                            /*resource_column_offset=*/0,
+                            /*resource_is_shared_cross_origin=*/false,
+                            /*script_id=*/-1, /*source_map_url=*/{},
+                            /*resource_is_opaque=*/is_opaque);
+    v8::Local<v8::Script> script =
+        v8::Script::Compile(v8_context(), NewString(source), &origin)
+            .ToLocalChecked();
+    return script->Run(v8_context()).ToLocalChecked();
+  };
+
+  compile_and_run(
+      "function nonOpaqueFn() { return captureIsTopScriptOpaque(); }"
+      "function nonOpaqueEvalFn() { return eval('captureIsTopScriptOpaque()'); "
+      "}",
+      "https://example.com/non-opaque.js", /*is_opaque=*/false);
+  compile_and_run(
+      "function opaqueFn() { return captureIsTopScriptOpaque(); }"
+      "function opaqueEvalFn() { return eval('captureIsTopScriptOpaque()'); }",
+      "https://other.example/opaque.js", /*is_opaque=*/true);
+
+  // Exercise both scripts (including repeated calls that hit
+  // V8Debugger::symbolize()'s m_cachedStackFrames cache) and eval inside each.
+  EXPECT_FALSE(compile_and_run("nonOpaqueFn()",
+                               "https://example.com/caller1.js",
+                               /*is_opaque=*/false)
+                   ->BooleanValue(isolate));
+  EXPECT_FALSE(compile_and_run("nonOpaqueFn()",
+                               "https://other.example/caller2.js",
+                               /*is_opaque=*/true)
+                   ->BooleanValue(isolate));
+  EXPECT_TRUE(compile_and_run("opaqueFn()", "https://example.com/caller3.js",
+                              /*is_opaque=*/false)
+                  ->BooleanValue(isolate));
+  EXPECT_TRUE(compile_and_run("opaqueFn()", "https://other.example/caller4.js",
+                              /*is_opaque=*/true)
+                  ->BooleanValue(isolate));
+  EXPECT_FALSE(compile_and_run("nonOpaqueEvalFn()",
+                               "https://other.example/caller5.js",
+                               /*is_opaque=*/true)
+                   ->BooleanValue(isolate));
+  EXPECT_TRUE(compile_and_run("opaqueEvalFn()",
+                              "https://example.com/caller6.js",
+                              /*is_opaque=*/false)
+                  ->BooleanValue(isolate));
 }
 }  // namespace internal
 }  // namespace v8

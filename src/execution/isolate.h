@@ -1366,6 +1366,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   StubCache* load_stub_cache() const { return load_stub_cache_; }
   StubCache* store_stub_cache() const { return store_stub_cache_; }
   StubCache* define_own_stub_cache() const { return define_own_stub_cache_; }
+  StubCache* has_stub_cache() const { return has_stub_cache_; }
   Deoptimizer* GetAndClearCurrentDeoptimizer() {
     Deoptimizer* result = current_deoptimizer_;
     CHECK_NOT_NULL(result);
@@ -1603,6 +1604,10 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 
   bool is_best_effort_code_coverage() const {
     return code_coverage_mode() == debug::CoverageMode::kBestEffort;
+  }
+
+  bool requires_bytecode_for_code_coverage() const {
+    return !is_best_effort_code_coverage();
   }
 
   bool is_precise_count_code_coverage() const {
@@ -2648,6 +2653,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   StubCache* load_stub_cache_ = nullptr;
   StubCache* store_stub_cache_ = nullptr;
   StubCache* define_own_stub_cache_ = nullptr;
+  StubCache* has_stub_cache_ = nullptr;
   Deoptimizer* current_deoptimizer_ = nullptr;
   bool deoptimizer_lazy_throw_ = false;
   MaterializedObjectStore* materialized_object_store_ = nullptr;

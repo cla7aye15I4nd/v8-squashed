@@ -2176,12 +2176,14 @@ void ClearStubCaches(Isolate* isolate) {
   isolate->load_stub_cache()->Clear();
   isolate->store_stub_cache()->Clear();
   isolate->define_own_stub_cache()->Clear();
+  isolate->has_stub_cache()->Clear();
 
   if (isolate->is_shared_space_isolate()) {
     isolate->global_safepoint()->IterateClientIsolates([](Isolate* client) {
       client->load_stub_cache()->Clear();
       client->store_stub_cache()->Clear();
       client->define_own_stub_cache()->Clear();
+      client->has_stub_cache()->Clear();
     });
   }
 }
@@ -3743,7 +3745,7 @@ void Heap::InvokeIncrementalMarkingEpilogueCallbacks() {
 namespace {
 thread_local Address pending_layout_change_object_address = kNullAddress;
 
-#ifdef V8_ENABLE_SANDBOX
+#ifdef V8_COMPRESS_POINTERS
 // Invalidates slots for external and CppHeap pointers. These are pointers in
 // tables that can get compacted/evacuated and thus have to maintain information
 // about whether a slot is valid. Note that it's fine to overwrite slots with
@@ -3795,7 +3797,7 @@ class ExternalPointerSlotInvalidator final
   Tagged<HeapObject> target_;
   int num_invalidated_slots = 0;
 };
-#endif  // V8_ENABLE_SANDBOX
+#endif  // V8_COMPRESS_POINTERS
 
 }  // namespace
 
@@ -3849,17 +3851,13 @@ void Heap::NotifyObjectLayoutChange(
       InvalidateExternalPointerSlots{true}) {
     // Currently, the only time this function receives
     // InvalidateExternalPointerSlots{true} is when an external string
-    // transitions to a thin string.  If this ever changed to happen for array
-    // buffer extension slots, we would have to run the invalidator in
-    // pointer-compression-but-no-sandbox configurations as well.
+    // transitions to a thin string.
     DCHECK(IsString(object));
-#ifdef V8_ENABLE_SANDBOX
-    if (V8_ENABLE_SANDBOX_BOOL) {
-      ExternalPointerSlotInvalidator slot_invalidator(isolate());
-      const int num_invalidated_slots = slot_invalidator.Visit(object);
-      USE(num_invalidated_slots);
-      DCHECK_GT(num_invalidated_slots, 0);
-    }
+#ifdef V8_COMPRESS_POINTERS
+    ExternalPointerSlotInvalidator slot_invalidator(isolate());
+    const int num_invalidated_slots = slot_invalidator.Visit(object);
+    USE(num_invalidated_slots);
+    DCHECK_GT(num_invalidated_slots, 0);
 
     // During concurrent marking for a minor GC, the heap also builds up a
     // RememberedSet of external pointer field locations, and uses that set to
@@ -3867,7 +3865,7 @@ void Heap::NotifyObjectLayoutChange(
     // would need to invalidate that set too; until we do, assert that
     // NotifyObjectLayoutChange is never called on young objects.
     CHECK(!HeapLayout::InYoungGeneration(object));
-#endif
+#endif  // V8_COMPRESS_POINTERS
   }
 
 #ifdef VERIFY_HEAP
@@ -6990,6 +6988,9 @@ StrongRootsEntry* Heap::RegisterStrongRoots(const char* label,
   base::MutexGuard guard(&strong_roots_mutex_);
 
   StrongRootsEntry* entry = new StrongRootsEntry(label);
+#ifdef DEBUG
+  entry->local_heap = LocalHeap::Current();
+#endif
   entry->start = start;
   entry->end = end;
   entry->prev = nullptr;
@@ -7030,6 +7031,20 @@ void Heap::UnregisterStrongRoots(StrongRootsEntry* entry) {
 
   delete entry;
 }
+
+#ifdef DEBUG
+bool Heap::ContainsStrongRoot(LocalHeap* local_heap, FullObjectSlot slot) {
+  base::MutexGuard guard(&strong_roots_mutex_);
+  for (StrongRootsEntry* current = strong_roots_head_; current;
+       current = current->next) {
+    if (current->local_heap == local_heap && current->start <= slot &&
+        slot < current->end) {
+      return true;
+    }
+  }
+  return false;
+}
+#endif
 
 void Heap::SetBuiltinsConstantsTable(Tagged<FixedArray> cache) {
   set_builtins_constants_table(cache);

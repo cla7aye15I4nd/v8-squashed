@@ -1041,28 +1041,31 @@ bool ExecuteWasmDebugBreaks(
     }
   }
 
-  if (debug_info->IsStepping(frame) && !debug_info->IsFrameBlackboxed(frame)) {
-    debug_info->ClearStepping(isolate);
-    StepAction step_action = isolate->debug()->last_step_action();
-    isolate->debug()->ClearStepping();
-    if (isolate->debug()->ContinueSteppingIfSkipped(step_action)) return true;
-    isolate->debug()->OnDebugBreak(isolate->factory()->empty_fixed_array(),
-                                   step_action);
-    return true;
-  }
-
   // Check whether we hit a breakpoint.
   DirectHandle<FixedArray> breakpoints;
-  if (WasmScript::CheckBreakPoints(isolate, script, frame->position(),
+  if (isolate->debug()->break_points_active() &&
+      WasmScript::CheckBreakPoints(isolate, script, frame->position(),
                                    frame->id())
           .ToHandle(&breakpoints)) {
     debug_info->ClearStepping(isolate);
     StepAction step_action = isolate->debug()->last_step_action();
+    v8::debug::BreakReasons break_reasons =
+        isolate->debug()->scheduled_break_on_next_function_call();
     isolate->debug()->ClearStepping();
-    if (isolate->debug()->break_points_active()) {
-      // We hit one or several breakpoints. Notify the debug listeners.
-      isolate->debug()->OnDebugBreak(breakpoints, step_action);
-    }
+    // We hit one or several breakpoints. Notify the debug listeners.
+    isolate->debug()->OnDebugBreak(breakpoints, step_action, break_reasons);
+    return true;
+  }
+
+  if (debug_info->IsStepping(frame) && !debug_info->IsFrameBlackboxed(frame)) {
+    debug_info->ClearStepping(isolate);
+    StepAction step_action = isolate->debug()->last_step_action();
+    v8::debug::BreakReasons break_reasons =
+        isolate->debug()->scheduled_break_on_next_function_call();
+    isolate->debug()->ClearStepping();
+    if (isolate->debug()->ContinueSteppingIfSkipped(step_action)) return true;
+    isolate->debug()->OnDebugBreak(isolate->factory()->empty_fixed_array(),
+                                   step_action, break_reasons);
     return true;
   }
 

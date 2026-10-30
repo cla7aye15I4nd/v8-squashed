@@ -1441,20 +1441,7 @@ i::DirectHandle<i::AccessorInfo> MakeAccessorInfo(i::Isolate* i_isolate,
   obj->set_getter(i_isolate, reinterpret_cast<i::Address>(getter));
   DCHECK_IMPLIES(replace_on_access, setter == nullptr);
   if (setter == nullptr) {
-    // TODO(https://crbug.com/348660658): remove once AccessorNameSetterCallback
-    // is deprecated and removed.
-#if (__GNUC__ >= 8) || defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wcast-function-type"
-#endif
-    // Cast from 'void (*)(v8::Local<v8::Name>, v8::Local<v8::Value>, const
-    // v8::PropertyCallbackInfo<v8::Boolean> &)' to 'void
-    // (*)(v8::Local<v8::Name>, v8::Local<v8::Value>, const
-    // v8::PropertyCallbackInfo<void> &)'.
-    setter = reinterpret_cast<Setter>(&i::Accessors::ReconfigureToDataProperty);
-#if (__GNUC__ >= 8) || defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
+    setter = &i::Accessors::ReconfigureToDataProperty;
   }
   obj->set_setter(i_isolate, reinterpret_cast<i::Address>(setter));
 
@@ -2940,6 +2927,7 @@ ScriptCompiler::ConsumeCodeCacheTask* ScriptCompiler::StartConsumingCodeCache(
     Isolate* v8_isolate, std::unique_ptr<CachedData> cached_data) {
   if (!i::v8_flags.concurrent_cache_deserialization) return nullptr;
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(v8_isolate);
+  if (i_isolate->requires_bytecode_for_code_coverage()) return nullptr;
   i::DisallowJavascriptExecutionDebugOnly no_execution(i_isolate);
   i::DisallowExceptionsDebugOnly no_exceptions(i_isolate);
   return new ScriptCompiler::ConsumeCodeCacheTask(
@@ -2952,6 +2940,7 @@ ScriptCompiler::StartConsumingCodeCacheOnBackground(
     Isolate* v8_isolate, std::unique_ptr<CachedData> cached_data) {
   if (!i::v8_flags.concurrent_cache_deserialization) return nullptr;
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(v8_isolate);
+  if (i_isolate->requires_bytecode_for_code_coverage()) return nullptr;
   return new ScriptCompiler::ConsumeCodeCacheTask(
       std::make_unique<i::BackgroundDeserializeTask>(i_isolate,
                                                      std::move(cached_data)));
@@ -11779,15 +11768,15 @@ CpuProfiler* CpuProfiler::New(Isolate* v8_isolate,
       reinterpret_cast<i::Isolate*>(v8_isolate), naming_mode, logging_mode));
 }
 
-CpuProfilingOptions::CpuProfilingOptions(
-    CpuProfilingMode mode, unsigned max_samples, int sampling_interval_us,
-    MaybeLocal<Context> filter_context, CpuProfileSource profile_source,
-    SampleContextExtractor sample_context_extractor)
+CpuProfilingOptions::CpuProfilingOptions(CpuProfilingMode mode,
+                                         unsigned max_samples,
+                                         int sampling_interval_us,
+                                         MaybeLocal<Context> filter_context,
+                                         CpuProfileSource profile_source)
     : mode_(mode),
       max_samples_(max_samples),
       sampling_interval_us_(sampling_interval_us),
-      profile_source_(profile_source),
-      sample_context_extractor_(sample_context_extractor) {
+      profile_source_(profile_source) {
   if (!filter_context.IsEmpty()) {
     Local<Context> local_filter_context = filter_context.ToLocalChecked();
     filter_context_.Reset(v8::Isolate::GetCurrent(), local_filter_context);
@@ -11822,6 +11811,11 @@ void CpuProfiler::SetSamplingInterval(int us) {
 void CpuProfiler::SetUsePreciseSampling(bool use_precise_sampling) {
   reinterpret_cast<i::CpuProfiler*>(this)->set_use_precise_sampling(
       use_precise_sampling);
+}
+
+void CpuProfiler::SetSampleContextExtractor(SampleContextExtractor extractor) {
+  reinterpret_cast<i::CpuProfiler*>(this)->set_sample_context_extractor(
+      extractor);
 }
 
 CpuProfilingResult CpuProfiler::Start(
