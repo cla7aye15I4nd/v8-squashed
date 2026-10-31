@@ -621,6 +621,7 @@ class Heap final {
   V8_EXPORT_PRIVATE void ResizeArrayBufferExtension(
       ArrayBufferExtension* extension, int64_t delta);
   void DetachArrayBufferExtension(ArrayBufferExtension* extension);
+  void AccountMarkedArrayBufferExtension(size_t bytes);
 
   V8_EXPORT_PRIVATE void ExpandNewSpaceSizeForTesting();
   V8_EXPORT_PRIVATE void ReduceNewSpaceSizeForTesting();
@@ -1207,10 +1208,6 @@ class Heap final {
 
   // Registers an external string.
   inline void RegisterExternalString(Tagged<String> string);
-
-  // Finalizes an external string by deleting the associated external
-  // data and clearing the resource pointer.
-  inline void FinalizeExternalString(Tagged<String> string);
 
   // ===========================================================================
   // Methods checking/returning the space of a given object/address. ===========

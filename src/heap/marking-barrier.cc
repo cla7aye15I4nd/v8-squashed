@@ -23,7 +23,7 @@
 #include "src/heap/safepoint.h"
 #include "src/objects/descriptor-array.h"
 #include "src/objects/heap-object.h"
-#include "src/objects/js-array-buffer.h"
+#include "src/objects/js-array-buffer-inl.h"
 #include "src/objects/objects-inl.h"
 
 namespace v8 {
@@ -131,10 +131,11 @@ void MarkingBarrier::Write(Tagged<JSArrayBuffer> host,
                            ArrayBufferExtension* extension) {
   DCHECK(IsCurrentMarkingBarrier(host));
   DCHECK(!HeapLayout::InWritableSharedSpace(host));
-  DCHECK(MemoryChunk::FromHeapObject(host)->IsMarking());
+  DCHECK(is_activated_);
 
   if (is_minor()) {
-    if (HeapLayout::InYoungGeneration(host)) {
+    if (extension->age() == ArrayBufferExtension::Age::kYoung) {
+      DCHECK(HeapLayout::InYoungGeneration(host));
       extension->YoungMark();
     }
   } else {

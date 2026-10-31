@@ -468,6 +468,11 @@ void V8::SetFatalErrorHandler(V8FatalErrorCallback that) {
   v8::base::SetFatalFunction(that);
 }
 
+void V8::SetCrashKeyCallbacks(AllocateCrashKeyCallback allocate,
+                              SetCrashKeyCallback set) {
+  i::V8::SetCrashKeyCallbacks(allocate, set);
+}
+
 void V8::SetFlagsFromString(const char* str) {
   SetFlagsFromString(str, strlen(str));
 }
@@ -6249,8 +6254,7 @@ String::ExternalStringResourceBase* String::GetExternalStringResourceBaseSlow(
       static_cast<Encoding>(type & i::Internals::kStringEncodingMask);
   if (i::StringShape(str).IsExternalOneByte() ||
       i::StringShape(str).IsExternalTwoByte()) {
-    i::Address value = i::Cast<i::ExternalString>(str)->resource_as_address();
-    resource = reinterpret_cast<ExternalStringResourceBase*>(value);
+    resource = i::Cast<i::ExternalString>(str)->resource(i::Isolate::Current());
   } else {
     uint32_t raw_hash_field = str->raw_hash_field();
     if (i::String::IsExternalForwardingIndex(raw_hash_field)) {
@@ -7877,25 +7881,23 @@ bool v8::String::MakeExternal(v8::String::ExternalStringResource* resource) {
 
 bool v8::String::MakeExternal(Isolate* isolate,
                               v8::String::ExternalStringResource* resource) {
-  i::DisallowGarbageCollection no_gc;
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
+  i::DirectHandle<i::String> obj = Utils::OpenDirectHandle(this);
 
-  i::Tagged<i::String> obj = *Utils::OpenDirectHandle(this);
-
-  if (i::IsThinString(obj)) {
-    obj = i::Cast<i::ThinString>(obj)->actual();
+  if (i::IsThinString(*obj)) {
+    obj = i::direct_handle(i::Cast<i::ThinString>(*obj)->actual(), i_isolate);
   }
 
   if (!obj->SupportsExternalization(Encoding::TWO_BYTE_ENCODING)) {
     return false;
   }
 
-  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
   EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
 
   CHECK(resource && resource->data());
 
-  bool result = obj->MakeExternal(i_isolate, resource);
-  DCHECK_IMPLIES(result, HasExternalStringResource(obj));
+  bool result = i::String::MakeExternal(i_isolate, obj, resource);
+  DCHECK_IMPLIES(result, HasExternalStringResource(*obj));
   return result;
 }
 
@@ -7907,25 +7909,23 @@ bool v8::String::MakeExternal(
 
 bool v8::String::MakeExternal(
     Isolate* isolate, v8::String::ExternalOneByteStringResource* resource) {
-  i::DisallowGarbageCollection no_gc;
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
+  i::DirectHandle<i::String> obj = Utils::OpenDirectHandle(this);
 
-  i::Tagged<i::String> obj = *Utils::OpenDirectHandle(this);
-
-  if (i::IsThinString(obj)) {
-    obj = i::Cast<i::ThinString>(obj)->actual();
+  if (i::IsThinString(*obj)) {
+    obj = i::direct_handle(i::Cast<i::ThinString>(*obj)->actual(), i_isolate);
   }
 
   if (!obj->SupportsExternalization(Encoding::ONE_BYTE_ENCODING)) {
     return false;
   }
 
-  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
   EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
 
   CHECK(resource && resource->data());
 
-  bool result = obj->MakeExternal(i_isolate, resource);
-  DCHECK_IMPLIES(result, HasExternalStringResource(obj));
+  bool result = i::String::MakeExternal(i_isolate, obj, resource);
+  DCHECK_IMPLIES(result, HasExternalStringResource(*obj));
   return result;
 }
 
@@ -8704,6 +8704,20 @@ i::DirectHandle<i::JSArray> MapAsArray(i::Isolate* i_isolate,
 }
 
 }  // namespace
+
+Local<Value> Map::Get(Local<Value> key, bool* found) const {
+  DCHECK_NOT_NULL(found);
+  auto self = Utils::OpenDirectHandle(this);
+  i::Isolate* i_isolate = i::Isolate::Current();
+  i::DisallowGarbageCollection no_gc;
+  i::Tagged<i::OrderedHashMap> table =
+      i::Cast<i::OrderedHashMap>(self->table());
+  i::InternalIndex entry =
+      table->FindEntry(i_isolate, *Utils::OpenDirectHandle(*key));
+  *found = entry.is_found();
+  if (!*found) return Utils::ToLocal(i_isolate->factory()->undefined_value());
+  return Utils::ToLocal(i::direct_handle(table->ValueAt(entry), i_isolate));
+}
 
 Local<Array> Map::AsArray() const {
   auto obj = Utils::OpenDirectHandle(this);

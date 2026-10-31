@@ -684,6 +684,7 @@ class V8_EXPORT Isolate {
     kRegExpCustomSpecies = 189,
     kWasmWideArithmetic = 190,
     kBigInt = 191,
+    kExtendingNonExtensibleWithPrivateProxyTrap = 192,
 
     // If you add new values here, you'll also need to update Chromium's:
     // web_feature.mojom, use_counter_callback.cc, and enums.xml. V8 changes to
@@ -1518,6 +1519,7 @@ class V8_EXPORT Isolate {
    * Enables the host application to provide a mechanism for allocating a new
    * crash key and setting/updating values for them.
    */
+  V8_DEPRECATE_SOON("Use V8::SetCrashKeyCallbacks instead")
   void SetCrashKeyStringCallbacks(AllocateCrashKeyStringCallback,
                                   SetCrashKeyStringCallback);
 

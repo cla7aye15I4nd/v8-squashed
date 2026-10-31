@@ -620,6 +620,18 @@ class TestOneByteResource : public String::ExternalOneByteStringResource {
   int* counter_;
 };
 
+namespace {
+
+// Runs memory-reducing GCs and finishes the sweeping of the unified heap.
+void InvokeMajorGCsAndFinishSweeping(i::Heap* heap) {
+  i::heap::InvokeMemoryReducingMajorGCs(heap);
+  heap->EnsureSweepingCompleted(
+      i::Heap::SweepingForcedFinalizationMode::kUnifiedHeap,
+      i::CompleteSweepingReason::kTesting);
+}
+
+}  // namespace
+
 TEST(ScriptUsingStringResource) {
   int dispose_count = 0;
   const char* c_source = "1 + 2 * 3";
@@ -649,9 +661,10 @@ TEST(ScriptUsingStringResource) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
-    i::heap::InvokeMemoryReducingMajorGCs(CcTest::heap());
+    InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
   CHECK_EQ(1, dispose_count);
 }
@@ -686,9 +699,10 @@ TEST(ScriptUsingOneByteStringResource) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
-    i::heap::InvokeMemoryReducingMajorGCs(CcTest::heap());
+    InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
   CHECK_EQ(1, dispose_count);
 }
@@ -723,9 +737,10 @@ TEST(ScriptMakingExternalString) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
-    i::heap::InvokeMajorGC(CcTest::heap());
+    InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
   CHECK_EQ(1, dispose_count);
 }
@@ -754,9 +769,10 @@ TEST(ScriptMakingExternalOneByteString) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
-    i::heap::InvokeMajorGC(CcTest::heap());
+    InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
   CHECK_EQ(1, dispose_count);
 }
@@ -978,10 +994,11 @@ TEST(ScavengeExternalString) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
     in_young_generation ? i::heap::InvokeMinorGC(CcTest::heap())
-                        : i::heap::InvokeMajorGC(CcTest::heap());
+                        : InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
   CHECK_EQ(1, dispose_count);
 }
@@ -1011,10 +1028,11 @@ TEST(ScavengeExternalOneByteString) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
     in_young_generation ? i::heap::InvokeMinorGC(CcTest::heap())
-                        : i::heap::InvokeMajorGC(CcTest::heap());
+                        : InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
   CHECK_EQ(1, dispose_count);
 }
@@ -1065,9 +1083,10 @@ TEST(ExternalStringWithDisposeHandling) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
-    i::heap::InvokeMemoryReducingMajorGCs(CcTest::heap());
+    InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
   CHECK_EQ(1, TestOneByteResourceWithDisposeControl::dispose_calls);
   CHECK_EQ(0, TestOneByteResourceWithDisposeControl::dispose_count);
@@ -1093,9 +1112,10 @@ TEST(ExternalStringWithDisposeHandling) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
-    i::heap::InvokeMemoryReducingMajorGCs(CcTest::heap());
+    InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
   CHECK_EQ(1, TestOneByteResourceWithDisposeControl::dispose_calls);
   CHECK_EQ(1, TestOneByteResourceWithDisposeControl::dispose_count);
@@ -17984,9 +18004,10 @@ TEST(ExternalInternalizedStringCollectedAtGC) {
   {
     // We need to invoke GC without stack, otherwise the resource may not be
     // reclaimed because of conservative stack scanning.
+    // Finishing the sweeping makes sure the resource is disposed.
     i::DisableConservativeStackScanningScopeForTesting no_stack_scanning(
         CcTest::heap());
-    i::heap::InvokeMemoryReducingMajorGCs(CcTest::heap());
+    InvokeMajorGCsAndFinishSweeping(CcTest::heap());
   }
 
   // Ring has been destroyed.  Free Peoples of Middle-earth Rejoice.
@@ -26553,6 +26574,50 @@ TEST(Map) {
   CHECK_EQ(0U, map->Size());
 }
 
+TEST(MapGetNoContext) {
+  v8::Isolate* isolate = CcTest::isolate();
+  v8::HandleScope handle_scope(isolate);
+  LocalContext env;
+  v8::Local<v8::Context> context = env.local();
+
+  v8::Local<v8::Map> map = v8::Map::New(isolate);
+  v8::Local<v8::Object> object_key = v8::Object::New(isolate);
+  v8::Local<v8::Object> undefined_key = v8::Object::New(isolate);
+  v8::Local<v8::Value> value = v8::Object::New(isolate);
+  map->Set(context, object_key, value).ToLocalChecked();
+  map->Set(context, v8::Integer::New(isolate, 1), value).ToLocalChecked();
+  map->Set(context, undefined_key, v8::Undefined(isolate)).ToLocalChecked();
+  map->Set(context, v8_str("a long string key"), value).ToLocalChecked();
+  v8::Local<v8::String> string_key = v8_str("a long string key");
+
+  context->Exit();
+  CHECK(!isolate->InContext());
+
+  bool found = false;
+  CHECK(map->Get(object_key, &found)->StrictEquals(value));
+  CHECK(found);
+
+  found = false;
+  CHECK(map->Get(v8::Integer::New(isolate, 1), &found)->StrictEquals(value));
+  CHECK(found);
+
+  found = true;
+  v8::Local<v8::Value> missing = map->Get(v8::Integer::New(isolate, 2), &found);
+  CHECK(missing->IsUndefined());
+  CHECK(!found);
+
+  found = false;
+  CHECK(map->Get(undefined_key, &found)->IsUndefined());
+  CHECK(found);
+
+  // The lookup has to compute the hash of an equal but unhashed string.
+  CHECK(!v8::Utils::OpenDirectHandle(*string_key)->HasHashCode());
+  found = false;
+  CHECK(map->Get(string_key, &found)->StrictEquals(value));
+  CHECK(found);
+
+  context->Enter();
+}
 
 TEST(Set) {
   v8::Isolate* isolate = CcTest::isolate();

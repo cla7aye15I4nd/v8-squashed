@@ -79,6 +79,7 @@
 ##############################################################################
 # TODO(v8:7777): Change this once wasm is supported in jitless mode.
 ['not has_webassembly or variant == jitless', {
+  'debugger/restart-frame/wasm-*': [SKIP],
   'debugger/wasm-*': [SKIP],
   'cpu-profiler/console-profile-wasm': [SKIP],
   'runtime/get-properties': [SKIP],
@@ -269,6 +270,7 @@
 ##############################################################################
 ['lite_mode or variant in (nooptimization, jitless, assert_types)', {
   # Test relies on TurboFan being enabled.
+  'debugger/breakpoint-after-side-effect-check-optimized': [SKIP],
   'debugger/restart-frame/restart-inlined-frame': [SKIP],
   'debugger/value-unavailable-scopes': [SKIP],
 }], # lite_mode or variant in (nooptimization, jitless, assert_types)
@@ -296,5 +298,11 @@
   'regress/regress-521715545': [SKIP],
   'regress/regress-526163463': [SKIP],
 }],  # sandbox_hardware_support
+
+##############################################################################
+['verify_predictable', {
+  # https://crbug.com/374722652
+  'regress/regress-374013413': [SKIP],
+}],  # 'verify_predictable'
 
 ]

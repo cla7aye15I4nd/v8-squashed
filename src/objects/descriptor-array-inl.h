@@ -51,10 +51,10 @@ void EnumCache::set_indices(Tagged<FixedArray> value, WriteBarrierMode mode) {
 }
 
 template <typename IsolateT>
-Handle<DescriptorLookupTable> DescriptorLookupTable::New(
+Handle<DescriptorLookupTable> DescriptorLookupTable::NewUninitialized(
     IsolateT* isolate, uint32_t number_of_elements, AllocationType allocation) {
   return Cast<DescriptorLookupTable>(
-      Super::New(isolate, number_of_elements, allocation));
+      Super::NewUninitialized(isolate, number_of_elements, allocation));
 }
 
 int16_t DescriptorArray::number_of_all_descriptors() const {
@@ -132,6 +132,28 @@ void DescriptorArray::RebuildLookupTable(int len) {
           len, [this](uint32_t index) { return GetKey(InternalIndex(index)); });
 }
 
+void DescriptorArray::CopyFromOrRebuildLookupTable(
+    Tagged<DescriptorArray> source) {
+  int new_nof = number_of_descriptors();
+  if (new_nof <= kMaxElementsForLinearSearch) return;
+  int old_nof = source->number_of_descriptors();
+  DCHECK_LE(new_nof, old_nof);
+  Tagged<DescriptorLookupTable> source_table =
+      Cast<DescriptorLookupTable>(source->lookup_table());
+  Tagged<DescriptorLookupTable> table =
+      Cast<DescriptorLookupTable>(lookup_table());
+  if (table->capacity() == source_table->capacity() &&
+      old_nof - new_nof <= new_nof) {
+    table->CopyFrom(source_table);
+    table->RemoveEntries(old_nof, new_nof, [source](uint32_t index) {
+      return source->GetKey(InternalIndex(index));
+    });
+  } else {
+    RebuildLookupTable(new_nof);
+  }
+  DCHECK(VerifyLookupTable());
+}
+
 void DescriptorArray::RemoveFromLookupTable(int old_nof, int new_nof) {
   DCHECK_EQ(old_nof, number_of_descriptors());
   DCHECK_GT(new_nof, kMaxElementsForLinearSearch);
@@ -201,8 +223,7 @@ InternalIndex DescriptorArray::TableSearch(Tagged<Name> name,
   }
   return InternalIndex::NotFound();
 }
-#endif  // V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
-
+#else
 InternalIndex DescriptorArray::BinarySearch(Tagged<Name> name,
                                             int valid_descriptors) {
   // We have to binary search all descriptors, not just valid ones, since the
@@ -247,6 +268,7 @@ InternalIndex DescriptorArray::BinarySearch(Tagged<Name> name,
 
   return InternalIndex::NotFound();
 }
+#endif  // V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
 
 InternalIndex DescriptorArray::LinearSearch(Tagged<Name> name,
                                             int valid_descriptors) {
@@ -320,6 +342,7 @@ void DescriptorArray::SetKey(InternalIndex descriptor_number,
                        FastIterableState::kJsonFast);
 }
 
+#ifndef V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
 int DescriptorArray::GetSortedKeyIndex(int descriptor_number) {
   return GetDetails(InternalIndex(descriptor_number)).pointer();
 }
@@ -332,6 +355,7 @@ void DescriptorArray::SetSortedKey(int descriptor_number, int pointer) {
   PropertyDetails details = GetDetails(InternalIndex(descriptor_number));
   SetDetails(InternalIndex(descriptor_number), details.set_pointer(pointer));
 }
+#endif  // !V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
 
 Tagged<Object> DescriptorArray::GetStrongValue(
     InternalIndex descriptor_number) {
@@ -399,6 +423,12 @@ void DescriptorArray::Set(InternalIndex descriptor_number, Descriptor* desc) {
   DCHECK_NE(fast_iterable(), FastIterableState::kJsonFast);
 }
 
+void DescriptorArray::CopyFrom(InternalIndex index,
+                               Tagged<DescriptorArray> src) {
+  PropertyDetails details = src->GetDetails(index);
+  Set(index, src->GetKey(index), src->GetValue(index), details);
+}
+
 void DescriptorArray::Append(Descriptor* desc) {
   DisallowGarbageCollection no_gc;
   int descriptor_number = number_of_descriptors();
@@ -456,11 +486,13 @@ void DescriptorArray::Sort() {
   SortImpl(len);
 }
 
+#ifndef V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
 void DescriptorArray::SwapSortedKeys(int first, int second) {
   int first_key = GetSortedKeyIndex(first);
   SetSortedKey(first, GetSortedKeyIndex(second));
   SetSortedKey(second, first_key);
 }
+#endif  // !V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE
 
 }  // namespace internal
 }  // namespace v8

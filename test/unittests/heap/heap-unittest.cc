@@ -41,6 +41,7 @@
 #include "src/flags/flags.h"
 #include "src/handles/global-handles-inl.h"
 #include "src/handles/handles-inl.h"
+#include "src/heap/array-buffer-sweeper.h"
 #include "src/heap/combined-heap.h"
 #include "src/heap/factory.h"
 #include "src/heap/gc-tracer-inl.h"
@@ -390,6 +391,94 @@ TEST_F(HeapTest, ExternalLimitStaysAboveDefaultForExplicitHandling) {
   accounter.Decrease(v8_isolate(), 10 * MB);
   Heap* heap = i_isolate()->heap();
   EXPECT_GE(heap->external_memory_soft_limit(), kExternalAllocationSoftLimit);
+}
+
+namespace {
+
+constexpr size_t kLiveArrayBufferSize = 16 * MB;
+constexpr size_t kDeadArrayBufferSize = 64 * MB;
+
+// Allocates a live and a dead array buffer, then performs a full GC that leaves
+// array buffer sweeping in progress. Returns false if array buffer sweeping
+// already finished in the GC pause.
+bool AllocateArrayBuffersAndCollectGarbage(v8::Isolate* isolate, Heap* heap,
+                                           v8::Global<v8::ArrayBuffer>& live,
+                                           uint64_t& external_memory_before) {
+  {
+    v8::HandleScope scope(isolate);
+    live.Reset(isolate, v8::ArrayBuffer::New(isolate, kLiveArrayBufferSize));
+    v8::Local<v8::ArrayBuffer> dead =
+        v8::ArrayBuffer::New(isolate, kDeadArrayBufferSize);
+    // The allocations may have started incremental marking. Finish it, and
+    // the following sweeping, while `dead` is still alive.
+    InvokeAtomicMajorGC(reinterpret_cast<Isolate*>(isolate));
+    CHECK(!dead.IsEmpty());
+    external_memory_before =
+        heap->external_memory() - kLiveArrayBufferSize - kDeadArrayBufferSize;
+  }
+  // A single full GC in which `dead` dies.
+  heap->CollectAllGarbage(GCFlag::kNoFlags, GarbageCollectionReason::kTesting);
+  return heap->array_buffer_sweeper()->sweeping_in_progress();
+}
+
+}  // namespace
+
+// External memory of dead array buffers is decremented in the GC pause based on
+// marking, so that allocation limits computed in the pause don't account for
+// it.
+TEST_F(HeapTest, DeadArrayBufferBytesDecrementedInAtomicPause) {
+  ManualGCScope manual_gc_scope(i_isolate());
+  DisableConservativeStackScanningScopeForTesting no_stack_scanning(heap());
+  v8::Global<v8::ArrayBuffer> live;
+  uint64_t external_memory_before;
+  if (!AllocateArrayBuffersAndCollectGarbage(v8_isolate(), heap(), live,
+                                             external_memory_before)) {
+    GTEST_SKIP() << "Array buffer sweeping finished in the GC pause.";
+  }
+
+  EXPECT_EQ(external_memory_before + kLiveArrayBufferSize,
+            heap()->limits()->external_memory_low_since_last_gc());
+  EXPECT_EQ(external_memory_before + kLiveArrayBufferSize,
+            heap()->external_memory());
+
+  // Sweeping must not decrement the dead bytes again.
+  heap()->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only,
+                                  CompleteSweepingReason::kTesting);
+  EXPECT_EQ(external_memory_before + kLiveArrayBufferSize,
+            heap()->external_memory());
+  live.Reset();
+}
+
+TEST_F(HeapTest, DeadYoungArrayBufferBytesDecrementedInAtomicPause) {
+  if (v8_flags.single_generation) return;
+  ManualGCScope manual_gc_scope(i_isolate());
+  DisableConservativeStackScanningScopeForTesting no_stack_scanning(heap());
+  constexpr size_t kYoungLiveSize = 8 * MB;
+  constexpr size_t kYoungDeadSize = 16 * MB;
+  const uint64_t external_memory_before = heap()->external_memory();
+  v8::Global<v8::ArrayBuffer> live;
+  {
+    v8::HandleScope scope(v8_isolate());
+    live.Reset(v8_isolate(),
+               v8::ArrayBuffer::New(v8_isolate(), kYoungLiveSize));
+    v8::Local<v8::ArrayBuffer> dead =
+        v8::ArrayBuffer::New(v8_isolate(), kYoungDeadSize);
+    CHECK(!dead.IsEmpty());
+    EXPECT_EQ(external_memory_before + kYoungLiveSize + kYoungDeadSize,
+              heap()->external_memory());
+  }
+  heap()->CollectGarbage(NEW_SPACE, GarbageCollectionReason::kTesting);
+  if (!heap()->array_buffer_sweeper()->sweeping_in_progress()) {
+    GTEST_SKIP() << "Array buffer sweeping finished in the GC pause.";
+  }
+
+  EXPECT_EQ(external_memory_before + kYoungLiveSize, heap()->external_memory());
+
+  // Sweeping must not decrement the dead bytes again.
+  heap()->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only,
+                                  CompleteSweepingReason::kTesting);
+  EXPECT_EQ(external_memory_before + kYoungLiveSize, heap()->external_memory());
+  live.Reset();
 }
 
 #ifdef V8_COMPRESS_POINTERS
@@ -1308,7 +1397,7 @@ TEST_F(HeapTest,
 }
 
 TEST_F(HeapTest, ReportStatsAsCrashKeys) {
-  CrashKeyStore crash_key_store(i_isolate());
+  CrashKeyStore crash_key_store;
 
   HeapStats stats;
   auto next_value = [value = size_t{1}]() mutable { return value++; };
@@ -1487,7 +1576,7 @@ void FatalMemoryErrorCallbackForTest(const char* location,
 }  // anonymous namespace
 
 TEST_F(HeapTest, CheckCrashKeysAreReportedInOOM) {
-  CrashKeyStore crash_key_store(i_isolate());
+  CrashKeyStore crash_key_store;
   g_crash_key_store_for_oom = &crash_key_store;
   v8_isolate()->SetOOMErrorHandler(FatalMemoryErrorCallbackForTest);
   EXPECT_DEATH_IF_SUPPORTED(
@@ -4666,6 +4755,10 @@ void ReleaseStackTraceDataTest(v8::Isolate* isolate, const char* source,
     // reclaimed because of conservative stack scanning.
     DisableConservativeStackScanningScopeForTesting no_stack_scanning(heap);
     InvokeMemoryReducingMajorGCs(i_isolate);
+    // Finishing the sweeping makes sure the resource is disposed.
+    heap->EnsureSweepingCompleted(
+        Heap::SweepingForcedFinalizationMode::kUnifiedHeap,
+        CompleteSweepingReason::kTesting);
   }
 
   // External source has been released.
@@ -6141,10 +6234,10 @@ TEST_F(HeapTest, Regress631969) {
 
   {
     StaticOneByteResource external_string("12345678901234");
-    s3->MakeExternal(isolate, &external_string);
+    String::MakeExternal(isolate, s3, &external_string);
     InvokeMajorGC();
     // This avoids the GC from trying to free stack allocated resources.
-    Cast<ExternalOneByteString>(s3)->SetResource(isolate, nullptr);
+    Cast<ExternalString>(s3)->ReleaseResourceForTesting(isolate);
   }
 }
 

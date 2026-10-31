@@ -252,6 +252,7 @@ void Debug::GetContextScripts(
 }
 
 void Debug::RecordScriptContext(DirectHandle<Script> script) {
+  DCHECK(!isolate_->serializer_enabled());
   HandleScope scope(isolate_);
   DirectHandle<NativeContext> context = isolate_->native_context();
   Handle<EphemeronHashTable> table;
@@ -762,7 +763,7 @@ void Debug::Break(JavaScriptFrame* frame,
   if (hitInstrumentationBreak) {
     debug::DebugDelegate::ActionAfterInstrumentation action =
         OnInstrumentationBreak();
-    if (IsRestartFrameScheduled()) return;
+    if (has_scheduled_restart_frame()) return;
     switch (action) {
       case debug::DebugDelegate::ActionAfterInstrumentation::kPause:
         shouldPauseAfterInstrumentation = true;
@@ -1973,18 +1974,35 @@ void Debug::PrepareFunctionForDebugExecution(
   DCHECK(shared->is_compiled());
   DirectHandle<DebugInfo> debug_info(TryGetDebugInfo(*shared).value(),
                                      isolate_);
-  if (debug_info->flags(kRelaxedLoad).prepared_for_debug_execution()) {
+
+  DebugInfo::Flags flags = debug_info->flags(kRelaxedLoad);
+  const bool needs_deopt_for_break_info =
+      debug_info->HasBreakInfo() && !flags.deoptimized_for_break_info();
+  if (flags.prepared_for_debug_execution() && !needs_deopt_for_break_info) {
     return;
   }
 
-  // Have to discard baseline code before installing debug bytecode, since the
-  // bytecode array field on the baseline code object is immutable.
-  if (debug_info->CanBreakAtEntry()) {
-    // Deopt everything in case the function is inlined anywhere.
-    Deoptimizer::DeoptimizeAll(isolate_);
-    DiscardAllBaselineCode();
-  } else {
-    DeoptimizeFunction(shared);
+  // Ensure all optimized code (and inlined callers) are deoptimized. We only
+  // mark deoptimized_for_break_info when HasBreakInfo() is true so that an
+  // earlier side-effect check does not prevent subsequent deoptimization when
+  // break info is added later.
+  if (!flags.deoptimized_for_break_info()) {
+    if (debug_info->CanBreakAtEntry()) {
+      // Deopt everything in case the function is inlined anywhere.
+      Deoptimizer::DeoptimizeAll(isolate_);
+      DiscardAllBaselineCode();
+    } else {
+      DeoptimizeFunction(shared);
+    }
+    if (debug_info->HasBreakInfo()) {
+      debug_info->set_flags(
+          debug_info->flags(kRelaxedLoad).with_deoptimized_for_break_info(true),
+          kRelaxedStore);
+    }
+  }
+
+  if (flags.prepared_for_debug_execution()) {
+    return;
   }
 
   if (shared->HasBytecodeArray()) {
@@ -3017,6 +3035,7 @@ int Debug::CurrentFrameCount() {
 }
 
 void Debug::SetDebugDelegate(debug::DebugDelegate* delegate) {
+  DCHECK(!isolate_->serializer_enabled() || delegate == nullptr);
   debug_delegate_ = delegate;
   UpdateState();
 }
@@ -3026,6 +3045,7 @@ void Debug::UpdateState() {
   bool is_active = debug_delegate_ != nullptr;
   if (is_active == is_active_) return;
   if (is_active) {
+    DCHECK(!isolate_->serializer_enabled());
     // Note that the debug context could have already been loaded to
     // bootstrap test cases.
     isolate_->compilation_cache()->DisableScriptAndEval();
