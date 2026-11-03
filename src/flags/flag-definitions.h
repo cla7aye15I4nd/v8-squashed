@@ -107,16 +107,16 @@
 
 // Enforces that `flag` is at least `min_value` (sets `flag = min_value` if
 // `flag < min_value`).
-#define DEFINE_MIN_VALUE_IMPLICATION(flag, min_value)                        \
-  changed |= TriggerImplication(v8_flags.flag < min_value,                   \
-                                #flag "<" #min_value, &v8_flags.flag, #flag, \
+#define DEFINE_MIN_VALUE_IMPLICATION(flag, min_value)                          \
+  changed |= TriggerImplication(v8_flags.flag < min_value,                     \
+                                #flag " < " #min_value, &v8_flags.flag, #flag, \
                                 min_value, kStrongImplication);
 
 // Enforces that `flag` is at most `max_value` (sets `flag = max_value` if
 // `flag > max_value`).
-#define DEFINE_MAX_VALUE_IMPLICATION(flag, max_value)                        \
-  changed |= TriggerImplication(v8_flags.flag > max_value,                   \
-                                #max_value "<" #flag, &v8_flags.flag, #flag, \
+#define DEFINE_MAX_VALUE_IMPLICATION(flag, max_value)                          \
+  changed |= TriggerImplication(v8_flags.flag > max_value,                     \
+                                #flag " > " #max_value, &v8_flags.flag, #flag, \
                                 max_value, kStrongImplication);
 
 // Enforces that `thenflag` is set to `false` if `whenflag` holds, printing a
@@ -1744,10 +1744,8 @@ DEFINE_IMPLICATION(wasm_in_js_inlining_body, wasm_in_js_inlining_wrapper)
 DEFINE_BOOL(wasm_in_js_inlining_wrapper, true,
             "inline JS-to-Wasm wrappers via Turboshaft/Turbolev.")
 
-DEFINE_EXPERIMENTAL_FEATURE(
-    wasm_in_js_inlining_opt,
-    "enable optimizations for Wasm-in-JS inlining in Turboshaft")
-DEFINE_IMPLICATION(turbolev_future, wasm_in_js_inlining_opt)
+DEFINE_BOOL(wasm_in_js_inlining_opt, true,
+            "enable optimizations for Wasm-in-JS inlining in Turboshaft")
 
 DEFINE_BOOL(turboshaft_load_elimination, true,
             "enable Turboshaft's low-level load elimination for JS")
@@ -2073,6 +2071,8 @@ DEFINE_UINT(wasm_max_committed_code_mb, kMaxCommittedWasmCodeMB,
             "maximum committed code space for wasm (in MB)")
 DEFINE_UINT(wasm_max_code_space_size_mb, kDefaultMaxWasmCodeSpaceSizeMb,
             "maximum size of a single wasm code space")
+DEFINE_MAX_VALUE_IMPLICATION(wasm_max_code_space_size_mb,
+                             kDefaultMaxWasmCodeSpaceSizeMb)
 DEFINE_BOOL(wasm_tier_up, V8_ENABLE_TURBOFAN_BOOL,
             "enable tier up to the optimizing compiler (requires --liftoff to "
             "have an effect)")
@@ -4406,8 +4406,10 @@ DISALLOW_UNSAFE_FLAG(max_wasm_functions)
 // Features we don't currently want to fuzz.
 DISALLOW_UNSAFE_FLAG(cppgc_young_generation)
 // The memory corruption API is only allowed in sandbox testing/fuzzing mode.
+// LINT.IfChange(MemoryCorruptionApiImplications)
 DISALLOW_UNSAFE_FLAG_IF(!sandbox_testing && !sandbox_fuzzing,
                         expose_memory_corruption_api)
+// LINT.ThenChange(/src/d8/d8.cc:MemoryCorruptionApiImplications)
 
 // Flags which trigger a breakpoint on purpose.
 DISALLOW_UNSAFE_FLAG(maglev_break_on_entry)

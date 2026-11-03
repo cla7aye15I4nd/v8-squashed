@@ -214,7 +214,6 @@ class MachineOptimizationReducer : public Next {
         case multi(Kind::kSignExtend, Rep::Word32(), Rep::Word64()):
           return __ Word64Constant(int64_t{static_cast<int32_t>(value)});
         case multi(Kind::kZeroExtend, Rep::Word32(), Rep::Word64()):
-        case multi(Kind::kBitcast, Rep::Word32(), Rep::Word64()):
           return __ Word64Constant(uint64_t{static_cast<uint32_t>(value)});
         case multi(Kind::kBitcast, Rep::Word32(), Rep::Float32()):
           return __ Float32Constant(
@@ -343,7 +342,7 @@ class MachineOptimizationReducer : public Next {
       if (input_bitcast->from == to) return input_bitcast->input();
       if (input_bitcast->from == RegisterRepresentation::Word32()) {
         DCHECK_EQ(to, RegisterRepresentation::Word64());
-        return __ BitcastWord32ToWord64(input_bitcast->input());
+        return __ ChangeUint32ToUint64(input_bitcast->input());
       }
       DCHECK(input_bitcast->from == RegisterRepresentation::Word64() &&
              to == RegisterRepresentation::Word32());
@@ -1635,8 +1634,9 @@ class MachineOptimizationReducer : public Next {
       return Next::ReduceWord64AddSub128Binop(al, ah, bl, bh, kind);
     }
 
-#if defined(V8_TARGET_ARCH_X64) || defined(V8_TARGET_ARCH_ARM64) || \
-    defined(V8_TARGET_ARCH_LOONG64) || defined(V8_TARGET_ARCH_MIPS64)
+#if defined(V8_TARGET_ARCH_X64) || defined(V8_TARGET_ARCH_ARM64) ||      \
+    defined(V8_TARGET_ARCH_LOONG64) || defined(V8_TARGET_ARCH_MIPS64) || \
+    defined(V8_TARGET_ARCH_RISCV64)
     if (kind == Word64AddSub128BinopOp::Kind::kAdd) {
       // add128(add128(x, 0, y, 0), z, 0) -> add3(x, y, z)
       if (const Word64AddSub128BinopOp* nested = TryMatchAdd3(al, ah, bh)) {
@@ -1651,7 +1651,8 @@ class MachineOptimizationReducer : public Next {
     // TODO(ryandiaz): sub128(sub128(x, 0, y, 0), z, 0) -> sub2(x, y, z)
     // TODO(ryandiaz): sub128(x, 0, add128(y, 0, z, 0)) -> sub2(x, y, z)
 #endif  // defined(V8_TARGET_ARCH_X64) || defined(V8_TARGET_ARCH_ARM64) ||
-        // defined(V8_TARGET_ARCH_LOONG64) || defined(V8_TARGET_ARCH_MIPS64)
+        // defined(V8_TARGET_ARCH_LOONG64) || defined(V8_TARGET_ARCH_MIPS64) ||
+        // defined(V8_TARGET_ARCH_RISCV64)
     return Next::ReduceWord64AddSub128Binop(al, ah, bl, bh, kind);
   }
 

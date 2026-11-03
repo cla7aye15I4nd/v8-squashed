@@ -68,6 +68,7 @@
 #include "src/flags/flags.h"
 #include "src/handles/global-handles-inl.h"
 #include "src/handles/persistent-handles.h"
+#include "src/heap/cppgc-js/cpp-heap.h"
 #include "src/heap/heap-inl.h"
 #include "src/heap/heap-verifier.h"
 #include "src/heap/local-heap-inl.h"
@@ -7636,6 +7637,10 @@ void Isolate::SetFilterETWSessionByURL2Callback(
     FilterETWSessionByURL2Callback callback) {
   filter_etw_session_by_url2_callback_ = callback;
 }
+void Isolate::RequestEnableETW() {
+  etw_tracing_requested_ = true;
+  ETWJITInterface::MaybeSetHandlerNow(this);
+}
 
 FilterETWSessionByURLResult Isolate::RunFilterETWSessionByURLCallback(
     const std::string& etw_filter_payload) {
@@ -7652,10 +7657,7 @@ FilterETWSessionByURLResult Isolate::RunFilterETWSessionByURLCallback(
         filter_etw_session_by_url_callback_(context, etw_filter_payload);
     return {enable_etw_tracing, v8_flags.interpreted_frames_native_stack};
   }
-
-  // If no callback is installed, by default enable etw tracing but disable
-  // tracing of interpreter stack frames.
-  return {true, v8_flags.interpreted_frames_native_stack};
+  return {false, false};
 }
 
 #endif  // V8_ENABLE_ETW_STACK_WALKING
@@ -8051,6 +8053,9 @@ void Isolate::DetachGlobal(DirectHandle<NativeContext> env) {
   // Set security token back to default (unique) state making sure that only
   // accesses from the same native context are allowed.
   env->set_security_token(env->global_object());
+  // Invalidate LoadGlobalIC/StoreGlobalIC handlers to enforce access checks
+  // for the rewired global proxy from the detached context.
+  JSObject::InvalidatePrototypeValidityCell(env->global_object());
 }
 
 void Isolate::SetIsLoading(bool is_loading) {

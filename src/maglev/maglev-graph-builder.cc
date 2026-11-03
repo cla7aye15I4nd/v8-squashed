@@ -4020,6 +4020,7 @@ bool MaglevGraphBuilder::TryElideWriteBarrierForAllocation(ValueNode* object,
   AllocationBlock* allocation = get_allocation(object);
   if (!is_turbolev() && allocation != nullptr &&
       reducer_.current_allocation_block() == allocation &&
+      allocation->allocation_type() == AllocationType::kYoung &&
       allocation == get_allocation(value)) {
     return true;
   }
@@ -4806,7 +4807,7 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildNamedAccess(
       if (!native_context.GlobalIsDetached(broker())) {
         compiler::OptionalPropertyCellRef cell =
             native_context.global_object(broker()).GetPropertyCell(
-                broker(), feedback.name());
+                broker(), feedback.name(), access_mode);
         if (!cell.has_value()) return {};
         // Note: The map check generated below ensures that we will deopt
         // when/if GlobalIsDetached becomes true.
@@ -9035,19 +9036,12 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceFunctionPrototypeCall(
 
 MaybeReduceResult MaglevGraphBuilder::TryReduceFunctionPrototypeApply(
     compiler::JSFunctionRef target, CallArguments& args) {
-  compiler::OptionalHeapObjectRef maybe_receiver;
-  if (current_speculation_feedback().IsValid()) {
-    const compiler::ProcessedFeedback& processed_feedback =
-        broker()->GetFeedbackForCall(current_speculation_feedback());
-    DCHECK_EQ(processed_feedback.kind(), compiler::ProcessedFeedback::kCall);
-    const compiler::CallFeedback& call_feedback = processed_feedback.AsCall();
-    if (call_feedback.call_feedback_content() ==
-        CallFeedbackContent::kReceiver) {
-      maybe_receiver = call_feedback.target();
-    }
-  }
+  // We should have taken the `BuildCallWithFeedback` path for the typical
+  // Function.prototype.apply speculation-based optimization. If we are on this
+  // code path, we must be inside an apply inside another inlining and shouldn't
+  // use the feedback receiver.
   return TryReduceFunctionPrototypeApplyCallWithReceiver(
-      maybe_receiver, args, current_speculation_feedback());
+      {}, args, current_speculation_feedback());
 }
 
 namespace {
@@ -11556,7 +11550,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceCallForNewClosure(
 
 MaybeReduceResult
 MaglevGraphBuilder::TryReduceFunctionPrototypeApplyCallWithReceiver(
-    compiler::OptionalHeapObjectRef maybe_receiver, CallArguments& args,
+    compiler::OptionalJSFunctionRef maybe_receiver, CallArguments& args,
     const compiler::FeedbackSource& feedback_source) {
   if (args.mode() != CallArguments::kDefault) return {};
 
@@ -11618,20 +11612,26 @@ ReduceResult MaglevGraphBuilder::BuildCallWithFeedback(
             broker()->target_native_context();
         compiler::JSFunctionRef apply_function =
             native_context.function_prototype_apply(broker());
-        RETURN_IF_ABORT(BuildCheckValueByReference(
-            target_node, apply_function, DeoptimizeReason::kWrongCallTarget));
-        PROCESS_AND_RETURN_IF_DONE(
-            TryReduceFunctionPrototypeApplyCallWithReceiver(
-                feedback_target, args, feedback_source),
-            SetAccumulator);
-        feedback_target = apply_function;
+        if (compiler::OptionalHeapObjectRef target_constant =
+                TryGetConstant<HeapObject>(target_node);
+            !target_constant.has_value() ||
+            target_constant->equals(apply_function)) {
+          RETURN_IF_ABORT(BuildCheckValueByReference(
+              target_node, apply_function, DeoptimizeReason::kWrongCallTarget));
+          PROCESS_AND_RETURN_IF_DONE(
+              TryReduceFunctionPrototypeApplyCallWithReceiver(
+                  feedback_target, args, feedback_source),
+              SetAccumulator);
+        }
       } else {
         DCHECK_EQ(CallFeedbackContent::kTarget, content);
+        RETURN_IF_ABORT(BuildCheckValueByReference(
+            target_node, feedback_target, DeoptimizeReason::kWrongCallTarget));
       }
-      RETURN_IF_ABORT(BuildCheckValueByReference(
-          target_node, feedback_target, DeoptimizeReason::kWrongCallTarget));
     } else if (call_feedback.target()->IsFeedbackCell() &&
                args.mode() == CallArguments::kDefault) {
+      DCHECK_EQ(CallFeedbackContent::kTarget,
+                call_feedback.call_feedback_content());
       compiler::FeedbackCellRef feedback_cell =
           call_feedback.target()->AsFeedbackCell();
       compiler::OptionalSharedFunctionInfoRef shared =
@@ -12839,9 +12839,12 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildAndAllocateJSGeneratorObject(
   if (!function.has_initial_map(broker())) return {};
 
   // The shared function info of this JSFunction should be the same as the
-  // current one we are compiling.
-  DCHECK_EQ(compilation_unit()->shared_function_info(),
-            function.shared(broker()));
+  // current one we are compiling. Otherwise an earlier check narrowed the
+  // closure to a different function and this block is unreachable.
+  if (!function.shared(broker()).equals(
+          compilation_unit()->shared_function_info())) {
+    return reducer_.BuildAbort(AbortReason::kUnreachable);
+  }
 
   // Create the register file.
   int length = parameter_count_without_receiver() + register_count();
@@ -17874,6 +17877,17 @@ int MaglevGraphBuilder::GetLoopDepth() const {
 ReduceResult MaglevGraphBuilder::BuildSmiUntag(ValueNode* node) {
   return reducer_.BuildSmiUntag(node);
 }
+
+VirtualObject* MaglevGraphBuilder::CreateJSObject(compiler::MapRef map) {
+  return reducer_.CreateJSObject(map);
+}
+
+ReduceResult MaglevGraphBuilder::BuildInlinedAllocation(
+    VirtualObject* object, AllocationType allocation_type) {
+  return reducer_.BuildInlinedAllocation(object, allocation_type);
+}
+
+void MaglevGraphBuilder::FlushNodesToBlock() { reducer_.FlushNodesToBlock(); }
 
 #undef TRACE
 #undef MAGLEV_FAIL

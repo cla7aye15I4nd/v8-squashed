@@ -1130,7 +1130,27 @@ void InstructionSelector::VisitUint64Sub128(OpIndex node) {
 }
 
 void InstructionSelector::VisitUint64Add3WithCarry(OpIndex node) {
-  UNIMPLEMENTED();
+  RiscvOperandGenerator g(this);
+  const auto& op = this->Get(node).Cast<Word64Add3Op>();
+
+  OptionalOpIndex out_low = FindProjection(node, 0);
+  OptionalOpIndex out_high = FindProjection(node, 1);
+
+  InstructionOperand inputs[3];
+  size_t input_count = 0;
+  inputs[input_count++] = g.UseRegister(op.first());
+  inputs[input_count++] = g.UseOperand(op.second(), kRiscvAdd64);
+  inputs[input_count++] = g.UseUniqueOperand(op.third(), kRiscvAdd64);
+
+  InstructionOperand outputs[2];
+  size_t output_count = 0;
+  outputs[output_count++] =
+      g.DefineAsRegister(out_low.valid() ? out_low.value() : node);
+  if (out_high.valid() && IsUsed(out_high.value())) {
+    outputs[output_count++] = g.DefineAsRegister(out_high.value());
+  }
+
+  Emit(kRiscvAdd64_3, output_count, outputs, input_count, inputs);
 }
 
 void InstructionSelector::VisitInt32MulHigh(OpIndex node) {
@@ -1462,16 +1482,6 @@ void InstructionSelector::VisitTryTruncateFloat64ToUint64(OpIndex node) {
   }
 
   Emit(kRiscvTruncUlD, output_count, outputs, 1, inputs);
-}
-
-void InstructionSelector::VisitBitcastWord32ToWord64(OpIndex node) {
-  DCHECK(SmiValuesAre31Bits());
-  DCHECK(COMPRESS_POINTERS_BOOL);
-  RiscvOperandGenerator g(this);
-  const Operation& op = this->Get(node);
-  DCHECK_EQ(op.input_count, 1);
-  Emit(kRiscvZeroExtendWord, g.DefineAsRegister(node),
-       g.UseRegister(op.input(0)));
 }
 
 void EmitSignExtendWord(InstructionSelector* selector, OpIndex node) {
