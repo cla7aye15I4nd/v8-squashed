@@ -2258,55 +2258,6 @@ BUILTIN(WebAssemblyException) {
   return *runtime_exception;
 }
 
-DirectHandle<JSFunction> NewPromisingWasmExportedFunction(
-    Isolate* isolate, DirectHandle<WasmExportedFunctionData> data,
-    ErrorThrower& thrower) {
-  DirectHandle<WasmTrustedInstanceData> trusted_instance_data{
-      data->instance_data(), isolate};
-  int func_index = data->function_index();
-  const wasm::WasmModule* module = trusted_instance_data->module();
-  wasm::ModuleTypeIndex sig_index = module->functions[func_index].sig_index;
-  const wasm::CanonicalSig* sig = data->internal()->sig();
-  DirectHandle<Code> wrapper;
-  if (!wasm::IsJSCompatibleSignature(sig)) {
-    // If the signature is incompatible with JS, the original export will have
-    // compiled an incompatible signature wrapper, so fetch it from the cache.
-    wrapper = WasmExportedFunction::GetWrapper(isolate, sig);
-  } else {
-    wrapper = BUILTIN_CODE(isolate, WasmPromising);
-  }
-
-  // TODO(14034): Create funcref RTTs lazily?
-  DirectHandle<Map> rtt{
-      Cast<Map>(
-          trusted_instance_data->managed_object_maps()->get(sig_index.index)),
-      isolate};
-
-  int num_imported_functions = module->num_imported_functions;
-  DirectHandle<TrustedObject> implicit_arg;
-  if (func_index >= num_imported_functions) {
-    implicit_arg = trusted_instance_data;
-  } else {
-    implicit_arg = direct_handle(
-        TrustedCast<WasmImportData>(
-            trusted_instance_data->dispatch_table_for_imports()->implicit_arg(
-                func_index)),
-        isolate);
-  }
-
-  DirectHandle<WasmInternalFunction> internal =
-      isolate->factory()->NewWasmInternalFunction(
-          implicit_arg, func_index,
-          trusted_instance_data->GetCallTarget(func_index), sig);
-  DirectHandle<WasmFuncRef> func_ref =
-      isolate->factory()->NewWasmFuncRef(internal, rtt);
-
-  DirectHandle<JSFunction> result = WasmExportedFunction::New(
-      isolate, trusted_instance_data, func_ref, internal,
-      static_cast<int>(sig->parameter_count()), wrapper);
-  return result;
-}
-
 // WebAssembly.promising(Function) -> Function
 void WebAssemblyPromising(const v8::FunctionCallbackInfo<v8::Value>& info) {
   WasmJSApiScope js_api_scope{info, "WebAssembly.promising()"};
@@ -2327,8 +2278,7 @@ void WebAssemblyPromising(const v8::FunctionCallbackInfo<v8::Value>& info) {
   auto wasm_exported_function = Cast<WasmExportedFunction>(*callable);
   DirectHandle<WasmExportedFunctionData> data(
       wasm_exported_function->shared()->wasm_exported_function_data(), isolate);
-  DirectHandle<JSFunction> result =
-      NewPromisingWasmExportedFunction(isolate, data, thrower);
+  DirectHandle<JSFunction> result = NewPromisingWasmFunction(isolate, data);
   info.GetReturnValue().Set(Utils::ToLocal(Cast<JSObject>(result)));
 }
 
@@ -3011,26 +2961,17 @@ DirectHandle<JSFunction> CreateFunc(
   return function;
 }
 
-DirectHandle<JSFunction> InstallFunc(
-    Isolate* isolate, DirectHandle<JSObject> object, DirectHandle<String> name,
-    FunctionCallback func, int length, PropertyAttributes attributes = NONE,
+void InstallFunc(
+    Isolate* isolate, DirectHandle<JSObject> object, const char* str,
+    FunctionCallback func, int length,
     SideEffectType side_effect_type = SideEffectType::kHasSideEffect) {
+  DirectHandle<String> name = v8_str(isolate, str);
   DirectHandle<JSFunction> function =
       CreateFunc(isolate, name, func, side_effect_type);
   function->shared()->set_length(length);
   CHECK(!JSObject::HasRealNamedProperty(isolate, object, name).FromMaybe(true));
   CHECK(object->map()->is_extensible());
-  JSObject::AddProperty(isolate, object, name, function, attributes);
-  return function;
-}
-
-DirectHandle<JSFunction> InstallFunc(
-    Isolate* isolate, DirectHandle<JSObject> object, const char* str,
-    FunctionCallback func, int length, PropertyAttributes attributes = NONE,
-    SideEffectType side_effect_type = SideEffectType::kHasSideEffect) {
-  DirectHandle<String> name = v8_str(isolate, str);
-  return InstallFunc(isolate, object, name, func, length, attributes,
-                     side_effect_type);
+  JSObject::AddProperty(isolate, object, name, function, NONE);
 }
 
 DirectHandle<JSFunction> CreateConstructorFunc(Isolate* isolate,
@@ -3207,7 +3148,7 @@ void WasmJs::PrepareForSnapshot(Isolate* isolate) {
                   wasm::WebAssemblyTableGetLength);
     InstallFunc(isolate, table_proto, "grow", wasm::WebAssemblyTableGrow, 1);
     InstallFunc(isolate, table_proto, "set", wasm::WebAssemblyTableSet, 1);
-    InstallFunc(isolate, table_proto, "get", wasm::WebAssemblyTableGet, 1, NONE,
+    InstallFunc(isolate, table_proto, "get", wasm::WebAssemblyTableGet, 1,
                 SideEffectType::kHasNoSideEffect);
   }
 
@@ -3237,7 +3178,7 @@ void WasmJs::PrepareForSnapshot(Isolate* isolate) {
         WASM_GLOBAL_OBJECT_TYPE, WasmGlobalObject::kHeaderSize,
         "WebAssembly.Global");
     InstallFunc(isolate, global_proto, "valueOf",
-                wasm::WebAssemblyGlobalValueOf, 0, NONE,
+                wasm::WebAssemblyGlobalValueOf, 0,
                 SideEffectType::kHasNoSideEffect);
     InstallGetterSetter(isolate, global_proto, "value",
                         wasm::WebAssemblyGlobalGetValue,
@@ -3358,13 +3299,13 @@ void WasmJs::InstallModule(Isolate* isolate,
   }
 
   InstallFunc(isolate, module_constructor, "imports",
-              wasm::WebAssemblyModuleImports, 1, NONE,
+              wasm::WebAssemblyModuleImports, 1,
               SideEffectType::kHasNoSideEffect);
   InstallFunc(isolate, module_constructor, "exports",
-              wasm::WebAssemblyModuleExports, 1, NONE,
+              wasm::WebAssemblyModuleExports, 1,
               SideEffectType::kHasNoSideEffect);
   InstallFunc(isolate, module_constructor, "customSections",
-              wasm::WebAssemblyModuleCustomSections, 2, NONE,
+              wasm::WebAssemblyModuleCustomSections, 2,
               SideEffectType::kHasNoSideEffect);
 }
 

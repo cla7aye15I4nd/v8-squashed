@@ -8,10 +8,16 @@
 // coverage evaluation and edge determinism). Prints one PASS/FAIL line per
 // check and exits non-zero if any check failed.
 
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <initializer_list>
 #include <iterator>
 #include <set>
 
@@ -22,8 +28,15 @@
 #include "experimental/redline/commands/command.h"
 #include "experimental/redline/commands/selftest_checker.h"
 #include "experimental/redline/commands/selftest_selection.h"
+#include "experimental/redline/core/program.h"
+#include "experimental/redline/core/random.h"
+#include "experimental/redline/corpus/corpus.h"
+#include "experimental/redline/corpus/feature_weights.h"
 #include "experimental/redline/engine/crash.h"
+#include "experimental/redline/engine/d8_flags.h"
+#include "experimental/redline/exec/coverage.h"
 #include "experimental/redline/exec/runner.h"
+#include "experimental/redline/minimizer/minimizer.h"
 
 namespace redline {
 
@@ -58,6 +71,50 @@ std::string DefaultTestdataDir() {
     return selection.substr(0, selection.rfind('/'));
   }
   return RedlineDataDir("testdata");
+}
+
+// Offline: the profiles of the random d8 flags. The Turbolev profile must not
+// draw the flags that only Maglev reads, and the Maglev profile must not draw
+// the Turbolev and Turboshaft flags.
+void RunD8FlagProfileChecks(Checker* checker) {
+  auto draws_any = [](D8FlagProfile profile,
+                      std::initializer_list<const char*> prefixes) {
+    Random rng(7);
+    std::string found;
+    for (int i = 0; i < 500 && found.empty(); i++) {
+      for (const std::string& flag : RandomD8Flags(rng, profile)) {
+        for (const char* prefix : prefixes) {
+          if (flag.rfind(prefix, 0) == 0) {
+            found = flag;
+          }
+        }
+      }
+    }
+    return found;
+  };
+  D8FlagProfile parsed = D8FlagProfile::kMaglev;
+  checker->Check("random flags: the profile names parse",
+                 ParseD8FlagProfile("turbolev", &parsed) &&
+                     parsed == D8FlagProfile::kTurbolev &&
+                     ParseD8FlagProfile("maglev", &parsed) &&
+                     parsed == D8FlagProfile::kMaglev &&
+                     !ParseD8FlagProfile("turbofan", &parsed),
+                 "");
+  std::string maglev_only =
+      draws_any(D8FlagProfile::kTurbolev,
+                {"--maglev-future", "--maglev-non-eager", "--maglev-assert",
+                 "--max-maglev", "--optimize-on-next-call-optimizes-to-maglev",
+                 "--no-maglev-"});
+  checker->Check("random flags: the turbolev profile draws no Maglev-only flag",
+                 maglev_only.empty(), maglev_only);
+  std::string turbolev_only =
+      draws_any(D8FlagProfile::kMaglev,
+                {"--no-turbolev", "--no-turboshaft", "--turboshaft-",
+                 "--verify-turboshaft", "--maglev-range-verification",
+                 "--always-osr-from-maglev", "--no-additive-safe-int-feedback",
+                 "--max-inlined-bytecode-size-small"});
+  checker->Check("random flags: the maglev profile draws no Turbolev flag",
+                 turbolev_only.empty(), turbolev_only);
 }
 
 // Offline: crash signatures. A recursion that overflows the stack must get
@@ -97,6 +154,369 @@ void RunCrashSignatureChecks(Checker* checker) {
                      "sig11 SEGV_MAPERR v8::internal::Top1 < v8::internal::Foo "
                      "< v8::internal::Bar",
                  c.text);
+  CrashSignature d = CrashSignature::FromOutput(
+      5, 0,
+      "abort: CSA_DCHECK failed: Torque assert 'Is<A>(o)' failed "
+      "[src/builtins/cast.tq:1025] [gen/torque-generated/src/builtins/"
+      "regexp-test-tq-csa.cc:174]\n\nStacktrace:\n");
+  checker->Check(
+      "crash signature: a failed CSA_DCHECK names its builtin and message",
+      d.text == "csa regexp-test-tq-csa.cc:174 Torque assert 'Is<A>(o)' failed",
+      d.text);
+}
+
+// Offline: the coverage header (experimental/redline/d8/cov.h) on synthetic
+// shared memory.
+void RunCoverageHeaderChecks(Checker* checker) {
+  std::string error;
+  std::unique_ptr<CoverageMap> map = CoverageMap::Create(9998, &error);
+  if (!checker->Check("coverage header: create a coverage map", map != nullptr,
+                      error)) {
+    return;
+  }
+  int fd = shm_open(map->shm_name().c_str(), O_RDWR, 0);
+  void* mapping = fd < 0 ? MAP_FAILED
+                         : mmap(nullptr, CoverageMap::kShmSize,
+                                PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (fd >= 0) {
+    close(fd);
+  }
+  const bool mapped = mapping != MAP_FAILED;
+  if (!checker->Check("coverage header: map the shared memory", mapped,
+                      mapped ? "" : strerror(errno))) {
+    return;
+  }
+  uint8_t* shm = static_cast<uint8_t*>(mapping);
+  // A target with inline-bool-flag, 80 code edges and 10 builtins blocks
+  // writes this header.
+  cov::Header header = {};
+  header.magic = cov::kMagic;
+  header.version = cov::kVersion;
+  header.header_size = cov::kHeaderSize;
+  header.shm_size = static_cast<uint32_t>(CoverageMap::kShmSize);
+  header.mode = static_cast<uint32_t>(cov::Mode::kInlineBoolFlag);
+  header.bits_per_edge = 1;
+  header.num_edges = 90;
+  header.max_edges = cov::MaxEdges(header.shm_size, 1);
+  header.num_regions = 2;
+  header.regions[0] = {static_cast<uint32_t>(cov::RegionKind::kCode), 1, 80};
+  header.regions[1] = {static_cast<uint32_t>(cov::RegionKind::kBuiltins), 81,
+                       10};
+  header.build_id_size = 2;
+  header.build_id[0] = 0xab;
+  header.build_id[1] = 0x01;
+  memcpy(shm, &header, sizeof(header));
+  bool ok = map->FinishInitialization(&error);
+  checker->Check("coverage header: read a valid header", ok, error);
+  if (ok) {
+    checker->Check(
+        "coverage header: geometry",
+        map->num_edges() == 90 &&
+            strcmp(map->mode_name(), "inline-bool-flag") == 0 &&
+            map->build_id() == "ab01",
+        StringPrintf("%u edges, mode %s, build id %s", map->num_edges(),
+                     map->mode_name(), map->build_id().c_str()));
+    // The bitmap starts after the header.
+    uint8_t* bits = shm + cov::kHeaderSize;
+    bits[5 / 8] |= static_cast<uint8_t>(1u << (5 % 8));
+    bits[85 / 8] |= static_cast<uint8_t>(1u << (85 % 8));
+    const std::vector<uint32_t> expected = {5, 85};
+    checker->Check("coverage header: bits after the header",
+                   map->CurrentEdges() == expected,
+                   StringPrintf("%zu edges", map->CurrentEdges().size()));
+    // A new target process with other edges is another binary.
+    cov::Header other = header;
+    other.num_edges = 91;
+    other.regions[1].count = 11;
+    memcpy(shm, &other, sizeof(other));
+    std::string changed;
+    checker->Check("coverage header: a changed header is an error",
+                   !map->FinishInitialization(&changed) &&
+                       changed.find("mixing binaries") != std::string::npos,
+                   changed);
+  }
+  // Headers that this Redline rejects.
+  struct BadHeader {
+    const char* name;
+    cov::Header header;
+  };
+  BadHeader bad[4] = {{"no magic", header},
+                      {"a region beyond the edges", header},
+                      {"no instrumentation", header},
+                      {"a wrong edge size", header}};
+  bad[0].header.magic = 0;
+  bad[1].header.regions[1].count = 11;
+  bad[2].header.mode = static_cast<uint32_t>(cov::Mode::kNone);
+  bad[3].header.mode = static_cast<uint32_t>(cov::Mode::kInline8bitCounters);
+  for (const BadHeader& b : bad) {
+    std::unique_ptr<CoverageMap> fresh = CoverageMap::Create(9997, &error);
+    if (fresh == nullptr) {
+      checker->Check("coverage header: create a coverage map", false, error);
+      break;
+    }
+    int bad_fd = shm_open(fresh->shm_name().c_str(), O_RDWR, 0);
+    if (bad_fd >= 0) {
+      if (pwrite(bad_fd, &b.header, sizeof(b.header), 0) !=
+          static_cast<ssize_t>(sizeof(b.header))) {
+        bad_fd = -1;
+      }
+      close(bad_fd);
+    }
+    std::string reason;
+    checker->Check(StringPrintf("coverage header: reject %s", b.name).c_str(),
+                   bad_fd >= 0 && !fresh->FinishInitialization(&reason),
+                   reason);
+  }
+  munmap(mapping, CoverageMap::kShmSize);
+}
+
+// Offline: the counters layout of the coverage (exec/coverage.h) on a
+// synthetic header, and the feature weights (corpus/feature_weights.h).
+void RunCoverageCounterChecks(Checker* checker) {
+  const uint32_t buckets[][2] = {{1, 0},   {2, 1},   {3, 2},  {4, 3},  {7, 3},
+                                 {8, 4},   {15, 4},  {16, 5}, {31, 5}, {32, 6},
+                                 {127, 6}, {128, 7}, {255, 7}};
+  bool buckets_ok = true;
+  for (const auto& [count, bucket] : buckets) {
+    buckets_ok = buckets_ok &&
+                 CoverageMap::Bucket(static_cast<uint8_t>(count)) == bucket;
+  }
+  checker->Check("coverage counters: AFL bucket table", buckets_ok, "");
+
+  std::string error;
+  std::unique_ptr<CoverageMap> map = CoverageMap::Create(9999, &error);
+  if (!checker->Check("coverage counters: create a coverage map",
+                      map != nullptr, error)) {
+    return;
+  }
+  // A target with 80 code edges, 10 builtins blocks and 10 optimized code
+  // features writes this header.
+  int fd = shm_open(map->shm_name().c_str(), O_RDWR, 0);
+  void* mapping = fd < 0 ? MAP_FAILED
+                         : mmap(nullptr, CoverageMap::kShmSize,
+                                PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (fd >= 0) {
+    close(fd);
+  }
+  const bool mapped = mapping != MAP_FAILED;
+  if (!checker->Check("coverage counters: map the shared memory", mapped,
+                      mapped ? "" : strerror(errno))) {
+    return;
+  }
+  uint8_t* shm = static_cast<uint8_t*>(mapping);
+  cov::Header header = {};
+  header.magic = cov::kMagic;
+  header.version = cov::kVersion;
+  header.header_size = cov::kHeaderSize;
+  header.shm_size = static_cast<uint32_t>(CoverageMap::kShmSize);
+  header.mode = static_cast<uint32_t>(cov::Mode::kInline8bitCounters);
+  header.bits_per_edge = 8;
+  header.num_edges = 100;
+  header.max_edges = cov::MaxEdges(header.shm_size, 8);
+  header.num_regions = 3;
+  header.regions[0] = {static_cast<uint32_t>(cov::RegionKind::kCode), 1, 80};
+  header.regions[1] = {static_cast<uint32_t>(cov::RegionKind::kBuiltins), 81,
+                       10};
+  header.regions[2] = {static_cast<uint32_t>(cov::RegionKind::kOptimized), 91,
+                       10};
+  memcpy(shm, &header, sizeof(header));
+  CoverageMap::Watch watch;
+  watch.edges = {7, 5};
+  map->SetWatch(watch);
+  bool ok = map->FinishInitialization(&error);
+  checker->Check("coverage counters: read the header", ok, error);
+  if (ok) {
+    checker->Check(
+        "coverage counters: geometry",
+        map->counters_mode() && map->real_edges() == 100 &&
+            map->counted_edges() == 90 && map->watched().size() == 12 &&
+            map->num_edges() == 100 + 12 * CoverageMap::kBuckets,
+        StringPrintf("features %u, counted %u, watched %zu", map->num_edges(),
+                     map->counted_edges(), map->watched().size()));
+    uint8_t* counters = shm + cov::kHeaderSize;
+    counters[5] = 3;
+    counters[50] = 1;
+    counters[91] = 200;
+    map->Refresh();
+    // Edge 5 is watched edge 0 (bucket 2), edge 91 is watched edge 2
+    // (bucket 7). Bucket features start at 101.
+    const std::vector<uint32_t> expected = {5, 50, 91, 103, 124};
+    checker->Check(
+        "coverage counters: hit bits and bucket features",
+        map->CurrentEdges() == expected && map->CountCurrentEdges() == 2,
+        StringPrintf("%zu features, %u counted edges",
+                     map->CurrentEdges().size(), map->CountCurrentEdges()));
+    // Several counters in one 8-byte word. Also a watched edge in the middle
+    // of the optimized region: watched edge 10, bucket 4 for a count of 9.
+    map->ClearBitmap();
+    counters[8] = 1;
+    counters[12] = 255;
+    counters[15] = 128;
+    counters[99] = 9;
+    map->Refresh();
+    const std::vector<uint32_t> packed = {8, 12, 15, 99, 185};
+    checker->Check("coverage counters: packed hit bits",
+                   map->CurrentEdges() == packed,
+                   StringPrintf("%zu features", map->CurrentEdges().size()));
+    map->ClearBitmap();
+    counters[5] = 3;
+    counters[50] = 1;
+    counters[91] = 200;
+    map->Refresh();
+    FeatureWeights::Params params;
+    std::unique_ptr<FeatureWeights> weights =
+        FeatureWeights::Build(*map, params, {{5, 1.0}, {50, 0.3}});
+    auto near = [](double a, double b) { return std::fabs(a - b) < 1e-6; };
+    checker->Check(
+        "coverage counters: feature weights",
+        near(weights->Of(5), 21.0) && near(weights->Of(50), 7.0) &&
+            near(weights->Of(85), 0.5) && near(weights->Of(91), 5.0) &&
+            near(weights->Of(101), 0.0) && near(weights->Of(103), 10.5) &&
+            near(weights->Of(124), 2.5) && near(weights->Of(10), 1.0) &&
+            weights->target_edges() == std::vector<uint32_t>{5, 50},
+        StringPrintf("%g %g %g %g %g %g %g", weights->Of(5), weights->Of(50),
+                     weights->Of(85), weights->Of(91), weights->Of(101),
+                     weights->Of(103), weights->Of(124)));
+    // A focus on code edges 40 to 60. The focus edges, the target edges and
+    // the buckets of the targets are in the focus. Optimized code features are
+    // excluded by default and included when optimized_in_focus is true.
+    std::unique_ptr<FeatureWeights> focused = FeatureWeights::Build(
+        *map, params, {{5, 1.0}}, FeatureWeights::EdgeRanges{{40, 60}});
+    FeatureWeights::Params opt_params = params;
+    opt_params.optimized_in_focus = true;
+    std::unique_ptr<FeatureWeights> focused_opt = FeatureWeights::Build(
+        *map, opt_params, {{5, 1.0}}, FeatureWeights::EdgeRanges{{40, 60}});
+    std::unique_ptr<FeatureWeights> weights_opt =
+        FeatureWeights::Build(*map, opt_params, {{5, 1.0}, {50, 0.3}});
+    checker->Check(
+        "coverage counters: focus",
+        focused->has_focus() && focused->filters_admission() &&
+            focused->focus_edges() == 21 && focused->InFocus(40) &&
+            focused->InFocus(60) && !focused->InFocus(61) &&
+            focused->InFocus(5) && !focused->InFocus(95) &&
+            focused_opt->InFocus(95) && focused->InFocus(103) &&
+            !focused->InFocus(10) && !focused->InFocus(85) &&
+            near(focused->Of(10), 0.1) && near(focused->Of(50), 1.0) &&
+            near(focused->Of(85), 0.05) && near(focused->Of(5), 21.0) &&
+            !weights->has_focus() && weights->filters_admission() &&
+            weights->InFocus(10) && !weights->InFocus(95) &&
+            !weights_opt->filters_admission() && weights_opt->InFocus(95),
+        StringPrintf("focus edges %u, w(10) %g, w(85) %g",
+                     focused->focus_edges(), focused->Of(10), focused->Of(85)));
+    // Target features stay active in the rarity scheduler past rare_edge_limit.
+    // Slow programs get less energy than fast ones, and partner picks favour
+    // target programs in change-based fuzzing.
+    FeatureWeights::SetActive(weights.get());
+    auto& sel_reg = SelectorRegistry<const Program>::Instance();
+    std::string sel_err;
+    auto seeds =
+        sel_reg.Create(SelectionConfig{"rarity", JsonValue()}, &sel_err);
+    auto partners = sel_reg.Create(
+        SelectionConfig{"rarity-partner", JsonValue()}, &sel_err);
+    Corpus rarity_corpus(std::move(seeds), std::move(partners));
+    ProgramPtr last_target, last_non_target;
+    for (int i = 0; i < 10; i++) {
+      Lineage l;
+      auto pt = Program::Parse("let a = 1;", l, &sel_err);
+      pt->edges = {5};
+      if (i == 9) {
+        for (uint32_t e = 15; e < 155; e++) {
+          if (e != 50) {
+            pt->edges.push_back(e);
+          }
+        }
+      }
+      pt->exec_time_us = i == 9 ? 1000 : 100000;
+      last_target = rarity_corpus.Add(pt);
+      auto pn = Program::Parse("let b = 2;", l, &sel_err);
+      pn->edges = {10};
+      pn->exec_time_us = 1000;
+      last_non_target = rarity_corpus.Add(pn);
+    }
+    Random rng(42);
+    bool partner_picked_target = false;
+    for (int i = 0; i < 8; i++) {
+      ProgramPtr p = rarity_corpus.PickPartner(*last_non_target, rng);
+      if (p != nullptr && p->edges == std::vector<uint32_t>{5}) {
+        partner_picked_target = true;
+      }
+    }
+    FeatureWeights::SetActive(nullptr);
+    // Without active targets, Pick() pops the max-energy seed first: the fast
+    // program (1 ms) beats the slow one (100 ms) with equal edge rarity.
+    auto time_seeds =
+        sel_reg.Create(SelectionConfig{"rarity", JsonValue()}, &sel_err);
+    auto time_partners = sel_reg.Create(
+        SelectionConfig{"uniform-partner", JsonValue()}, &sel_err);
+    Corpus time_corpus(std::move(time_seeds), std::move(time_partners));
+    Lineage l;
+    auto slow_p = Program::Parse("let x = 1;", l, &sel_err);
+    slow_p->edges = {20};
+    slow_p->exec_time_us = 100000;
+    time_corpus.Add(slow_p);
+    auto fast_p = Program::Parse("let y = 1;", l, &sel_err);
+    fast_p->edges = {21};
+    fast_p->exec_time_us = 1000;
+    ProgramPtr fast_added = time_corpus.Add(fast_p);
+    ProgramPtr first_pick = time_corpus.Pick(rng);
+    const bool kept_target_5 = std::find(last_target->rare_edges.begin(),
+                                         last_target->rare_edges.end(),
+                                         5u) != last_target->rare_edges.end();
+    checker->Check(
+        "coverage counters: rarity target retention and time weighting",
+        kept_target_5 && last_target->rare_edges.size() == 128 &&
+            last_non_target->rare_edges.empty() && partner_picked_target &&
+            first_pick == fast_added,
+        StringPrintf("target rare_edges %zu, non-target %zu",
+                     last_target->rare_edges.size(),
+                     last_non_target->rare_edges.size()));
+
+    std::vector<std::string> base_flags = {
+        "--single-threaded", "--max-maglev-eager-inlined-bytecode-size=0",
+        "--max-maglev-inlined-bytecode-size-small=0"};
+    std::vector<std::string> extra_flags = {"--single-threaded",
+                                            "--maglev-assert"};
+    std::vector<std::string> combined =
+        CombineD8Flags(base_flags, extra_flags, rng);
+    const bool stripped_orphan =
+        std::find(combined.begin(), combined.end(),
+                  "--max-maglev-eager-inlined-bytecode-size=0") ==
+            combined.end() &&
+        std::find(combined.begin(), combined.end(),
+                  "--max-maglev-inlined-bytecode-size-small=0") ==
+            combined.end();
+    const bool has_assert = std::find(combined.begin(), combined.end(),
+                                      "--maglev-assert") != combined.end();
+    const ptrdiff_t st_count =
+        std::count(combined.begin(), combined.end(), "--single-threaded");
+    checker->Check(
+        "d8 flags: CombineD8Flags deduplication and orphan stripping",
+        stripped_orphan && has_assert && st_count == 1,
+        StringPrintf("size %zu, st_count %td", combined.size(), st_count));
+
+    Minimizer min_check;
+    auto min_prog = Program::Parse(
+        "let u0 = 1;\nlet u1 = 2;\nlet keep = 1;\n"
+        "let u2 = 3;\nlet u3 = 4;\nkeep.m(1);\n",
+        l, &sel_err);
+    auto min_tree = min_prog->CopyTree();
+    MinimizationResult min_res = min_check.Minimize(
+        min_tree.get(),
+        [](const std::string& src) {
+          return src.find("let keep = 1") != std::string::npos &&
+                 src.find("keep.m(1)") != std::string::npos;
+        },
+        nullptr);
+    const uint64_t stmt_invocations =
+        min_check.Find("statements")->stats().invocations;
+    checker->Check(
+        "minimizer: unreferenced declarations and fixed-point stopping",
+        min_res.accepted == 1 && min_res.tests <= 8 && stmt_invocations == 1,
+        StringPrintf("tests %d, accepted %d, stmt_invocations %llu",
+                     min_res.tests, min_res.accepted,
+                     static_cast<unsigned long long>(stmt_invocations)));
+  }
+  munmap(mapping, CoverageMap::kShmSize);
 }
 
 int RunSelftest(const Flags& flags) {
@@ -105,6 +525,9 @@ int RunSelftest(const Flags& flags) {
 
   // Offline checks first: they need no target.
   RunCrashSignatureChecks(&checker);
+  RunCoverageHeaderChecks(&checker);
+  RunD8FlagProfileChecks(&checker);
+  RunCoverageCounterChecks(&checker);
   RunNodeKindChecks(&checker);
   RunPresetChecks(&checker);
   std::string testdata = flags.GetString("testdata", DefaultTestdataDir());
@@ -144,6 +567,23 @@ int RunSelftest(const Flags& flags) {
   }
   checker.Info("instrumented edges",
                StringPrintf("%u", runner->coverage().num_edges()));
+  {
+    const CoverageMap& coverage = runner->coverage();
+    const cov::Header& header = coverage.header();
+    std::string regions;
+    for (uint32_t i = 0; i < header.num_regions; i++) {
+      static const char* const kKinds[] = {"?", "code", "builtins",
+                                           "optimized"};
+      const cov::Region& region = header.regions[i];
+      regions +=
+          StringPrintf(" %s %u..%u", kKinds[region.kind <= 3 ? region.kind : 0],
+                       region.first, region.first + region.count - 1);
+    }
+    checker.Info("coverage header",
+                 StringPrintf("%s, %u bit(s) per edge,%s, build id %s",
+                              coverage.mode_name(), header.bits_per_edge,
+                              regions.c_str(), coverage.build_id().c_str()));
+  }
 
   ScriptRunner::Result result;
 
@@ -167,9 +607,9 @@ int RunSelftest(const Flags& flags) {
 
   // Output channels.
   if (RunOrFail(&checker, runner.get(), "fuzzout",
-                "fuzzilli('FUZZILLI_PRINT', 'hello fuzzout');", &result)) {
+                "redline('REDLINE_PRINT', 'hello fuzzout');", &result)) {
     checker.Check(
-        "fuzzilli('FUZZILLI_PRINT') is captured",
+        "redline('REDLINE_PRINT') is captured",
         result.execution.succeeded() &&
             result.execution.fuzzout.find("hello fuzzout") != std::string::npos,
         Describe(result.execution) + ", fuzzout=\"" + result.execution.fuzzout +
@@ -236,9 +676,9 @@ int RunSelftest(const Flags& flags) {
       {"DEBUG build check", 8, false}, {"sandbox violation", 9, false},
   };
   for (const CrashCase& c : crash_cases) {
-    std::string script = StringPrintf("fuzzilli('FUZZILLI_CRASH', %d)", c.kind);
-    std::string name = StringPrintf("fuzzilli('FUZZILLI_CRASH', %d) [%s]",
-                                    c.kind, c.description);
+    std::string script = StringPrintf("redline('REDLINE_CRASH', %d)", c.kind);
+    std::string name = StringPrintf("redline('REDLINE_CRASH', %d) [%s]", c.kind,
+                                    c.description);
     if (!RunOrFail(&checker, runner.get(), name.c_str(), script, &result)) {
       continue;
     }
@@ -369,6 +809,73 @@ int RunSelftest(const Flags& flags) {
                   ok && spawns >= 2,
                   StringPrintf("%llu spawns in %d runs",
                                static_cast<unsigned long long>(spawns), runs));
+  }
+
+  // Random flags (randomize_d8_flags): a new target process gets new
+  // flags, except while the flags are pinned.
+  {
+    TargetOptions random_target = target;
+    int draws = 0;
+    random_target.random_args = [&draws] {
+      draws++;
+      // Two harmless flags, so that the check can see which draw a target
+      // process got.
+      return std::vector<std::string>{draws % 2 == 1 ? "--stress-ic"
+                                                     : "--no-stress-ic"};
+    };
+    std::unique_ptr<ScriptRunner> random_runner =
+        ScriptRunner::Create(random_target, 1, &error);
+    bool ok = random_runner != nullptr && random_runner->Initialize(&error);
+    std::vector<std::string> first, second, pinned, released;
+    auto respawn = [&](std::vector<std::string>* args) {
+      random_runner->child().Kill();
+      ok = ok && random_runner->Run("", &result, &error) &&
+           result.execution.succeeded();
+      *args = random_runner->child().CurrentArgs();
+    };
+    if (ok) {
+      first = random_runner->child().CurrentArgs();
+      respawn(&second);
+      random_runner->child().Pin(true);
+      respawn(&pinned);
+      random_runner->child().Pin(false);
+      respawn(&released);
+    }
+    auto starts_with = [](const std::vector<std::string>& args,
+                          const char* flag) {
+      return !args.empty() && args.front() == flag;
+    };
+    checker.Check(
+        "random flags: a new target gets new flags, a pinned one keeps them",
+        ok && starts_with(first, "--stress-ic") &&
+            starts_with(second, "--no-stress-ic") && pinned == second &&
+            starts_with(released, "--stress-ic") && draws == 3,
+        ok ? StringPrintf("%d draws", draws) : error);
+    // A respawn while pinned keeps the flags. Then Pin(false) kills the
+    // target, because its flags ran max_execs_before_respawn runs, and the
+    // next target draws new flags.
+    bool respawned = false;
+    bool killed = false;
+    std::vector<std::string> kept, renewed;
+    if (ok) {
+      random_runner->child().Pin(true);
+      uint64_t spawns_before = random_runner->child().total_spawns();
+      for (int i = 0; ok && i < random_target.max_execs_before_respawn; i++) {
+        ok = random_runner->Run("", &result, &error) &&
+             result.execution.succeeded();
+      }
+      respawned = random_runner->child().total_spawns() > spawns_before;
+      kept = random_runner->child().CurrentArgs();
+      random_runner->child().Pin(false);
+      killed = !random_runner->child().is_running();
+      ok = ok && random_runner->Run("", &result, &error) &&
+           result.execution.succeeded();
+      renewed = random_runner->child().CurrentArgs();
+    }
+    checker.Check("random flags: unpinning replaces a target with old flags",
+                  ok && respawned && kept == released && killed &&
+                      starts_with(renewed, "--no-stress-ic") && draws == 4,
+                  ok ? StringPrintf("%d draws", draws) : error);
   }
 
   // Speed (informational).

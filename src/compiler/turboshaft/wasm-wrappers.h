@@ -124,11 +124,12 @@ class WasmWrapperTSGraphBuilder : public wasm::WasmGraphBuilderBase<Assembler> {
 
   // Overload for the inlined JS-to-Wasm wrapper.
   // Returns the result of the Wasm function converted to a JS value.
-  V<Any> BuildJSToWasmWrapper(V<JSFunction> js_closure, V<Context> js_context,
-                              base::Vector<const OpIndex> arguments,
-                              OptionalV<LazyFrameState> lazy_frame_state,
-                              compiler::LazyDeoptOnThrow lazy_deopt_on_throw,
-                              OptionalV<EagerFrameState> caller_frame_state);
+  V<Any> BuildJSToWasmWrapper(
+      IndirectHandle<WasmInternalFunction> inlined_internal_function,
+      V<Context> js_context, base::Vector<const OpIndex> arguments,
+      OptionalV<LazyFrameState> lazy_frame_state,
+      compiler::LazyDeoptOnThrow lazy_deopt_on_throw,
+      OptionalV<EagerFrameState> caller_frame_state);
 
   // Overload for the "regular" non-inlined compiled JS-to-Wasm wrapper.
   void BuildJSToWasmWrapper();
@@ -913,9 +914,10 @@ class WasmWrapperTSGraphBuilder : public wasm::WasmGraphBuilderBase<Assembler> {
         V<WasmInternalFunction>::Cast(__ LoadProtectedPointerField(
             function_data, LoadOp::Kind::TaggedBase().Immutable(),
             offsetof(WasmFunctionData, protected_internal_)));
-    V<Word32> code_pointer = __ Load(
-        internal, LoadOp::Kind::TaggedBase(), MemoryRepresentation::Uint32(),
-        offsetof(WasmInternalFunction, raw_call_target_));
+    V<Word32> code_pointer =
+        __ Load(internal, LoadOp::Kind::TaggedBase().Immutable(),
+                MemoryRepresentation::Uint32(),
+                offsetof(WasmInternalFunction, call_target_));
     constexpr size_t entry_size_log2 =
         std::bit_width(sizeof(wasm::WasmCodePointerTableEntry)) - 1;
     return __ Load(

@@ -2797,8 +2797,8 @@ class ValueNode : public Node {
   const ValueNode* UnwrapIdentities() const;
 
   // Like UnwrapIdentities, but also unwraps phis with a single input (which are
-  // not exception phis or resumable loop phis), since the optimizer replaces
-  // those with their input.
+  // not exception phis, resumable loop phis, or former-loop hole phis), since
+  // the optimizer replaces those with their input.
   // TODO(dmercadier): Remove this if https://crrev.com/c/7117478 ever lands.
   ValueNode* UnwrapIdentitiesAndPhis();
 
@@ -5338,6 +5338,7 @@ class RootConstant : public FixedInputValueNodeT<0, RootConstant> {
   }
 
   bool ToBoolean(LocalIsolate* local_isolate) const;
+  bool IsAnyHole() const;
 
   RootIndex index() const { return index_; }
 
@@ -7986,9 +7987,11 @@ class MapPrototypeGet : public FixedInputValueNodeT<2, MapPrototypeGet> {
  public:
   explicit MapPrototypeGet(uint64_t bitfield) : Base(bitfield) {}
 
+  // Looking up a string key can allocate and internalize the key in place.
   static constexpr OpProperties kProperties =
       OpProperties::Call() | OpProperties::CanAllocate() |
-      OpProperties::CanRead() | OpProperties::TaggedValue();
+      OpProperties::CanRead() | OpProperties::CanWrite() |
+      OpProperties::TaggedValue();
   DECLARE_INPUTS(Table, Key)
   DECLARE_INPUT_TYPES(Tagged, Tagged)
 
@@ -8020,11 +8023,11 @@ class SetPrototypeHas : public FixedInputValueNodeT<2, SetPrototypeHas> {
  public:
   explicit SetPrototypeHas(uint64_t bitfield) : Base(bitfield) {}
 
-  // CanAllocate is needed, since finding strings in hash tables does an
-  // equality comparison which flattens strings.
+  // Looking up a string key can allocate and internalize the key in place.
   static constexpr OpProperties kProperties =
       OpProperties::Call() | OpProperties::CanAllocate() |
-      OpProperties::CanRead() | OpProperties::TaggedValue();
+      OpProperties::CanRead() | OpProperties::CanWrite() |
+      OpProperties::TaggedValue();
   DECLARE_INPUTS(Table, Key)
   DECLARE_INPUT_TYPES(Tagged, Tagged)
 
@@ -10010,8 +10013,11 @@ class DefineNamedOwnGeneric
     : public FixedInputValueNodeT<3, DefineNamedOwnGeneric> {
  public:
   explicit DefineNamedOwnGeneric(uint64_t bitfield, compiler::NameRef name,
+                                 bool in_literal,
                                  const compiler::FeedbackSource& feedback)
-      : Base(bitfield), name_(name), feedback_(feedback) {}
+      : Base(bitfield | InLiteralField::encode(in_literal)),
+        name_(name),
+        feedback_(feedback) {}
 
   // The implementation currently calls runtime.
   static constexpr OpProperties kProperties = OpProperties::JSCall();
@@ -10021,6 +10027,7 @@ class DefineNamedOwnGeneric
   compiler::NameRef name() const { return name_; }
   compiler::FeedbackSource feedback() const { return feedback_; }
 
+  bool in_literal() const { return InLiteralField::decode(bitfield()); }
 
   int MaxCallStackArgs() const;
   void SetValueLocationConstraints();
@@ -10028,6 +10035,7 @@ class DefineNamedOwnGeneric
   void PrintParams(std::ostream&) const;
 
  private:
+  using InLiteralField = NextBitField<bool, 1>;
   const compiler::NameRef name_;
   const compiler::FeedbackSource feedback_;
 };

@@ -355,13 +355,13 @@ void BreakLocation::AllAtCurrentStatement(
 Tagged<JSGeneratorObject> BreakLocation::GetGeneratorObjectForSuspendedFrame(
     JavaScriptFrame* frame) const {
   DCHECK(IsSuspend());
-  DCHECK_GE(generator_obj_reg_index_, 0);
+  SBXCHECK_GE(generator_obj_reg_index_, 0);
 
   Tagged<Object> generator_obj =
       UnoptimizedJSFrame::cast(frame)->ReadInterpreterRegister(
           generator_obj_reg_index_);
 
-  return Cast<JSGeneratorObject>(generator_obj);
+  return CheckedCast<JSGeneratorObject>(generator_obj);
 }
 
 int BreakLocation::BreakIndexFromCodeOffset(
@@ -427,7 +427,11 @@ BreakIterator::BreakIterator(Handle<DebugInfo> debug_info)
       break_index_(-1),
       source_position_iterator_(
           debug_info->DebugBytecodeArray(Isolate::Current())
-              ->SourcePositionTable()) {
+              ->SourcePositionTable()),
+      bytecode_iterator_(debug_info->OriginalBytecodeArray(Isolate::Current()),
+                         0, no_gc_) {
+  SBXCHECK_EQ(debug_info->DebugBytecodeArray(Isolate::Current())->length(),
+              debug_info->OriginalBytecodeArray(Isolate::Current())->length());
   position_ = debug_info->shared()->StartPosition();
   statement_position_ = position_;
   if (!Done()) Next();
@@ -464,6 +468,13 @@ void BreakIterator::Next() {
     DCHECK_LE(0, position_);
     DCHECK_LE(0, statement_position_);
 
+    while (!bytecode_iterator_.done() &&
+           bytecode_iterator_.current_offset() < code_offset()) {
+      bytecode_iterator_.Advance();
+    }
+    SBXCHECK(!bytecode_iterator_.done());
+    SBXCHECK_EQ(bytecode_iterator_.current_offset(), code_offset());
+
     DebugBreakType type = GetDebugBreakType();
     if (type != NOT_DEBUG_BREAK) break;
   }
@@ -471,16 +482,8 @@ void BreakIterator::Next() {
 }
 
 DebugBreakType BreakIterator::GetDebugBreakType() {
-  Tagged<BytecodeArray> bytecode_array =
-      debug_info_->OriginalBytecodeArray(Isolate::Current());
-  interpreter::Bytecode bytecode =
-      interpreter::Bytecodes::FromByte(bytecode_array->get(code_offset()));
-
-  // Make sure we read the actual bytecode, not a prefix scaling bytecode.
-  if (interpreter::Bytecodes::IsPrefixScalingBytecode(bytecode)) {
-    bytecode = interpreter::Bytecodes::FromByte(
-        bytecode_array->get(code_offset() + 1));
-  }
+  DCHECK_EQ(bytecode_iterator_.current_offset(), code_offset());
+  interpreter::Bytecode bytecode = bytecode_iterator_.current_bytecode();
 
   if (bytecode == interpreter::Bytecode::kDebugger) {
     return DEBUGGER_STATEMENT;
@@ -509,10 +512,8 @@ void BreakIterator::SkipToPosition(int position) {
 void BreakIterator::SetDebugBreak() {
   DCHECK(GetDebugBreakType() >= DEBUGGER_STATEMENT);
   Isolate* isolate = Isolate::Current();
-  HandleScope scope(isolate);
-  Handle<BytecodeArray> bytecode_array(debug_info_->DebugBytecodeArray(isolate),
-                                       isolate);
-  interpreter::BytecodeArrayIterator(bytecode_array, code_offset())
+  interpreter::BytecodeArrayIterator(debug_info_->DebugBytecodeArray(isolate),
+                                     code_offset(), no_gc_)
       .ApplyDebugBreak();
 }
 
@@ -539,19 +540,16 @@ BreakLocation BreakIterator::GetBreakLocation() {
     // index that holds the generator object by reading it directly off the
     // bytecode array, and we'll read the actual generator object off the
     // interpreter stack frame in GetGeneratorObjectForSuspendedFrame.
-    Tagged<BytecodeArray> bytecode_array =
-        debug_info_->OriginalBytecodeArray(isolate);
-    interpreter::BytecodeArrayIterator iterator(handle(bytecode_array, isolate),
-                                                code_offset());
-
-    DCHECK_EQ(iterator.current_bytecode(),
+    DCHECK_EQ(bytecode_iterator_.current_offset(), code_offset());
+    DCHECK_EQ(bytecode_iterator_.current_bytecode(),
               interpreter::Bytecode::kSuspendGenerator);
-    interpreter::Register generator_obj_reg = iterator.GetRegisterOperand(0);
+    interpreter::Register generator_obj_reg =
+        bytecode_iterator_.GetRegisterOperand(0);
     generator_object_reg_index = generator_obj_reg.index();
 
     // Also memorize the suspend ID, to be able to decide whether
     // we are paused on the implicit initial yield later.
-    generator_suspend_id = iterator.GetUnsignedImmediateOperand(3);
+    generator_suspend_id = bytecode_iterator_.GetUnsignedImmediateOperand(3);
   }
   return BreakLocation(code, type, code_offset(), position_,
                        generator_object_reg_index, generator_suspend_id);
@@ -748,12 +746,31 @@ void Debug::Break(JavaScriptFrame* frame,
   DebugScope debug_scope(this);
   DisableBreak no_recursive_break(this);
 
-  // Return if we fail to retrieve debug info.
   Handle<SharedFunctionInfo> shared(break_target->shared(), isolate_);
   if (!EnsureBreakInfo(shared)) return;
-  PrepareFunctionForDebugExecution(shared);
 
   Handle<DebugInfo> debug_info(TryGetDebugInfo(*shared).value(), isolate_);
+  if (!debug_info->CanBreakAtEntry()) {
+    SBXCHECK(frame->is_unoptimized_js());
+    Tagged<BytecodeArray> active_bytecode =
+        shared->GetActiveBytecodeArray(isolate_);
+    Tagged<BytecodeArray> frame_bytecode =
+        UnoptimizedJSFrame::cast(frame)->GetBytecodeArray();
+    SBXCHECK_EQ(active_bytecode, frame_bytecode);
+  }
+
+  PrepareFunctionForDebugExecution(shared);
+
+  if (debug_info->CanBreakAtEntry()) {
+    SBXCHECK(debug_info->BreakAtEntry());
+  } else {
+    SBXCHECK(debug_info->HasInstrumentedBytecodeArray());
+    Tagged<BytecodeArray> debug_bytecode =
+        debug_info->DebugBytecodeArray(isolate_);
+    Tagged<BytecodeArray> frame_bytecode =
+        UnoptimizedJSFrame::cast(frame)->GetBytecodeArray();
+    SBXCHECK_EQ(debug_bytecode, frame_bytecode);
+  }
 
   // Find the break location where execution has stopped.
   BreakLocation location = BreakLocation::FromFrame(debug_info, frame);
@@ -1539,8 +1556,10 @@ void Debug::PrepareStepOnThrow() {
         // functions, we have to check each one for the handler.
         // If it only contains one function, we already found the handler.
         if (summaries.size() > 1) {
+          if (!summary.IsJavaScript()) continue;
           DirectHandle<AbstractCode> code =
               summary.AsJavaScript().abstract_code();
+          if (code->kind() == CodeKind::BUILTIN) continue;
           CHECK_EQ(CodeKind::INTERPRETED_FUNCTION, code->kind());
           HandlerTable table(code->GetBytecodeArray());
           int code_offset = summary.code_offset();
@@ -1558,8 +1577,10 @@ void Debug::PrepareStepOnThrow() {
             current_frame_count > thread_local_.target_frame_count_) {
           continue;
         }
+        if (!summary.IsJavaScript()) continue;
         Handle<SharedFunctionInfo> info(
             summary.AsJavaScript().function()->shared(), isolate_);
+        if (!info->IsSubjectToDebugging()) continue;
         if (IsBlackboxed(info)) continue;
         FloodWithOneShot(info);
         return;
@@ -3642,8 +3663,9 @@ bool Debug::PerformSideEffectCheckAtBytecode(InterpretedFrame* frame) {
   std::optional<Tagged<DebugInfo>> debug_info = TryGetDebugInfo(shared);
   SBXCHECK(debug_info.has_value() &&
            debug_info.value()->HasInstrumentedBytecodeArray());
-  SBXCHECK_EQ(debug_info.value()->DebugBytecodeArray(isolate_),
-              frame->GetBytecodeArray());
+  Tagged<BytecodeArray> debug_bytecode =
+      debug_info.value()->DebugBytecodeArray(isolate_);
+  SBXCHECK_EQ(debug_bytecode, frame->GetBytecodeArray());
   Tagged<BytecodeArray> bytecode_array =
       debug_info.value()->OriginalBytecodeArray(isolate_);
   int offset = frame->GetBytecodeOffset();

@@ -4746,6 +4746,11 @@ bool LiftoffAssembler::emit_f16x8_neg(LiftoffRegister dst,
 
 bool LiftoffAssembler::emit_f16x8_sqrt(LiftoffRegister dst,
                                        LiftoffRegister src) {
+  if (UseAvx10_1()) {
+    CpuFeatureScope avx10_1_scope(this, AVX10_1);
+    vsqrtph(dst.fp(), src.fp());
+    return true;
+  }
   if (!CpuFeatures::IsSupported(F16C) || !CpuFeatures::IsSupported(AVX)) {
     return false;
   }
@@ -4936,12 +4941,22 @@ bool LiftoffAssembler::emit_f16x8_max(LiftoffRegister dst, LiftoffRegister lhs,
 
 bool LiftoffAssembler::emit_f16x8_pmin(LiftoffRegister dst, LiftoffRegister lhs,
                                        LiftoffRegister rhs) {
+  if (UseAvx10_1()) {
+    CpuFeatureScope avx10_1_scope(this, AVX10_1);
+    vminph(dst.fp(), rhs.fp(), lhs.fp());
+    return true;
+  }
   // Due to the way minps works, pmin(a, b) = minps(b, a).
   return F16x8BinOpViaF32<&Assembler::vminps>(this, dst, rhs, lhs);
 }
 
 bool LiftoffAssembler::emit_f16x8_pmax(LiftoffRegister dst, LiftoffRegister lhs,
                                        LiftoffRegister rhs) {
+  if (UseAvx10_1()) {
+    CpuFeatureScope avx10_1_scope(this, AVX10_1);
+    vmaxph(dst.fp(), rhs.fp(), lhs.fp());
+    return true;
+  }
   // Due to the way maxps works, pmax(a, b) = maxps(b, a).
   return F16x8BinOpViaF32<&Assembler::vmaxps>(this, dst, rhs, lhs);
 }
@@ -5187,6 +5202,8 @@ void LiftoffAssembler::RecordSpillsInSafepoint(
 }
 
 void LiftoffAssembler::DropStackSlotsAndRet(uint32_t num_stack_slots) {
+  // Like arm64's DropSlots, also drop the caller's padding slot (if any).
+  num_stack_slots = AddArgumentPaddingSlots(num_stack_slots);
   DCHECK_LT(num_stack_slots,
             (1 << 16) / kSystemPointerSize);  // 16 bit immediate
   ret(static_cast<int>(num_stack_slots * kSystemPointerSize));
@@ -5330,7 +5347,21 @@ void LiftoffAssembler::AssertOSREmpty() {
 void LiftoffStackSlots::Construct(int param_slots) {
   DCHECK_LT(0, slots_.size());
   SortInPushOrder();
-  int last_stack_slot = param_slots;
+  // With V8_X64_16BYTE_STACK_ALIGNMENT, the outgoing argument area must be an
+  // even number of slots so that rsp is still 16-byte aligned at the call.
+  // Like arm64 (which claims RoundUp(param_slots, 2)), the padding slot sits
+  // at the HIGHEST address, above the last stack parameter, so the parameters'
+  // offsets from rsp are unchanged:
+  //
+  //   | padding (uninit.) |  <- slot param_slots, only if param_slots is odd
+  //   | param slot n-1    |
+  //   | ...               |
+  //   | param slot 0      |  <- rsp at the call
+  //
+  // Wasm call descriptors already have an even slot count. For builtins with
+  // an odd count, the callee drops the padding slot on return (see
+  // CodeGenerator::AssembleReturn), like on arm64.
+  int last_stack_slot = AddArgumentPaddingSlots(param_slots);
   for (auto& slot : slots_) {
     const int stack_slot = slot.dst_slot_;
     int stack_decrement = (last_stack_slot - stack_slot) * kSystemPointerSize;

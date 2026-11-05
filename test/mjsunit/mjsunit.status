@@ -187,6 +187,7 @@
   # CRASH. See cctest.status for details (v8:13945).
   'verify-check-false': [FAIL, NO_VARIANTS, ['official_build', CRASH]],
   'verify-assert-false': [NO_VARIANTS, ['mode == release and dcheck_always_on == False', PASS], ['mode == debug', FAIL]],
+  'compiler/constant-field-hole-crash': [FAIL, NO_VARIANTS, ['official_build', CRASH]],
 
   ##############################################################################
   # Tests with different versions for release and debug.
@@ -713,6 +714,7 @@
   # test's cell rotation finishes before the broker reads the cell.
   'regress/regress-crbug-560233248': [SKIP],
   # Tests taking too long
+  'compiler/regress-580193566': [SKIP],
   'regress/regress-1122': [SKIP],
   'regress/regress-353551': [SKIP],
   'regress/regress-crbug-119926': [SKIP],
@@ -869,6 +871,7 @@
   'sandbox/regress/regress-349502157': [SKIP],
   'sandbox/regress/regress-572826713': [SKIP],
   'sandbox/regress/regress-574792351': [SKIP],
+  'sandbox/regress/regress-580519552': [SKIP],
   'sandbox/regress-537948358': [SKIP],
   'sandbox/regress-558640961': [SKIP],
   'sandbox/wasm-inlining-sigcheck': [SKIP],
@@ -1156,6 +1159,7 @@
   'regress/wasm/regress-408254017': [SKIP],
   'regress/wasm/regress-567481597': [SKIP],
   'regress/wasm/regress-578382523-2': [SKIP],
+  'regress/wasm/regress-578382734': [SKIP],
   'regress/wasm/regress-crbug-408253898': [SKIP],
 
   # --wasm-fp16
@@ -1211,6 +1215,7 @@
   'regress/wasm/regress-563427048*': [SKIP],
   'regress/wasm/regress-567171844': [SKIP],
   'regress/wasm/regress-572399718': [SKIP],
+  'regress/wasm/regress-574568994': [SKIP],
   'regress/wasm/regress-577267579': [SKIP],
   'wasm/custom-descriptors*': [SKIP],
   'wasm/exact-types': [SKIP],
@@ -3055,7 +3060,8 @@
   'regress/wasm/regress-365376497': [SKIP],
   'regress/wasm/regress-381917890': [SKIP],
   'regress/wasm/regress-392928805': [SKIP],
-  'regress/wasm/regress-394091686': [SKIP]
+  'regress/wasm/regress-394091686': [SKIP],
+  'regress/wasm/regress-578382734': [SKIP]
 }],  # (arch == mips64el)
 
 ##############################################################################
@@ -3268,7 +3274,8 @@
   'regress/wasm/regress-349640002': [SKIP],
   'regress/wasm/regress-364667545': [SKIP],
   'regress/wasm/regress-361123483': [SKIP],
-  'regress/wasm/regress-361717714': [SKIP]
+  'regress/wasm/regress-361717714': [SKIP],
+  'regress/wasm/regress-578382734': [SKIP]
 }],  # cet_shadow_stack
 
 ##############################################################################

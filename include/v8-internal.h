@@ -616,6 +616,7 @@ enum class ManagedTypeId : uint32_t {
   kD8Worker,
   kD8ModuleEmbedderData,
   kD8AsyncHooksWrap,
+  kCodeCacheForTesting,
 };
 
 #define SHARED_MANAGED_TAG_LIST(V) V(WasmFutexManagedObjectWaitListTag)
@@ -741,8 +742,6 @@ enum ExternalPointerTag : uint16_t {
 
   kLastMaybeReadOnlyExternalPointerTag = kLastInterceptorInfoExternalPointerTag,
 
-  kWasmStackMemoryTag,
-
 #define AS_ENUM(name) k##name,
   FOREIGN_TAG_LIST(AS_ENUM)
 
@@ -750,6 +749,7 @@ enum ExternalPointerTag : uint16_t {
 
   // External resources whose lifetime is tied to their entry in the
   // external pointer table but which are not referenced via a Managed
+  kWasmStackMemoryTag,
   kArrayBufferExtensionTag,
   kLastManagedResourceTag = kArrayBufferExtensionTag,
 

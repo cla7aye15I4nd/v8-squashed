@@ -1594,6 +1594,7 @@ SandboxTesting::InstanceTypeMap& SandboxTesting::GetInstanceTypeMap() {
     types["MAP_TYPE"] = MAP_TYPE;
     types["CLASS_BOILERPLATE_TYPE"] = CLASS_BOILERPLATE_TYPE;
 #ifdef V8_ENABLE_WEBASSEMBLY
+    types["WASM_CONTINUATION_OBJECT_TYPE"] = WASM_CONTINUATION_OBJECT_TYPE;
     types["WASM_FUNC_REF_TYPE"] = WASM_FUNC_REF_TYPE;
     types["WASM_GLOBAL_OBJECT_TYPE"] = WASM_GLOBAL_OBJECT_TYPE;
     types["WASM_INSTANCE_OBJECT_TYPE"] = WASM_INSTANCE_OBJECT_TYPE;
@@ -1683,6 +1684,7 @@ SandboxTesting::FieldOffsetMap& SandboxTesting::GetFieldOffsetMap() {
         offsetof(SharedFunctionInfo, script_);
     fields[SHARED_FUNCTION_INFO_TYPE]["unique_id"] =
         offsetof(SharedFunctionInfo, unique_id_);
+    fields[SCRIPT_TYPE]["source"] = offsetof(Script, source_);
     fields[SCRIPT_TYPE]["wasm_managed_native_module"] =
         offsetof(Script, eval_from_position_);
     fields[JS_PROMISE_TYPE]["reactions_or_result"] =
@@ -1708,6 +1710,8 @@ SandboxTesting::FieldOffsetMap& SandboxTesting::GetFieldOffsetMap() {
         offsetof(JSSegments, icu_iterator_with_text_);
 #endif  // V8_INTL_SUPPORT
 #ifdef V8_ENABLE_WEBASSEMBLY
+    fields[WASM_CONTINUATION_OBJECT_TYPE]["stack_obj"] =
+        offsetof(WasmContinuationObject, stack_obj_);
     fields[WASM_FUNC_REF_TYPE]["trusted_internal"] =
         offsetof(WasmFuncRef, trusted_internal_);
     fields[WASM_GLOBAL_OBJECT_TYPE]["buffer"] =

@@ -311,25 +311,59 @@ bool ScopeIterator::InPausedFunctionScopes() const {
   return false;
 }
 
+bool ScopeIterator::ContextBelongsToCurrentScript() const {
+  if (!HasScope()) return true;
+
+  const bool closure_created_in_own_context =
+      current_scope().is_script_scope() || current_scope().is_module_scope();
+
+  // 1. While we are still inside the scopes of the paused function,
+  // *context_ == UnwrapEvaluationContext(function_->context()) indicates that
+  // none of the paused function's own contexts have been pushed yet (e.g.
+  // pausing in a function before context allocation). Top-level script and
+  // module functions are the exception because they execute directly within
+  // their own ScriptContext / ModuleContext.
+  if (InPausedFunctionScopes()) {
+    if (!closure_created_in_own_context &&
+        *context_ == UnwrapEvaluationContext(function_->context())) {
+      return false;
+    }
+    return true;
+  }
+
+  // 2. If the current script is a direct eval script, walk the caller's
+  // ScopeInfo chain. If context_ matches the eval call site's ScopeInfo or any
+  // enclosing caller scope, the runtime context chain has already unwound into
+  // the caller script, so context_ does not belong to script_.
+  if (script_->has_eval_from_scope_info()) {
+    Tagged<ScopeInfo> eval_caller =
+        Cast<ScopeInfo>(script_->eval_from_scope_info());
+    while (true) {
+      if (context_->scope_info() == eval_caller) return false;
+      if (!eval_caller->HasOuterScopeInfo()) break;
+      eval_caller = eval_caller->OuterScopeInfo();
+    }
+  }
+
+  // 3. For any other inner scope not in the paused function, reaching a
+  // NativeContext, ScriptContext, or ModuleContext means all runtime contexts
+  // allocated by the current script have been unwound, unless current_scope()
+  // is itself the top-level script or module scope.
+  if (!closure_created_in_own_context &&
+      (IsNativeContext(*context_) || context_->IsScriptContext() ||
+       context_->IsModuleContext())) {
+    return false;
+  }
+
+  return true;
+}
+
 bool ScopeIterator::HasContext() const {
   if (HasScope() && NeedsContext()) {
     // In rare cases we pause in a scope that doesn't have its context pushed
     // yet. E.g. when pausing in for-of loop headers (see
     // https://crbug.com/399002824).
-    //
-    // While we are still in the scopes of the paused function, the function's
-    // creation context means that none of the function's own contexts have
-    // been pushed. Check this first: the creation context can belong to a
-    // different script (the caller of a direct eval), so comparing scope IDs,
-    // which are only unique within a script, would be meaningless.
-    // Top-level script and module functions are the exception: they are
-    // created with the script/module context as their context.
-    const bool closure_created_in_own_context =
-        current_scope().is_script_scope() || current_scope().is_module_scope();
-    if (!closure_created_in_own_context && InPausedFunctionScopes() &&
-        *context_ == UnwrapEvaluationContext(function_->context())) {
-      return false;
-    }
+    if (!ContextBelongsToCurrentScript()) return false;
 
     // Otherwise, context_ belongs to the same script as current_scope() and
     // we can detect a not-yet-pushed context by comparing the scope ID of the
@@ -373,49 +407,48 @@ void ScopeIterator::AdvanceOneContext() {
 void ScopeIterator::AdvanceScope() {
   DCHECK(HasScope());
 
-  do {
+  if (NeedsAndHasContext()) {
+    // current_scope() needs a context so moving one scope up requires us to
+    // also move up one context.
+    AdvanceOneContext();
+  }
+
+  const DebugScriptScope origin = current_scope();
+  for (std::optional<DebugScriptScope> parent = origin.parent();
+       parent.has_value(); parent = parent->parent()) {
+    current_scope_index_ = parent->scope_index();
+    if (IsDebuggerVisibleParent(origin, *parent)) {
+      return;
+    }
     if (NeedsAndHasContext()) {
-      // current_scope() needs a context so moving one scope up requires us to
-      // also move up one context.
       AdvanceOneContext();
     }
+  }
 
-    if (std::optional<DebugScriptScope> parent = current_scope().parent()) {
-      if (current_scope().scope_type() != BLOCK_SCOPE && parent->is_hidden() &&
-          parent->variable_count() > 0) {
-        current_scope_index_ = parent->scope_index();
-        break;
-      }
-      current_scope_index_ = parent->scope_index();
-      continue;
-    }
-
-    if (std::optional<DebugScriptScope> outer =
-            FindEvalOuterScope(isolate_, script_)) {
-      // The root scope of the paused script is either the closure scope itself
-      // or one of its ancestors, so we have left the paused function by now.
-      // Reset `function_` right away: `closure_scope_index_` indexes into the
-      // paused script's scope tree, so comparing it with `current_scope_index_`
-      // in the caller's script tree is meaningless (e.g. both are 0 when
-      // pausing in the top-level code of a direct eval called from another
-      // eval's top-level code).
-      // Do not skip `outer` if `outer->is_hidden()` is true: like
-      // `TryParseAndRetrieveScopes()`, `FindEvalOuterScope()` lands on the
-      // innermost scope at the eval call site (such as the outer block scope
-      // of a `for (let ...)` loop when eval is called in the initializer).
-      function_ = Handle<JSFunction>();
-      script_ =
-          handle(Cast<Script>(script_->eval_from_shared()->script()), isolate_);
-      debug_scope_info_ = handle(*outer->info(), isolate_);
-      current_scope_index_ = outer->scope_index();
-    } else {
-      // We left the root of the outermost scope tree we can reach (e.g. the
-      // root of an indirect eval, a `new Function` or a wrapped function).
-      // Continue with the runtime context chain.
-      current_scope_index_ = -1;
-    }
-    break;
-  } while (current_scope().is_hidden());
+  if (std::optional<DebugScriptScope> outer =
+          FindEvalOuterScope(isolate_, script_)) {
+    // The root scope of the paused script is either the closure scope itself
+    // or one of its ancestors, so we have left the paused function by now.
+    // Reset `function_` right away: `closure_scope_index_` indexes into the
+    // paused script's scope tree, so comparing it with `current_scope_index_`
+    // in the caller's script tree is meaningless (e.g. both are 0 when
+    // pausing in the top-level code of a direct eval called from another
+    // eval's top-level code).
+    // Do not skip `outer` if `outer->is_hidden()` is true: like
+    // `TryParseAndRetrieveScopes()`, `FindEvalOuterScope()` lands on the
+    // innermost scope at the eval call site (such as the outer block scope
+    // of a `for (let ...)` loop when eval is called in the initializer).
+    function_ = Handle<JSFunction>();
+    script_ =
+        handle(Cast<Script>(script_->eval_from_shared()->script()), isolate_);
+    debug_scope_info_ = handle(*outer->info(), isolate_);
+    current_scope_index_ = outer->scope_index();
+  } else {
+    // We left the root of the outermost scope tree we can reach (e.g. the
+    // root of an indirect eval, a `new Function` or a wrapped function).
+    // Continue with the runtime context chain.
+    current_scope_index_ = -1;
+  }
 }
 
 void ScopeIterator::AdvanceContext() { AdvanceOneContext(); }
@@ -726,13 +759,25 @@ int ScopeIterator::GetSourcePosition() const {
   }
 }
 
-bool ScopeIterator::IsLocalInTdz(VariableMode mode, Tagged<Object> value,
-                                 int initializer_position) const {
+bool ScopeIterator::IsLocalInTdz(const DebugVariableInfo& var,
+                                 Tagged<Object> value) const {
   if (IsTheHole(value) || IsTdzHole(value)) return true;
-  if (IsLexicalVariableMode(mode) && IsUndefined(value) &&
-      initializer_position != kNoSourcePosition &&
+  // When hole initialization is elided (var.is_hole_initialization_elided),
+  // the stack register holds `undefined` before the declaration runs instead
+  // of an actual TdzHole. In that case we intentionally use the lightweight
+  // static GetSourcePosition() <= var.initializer_position heuristic rather
+  // than scanning BytecodeArray and SourcePositionTable in the debugger. In
+  // multi-binding destructuring declarations (`let [a, b = (debugger, 2)] =
+  // [undefined]`), ParserBase::ParseVariableDeclarations assigns the end
+  // position of the entire declaration as initializer_position for all
+  // bindings in the pattern, so earlier bindings initialized to `undefined`
+  // conservatively appear unavailable (<value unavailable>) on read-side
+  // scope inspection while paused mid-declaration until the declaration
+  // finishes. We consider this edge case working as intended.
+  if (var.is_hole_initialization_elided && IsUndefined(value) &&
+      var.initializer_position != kNoSourcePosition &&
       GetSourcePosition() != kNoSourcePosition &&
-      GetSourcePosition() <= initializer_position) {
+      GetSourcePosition() <= var.initializer_position) {
     return true;
   }
   return false;
@@ -906,7 +951,7 @@ bool ScopeIterator::VisitLocals(const Visitor& visitor, Mode mode,
           CHECK_LT(static_cast<uint32_t>(index),
                    parameters_and_registers->ulength().value());
           value = handle(parameters_and_registers->get(index), isolate_);
-          if (IsLocalInTdz(var.mode, *value, var.initializer_position)) {
+          if (IsLocalInTdz(var, *value)) {
             value = isolate_->factory()->tdz_hole_value();
           }
         } else {
@@ -922,7 +967,7 @@ bool ScopeIterator::VisitLocals(const Visitor& visitor, Mode mode,
                 args_index == var.index) {
               continue;
             }
-          } else if (IsLocalInTdz(var.mode, *value, var.initializer_position)) {
+          } else if (IsLocalInTdz(var, *value)) {
             // Variables that are `undefined` could also mean an elided hole
             // write. We explicitly check the static scope information if we
             // are currently stopped before the variable is actually initialized
@@ -1121,7 +1166,35 @@ bool ScopeIterator::SetLocalVariableValue(DirectHandle<String> variable_name,
             CHECK_LT(static_cast<uint32_t>(index),
                      parameters_and_registers->ulength().value());
             Tagged<Object> current_val = parameters_and_registers->get(index);
-            if (IsLocalInTdz(var.mode, current_val, var.initializer_position)) {
+            // Intentional: SetLocalVariableValue intentionally checks only
+            // actual hole values (IsTheHole / IsTdzHole) and does not call
+            // IsLocalInTdz:
+            // 1. Context, script, and module lexical slots never elide TdzHole
+            //    initialization, and writing over TdzHole via Context::Set
+            //    would wrap a kNotAssigned (NoCell) slot in a ContextCell
+            //    (leaking a raw ContextCell to JS).
+            // 2. Stack and suspended-generator VariableLocation::LOCAL
+            //    registers only emit TdzHole when a path before or across the
+            //    initializer can read the register
+            //    (Variable::binding_needs_init()); otherwise TdzHole
+            //    initialization is elided and the register holds `undefined`
+            //    until the initializer runs.
+            // 3. Calling IsLocalInTdz here falsely rejected valid debugger
+            //    writes to already-initialized `undefined` locals (such as in
+            //    switch scopes where initializer_position is kMaxInt, or
+            //    earlier bindings in multi-binding destructuring declarations
+            //    where initializer_position is the end of the declaration).
+            // 4. Working as intended (WAI): While overwriting `undefined` with
+            //    another value in an elided-TDZ register via
+            //    SetLocalVariableValue is theoretically observable (e.g. to a
+            //    subsequent debugger read via VisitLocals /
+            //    DebugEvaluate::Local before the initializer runs, since
+            //    IsLocalInTdz only checks IsUndefined(value)), it cannot
+            //    violate VM, compiler, deoptimization, or ContextCell
+            //    invariants and is overwritten when the initializer executes.
+            //    We intentionally do not care about this edge case and consider
+            //    it working as intended.
+            if (IsTheHole(current_val) || IsTdzHole(current_val)) {
               return false;
             }
             parameters_and_registers->set(index, *new_value);
@@ -1135,8 +1208,9 @@ bool ScopeIterator::SetLocalVariableValue(DirectHandle<String> variable_name,
             DirectHandle<Object> current_val =
                 frame_inspector_->GetExpression(index);
             if (IsOptimizedOut(*current_val)) return false;
-            if (IsLocalInTdz(var.mode, *current_val,
-                             var.initializer_position)) {
+            // Intentional: As explained above, check only actual hole values
+            // for stack registers.
+            if (IsTheHole(*current_val) || IsTdzHole(*current_val)) {
               return false;
             }
             frame->SetExpression(index, *new_value);

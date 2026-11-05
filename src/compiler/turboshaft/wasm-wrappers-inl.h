@@ -67,10 +67,8 @@ auto WasmWrapperTSGraphBuilder<Assembler>::BuildChangeInt32ToNumber(
 template <typename Assembler>
 auto WasmWrapperTSGraphBuilder<Assembler>::BuildToJSFunctionRef(
     V<WasmFuncRef> ret, V<Context> context) -> V<Object> {
-  V<WasmInternalFunction> internal = V<WasmInternalFunction>::Cast(
-      __ LoadTrustedPointer(ret, LoadOp::Kind::TaggedBase(),
-                            kWasmInternalFunctionTrustedPointerTag,
-                            offsetof(WasmFuncRef, trusted_internal_)));
+  V<WasmInternalFunction> internal = this->LoadInternalFunctionFromFuncRef(
+      ret, LoadOp::Kind::TaggedBase().Immutable());
   V<Object> maybe_external = __ Load(internal, LoadOp::Kind::TaggedBase(),
                                      MemoryRepresentation::TaggedPointer(),
                                      offsetof(WasmInternalFunction, external_));
@@ -274,8 +272,8 @@ auto WasmWrapperTSGraphBuilder<Assembler>::ConvertWasmResultsToJS(
 
 template <typename Assembler>
 auto WasmWrapperTSGraphBuilder<Assembler>::BuildJSToWasmWrapper(
-    V<JSFunction> js_closure, V<Context> js_context,
-    base::Vector<const OpIndex> arguments,
+    IndirectHandle<WasmInternalFunction> inlined_internal_function,
+    V<Context> js_context, base::Vector<const OpIndex> arguments,
     OptionalV<LazyFrameState> lazy_frame_state,
     compiler::LazyDeoptOnThrow lazy_deopt_on_throw,
     OptionalV<EagerFrameState> caller_frame_state) -> V<Any> {
@@ -284,7 +282,7 @@ auto WasmWrapperTSGraphBuilder<Assembler>::BuildJSToWasmWrapper(
   DCHECK_NOT_NULL(__ data()->isolate());
 
   // All parameters are set if and only if we are inlining the wrapper.
-  DCHECK_EQ(is_inlining_into_js_, js_closure.valid());
+  DCHECK_EQ(is_inlining_into_js_, !inlined_internal_function.is_null());
   DCHECK_EQ(is_inlining_into_js_, js_context.valid());
   DCHECK_EQ(is_inlining_into_js_, lazy_frame_state.valid());
   DCHECK_IMPLIES(!is_inlining_into_js_, arguments.empty());
@@ -297,6 +295,7 @@ auto WasmWrapperTSGraphBuilder<Assembler>::BuildJSToWasmWrapper(
 
   __ Bind(__ NewBlock());
 
+  V<JSFunction> js_closure = OpIndex::Invalid();
   base::SmallVector<OpIndex, 16> params(wasm_param_count);
   const int param_offset = 1;  // Skip the JS receiver.
   if (is_inlining_into_js_) {
@@ -375,18 +374,32 @@ auto WasmWrapperTSGraphBuilder<Assembler>::BuildJSToWasmWrapper(
 
   // If the wasm function was not inlined, we need to call it.
   if (!inlining_result.success) {
-    V<SharedFunctionInfo> sfi = LoadSharedFunctionInfo(js_closure);
-    V<WasmFunctionData> function_data =
-        V<WasmFunctionData>::Cast(__ LoadTrustedPointer(
-            sfi, LoadOp::Kind::TaggedBase().Immutable(),
-            kWasmExportedFunctionDataTrustedPointerTag,
-            offsetof(SharedFunctionInfo, trusted_function_data_)));
-    V<WasmInternalFunction> internal =
-        V<WasmInternalFunction>::Cast(__ LoadProtectedPointerField(
-            function_data, LoadOp::Kind::TaggedBase().Immutable(),
-            offsetof(WasmFunctionData, protected_internal_)));
-    auto [target, implicit_arg] =
-        this->BuildFunctionTargetAndImplicitArg(internal);
+    V<Word32> target;
+    V<ExposedTrustedObject> implicit_arg;
+    if (is_inlining_into_js_) {
+      // When inlining into JS, the target Wasm function is statically known, so
+      // bake in its call target and `implicit_arg` as constants instead of
+      // loading them through the JS closure at runtime.
+      std::tie(target, implicit_arg) =
+          this->BuildFunctionTargetAndImplicitArg(inlined_internal_function);
+    } else {
+      // Standalone compiled wrappers are shared across exported Wasm functions
+      // with the same signature, so load `WasmInternalFunction` from the
+      // `js_closure` parameter at runtime.
+      DCHECK(js_closure.valid());
+      V<SharedFunctionInfo> sfi = LoadSharedFunctionInfo(js_closure);
+      V<WasmFunctionData> function_data =
+          V<WasmFunctionData>::Cast(__ LoadTrustedPointer(
+              sfi, LoadOp::Kind::TaggedBase().Immutable(),
+              kWasmExportedFunctionDataTrustedPointerTag,
+              offsetof(SharedFunctionInfo, trusted_function_data_)));
+      V<WasmInternalFunction> internal =
+          V<WasmInternalFunction>::Cast(__ LoadProtectedPointerField(
+              function_data, LoadOp::Kind::TaggedBase().Immutable(),
+              offsetof(WasmFunctionData, protected_internal_)));
+      std::tie(target, implicit_arg) =
+          this->BuildFunctionTargetAndImplicitArg(internal);
+    }
     args[0] = implicit_arg;
     BuildCallWasmFromWrapper(__ phase_zone(), sig_, target, VectorOf(args),
                              base::VectorOf(returns), lazy_frame_state,
@@ -401,9 +414,9 @@ auto WasmWrapperTSGraphBuilder<Assembler>::BuildJSToWasmWrapper(
 template <typename Assembler>
 void WasmWrapperTSGraphBuilder<Assembler>::BuildJSToWasmWrapper() {
   DCHECK(!is_inlining_into_js_);
-  V<Any> result = BuildJSToWasmWrapper(
-      OpIndex::Invalid(), OpIndex::Invalid(), {}, {},
-      compiler::LazyDeoptOnThrow{false}, OpIndex::Invalid());
+  V<Any> result = BuildJSToWasmWrapper({}, OpIndex::Invalid(), {}, {},
+                                       compiler::LazyDeoptOnThrow{false},
+                                       OpIndex::Invalid());
   if (result.valid()) {  // Invalid signature.
     __ Return(result);
   }
@@ -639,12 +652,9 @@ void WasmWrapperTSGraphBuilder<Assembler>::BuildWasmStackEntryWrapper() {
   AbortIfNot(
       __ HasInstanceType(func_ref, WASM_FUNC_REF_TYPE, SharedFlag{false}),
       AbortReason::kUnexpectedInstanceType);
-  V<WasmInternalFunction> internal_function = V<WasmInternalFunction>::Cast(
-      __ LoadTrustedPointer(func_ref, LoadOp::Kind::TaggedBase().Immutable(),
-                            kWasmInternalFunctionTrustedPointerTag,
-                            offsetof(WasmFuncRef, trusted_internal_)));
-  auto [target, instance] =
-      this->BuildFunctionTargetAndImplicitArg(internal_function);
+  auto [target, instance] = this->BuildFunctionTargetAndImplicitArg(
+      this->LoadInternalFunctionFromFuncRef(
+          func_ref, LoadOp::Kind::TaggedBase().Immutable()));
 
   base::Vector<OpIndex> args =
       __ phase_zone()

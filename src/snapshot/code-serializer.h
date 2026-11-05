@@ -14,6 +14,7 @@
 #include "src/snapshot/snapshot-data.h"
 #include "src/snapshot/snapshot-source-sink.h"
 #include "src/snapshot/trusted-section-serializer.h"
+#include "src/utils/allocation.h"
 #include "src/utils/sha-256.h"
 
 namespace v8 {
@@ -54,6 +55,25 @@ class V8_EXPORT_PRIVATE AlignedCachedData {
   bool rejected_ : 1;
   const uint8_t* data_;
   int length_;
+};
+
+// For code cache fuzzing. A copy of a code cache that ends right before an
+// inaccessible page, which the sandbox crash filter treats as safe to read.
+// Reads outside the sandbox are not part of the attacker model, but the filter
+// would still report them, and a truncated or malformed untrusted section
+// easily causes small reads past its end.
+class V8_EXPORT_PRIVATE GuardedCodeCacheForTesting final {
+ public:
+  GuardedCodeCacheForTesting(const uint8_t* data, int length);
+  ~GuardedCodeCacheForTesting();
+
+  const uint8_t* data() const { return data_.begin(); }
+  int length() const { return data_.length(); }
+
+ private:
+  VirtualMemory memory_;
+  Address guard_page_ = kNullAddress;
+  base::Vector<const uint8_t> data_;
 };
 
 typedef v8::ScriptCompiler::CachedData::CompatibilityCheckResult
@@ -111,19 +131,15 @@ class SerializedCodeData : public SerializedData {
   // The data header consists of uint32_t-sized entries (except for the 256-bit
   // source hash):
   static constexpr uint32_t kVersionHashOffset =
-      kMagicNumberOffset + kUInt32Size;
+      kTrustedPayloadLengthOffset + kUInt32Size;
   static constexpr uint32_t kSourceHashOffset =
       kVersionHashOffset + kUInt32Size;
   static constexpr uint32_t kFlagHashOffset =
       kSourceHashOffset + kSizeOfSha256Digest;
   static constexpr uint32_t kReadOnlySnapshotChecksumOffset =
       kFlagHashOffset + kUInt32Size;
-  static constexpr uint32_t kPayloadLengthOffset =
-      kReadOnlySnapshotChecksumOffset + kUInt32Size;
-  static constexpr uint32_t kTrustedPayloadLengthOffset =
-      kPayloadLengthOffset + kUInt32Size;
   static constexpr uint32_t kChecksumOffset =
-      kTrustedPayloadLengthOffset + kUInt32Size;
+      kReadOnlySnapshotChecksumOffset + kUInt32Size;
   static constexpr uint32_t kUnalignedHeaderSize =
       kChecksumOffset + kUInt32Size;
   static constexpr uint32_t kHeaderSize =
@@ -226,6 +242,16 @@ class CodeSerializer : public Serializer {
       BackgroundMergeTask* background_merge_task = nullptr);
 
   SourceHash source_hash() const { return source_hash_; }
+
+  // For %GetCodeCache and %ConsumeCodeCache. Returns the untrusted section of
+  // `cache`.
+  static base::Vector<const uint8_t> UntrustedPayloadForTesting(
+      base::Vector<const uint8_t> cache);
+  // Returns `header_and_trusted_section`, followed by `untrusted` and padding,
+  // with the payload length updated.
+  static std::vector<uint8_t> WithUntrustedPayloadForTesting(
+      base::Vector<const uint8_t> header_and_trusted_section,
+      base::Vector<const uint8_t> untrusted);
 
  protected:
   CodeSerializer(Isolate* isolate, SourceHash source_hash);

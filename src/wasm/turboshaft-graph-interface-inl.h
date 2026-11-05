@@ -13,6 +13,7 @@
 // Include the non-inl header before the rest of the headers.
 
 #include "src/base/logging.h"
+#include "src/wasm/wasm-objects-inl.h"
 
 namespace v8::internal::wasm {
 
@@ -105,6 +106,15 @@ auto WasmGraphBuilderBase<Assembler>::BuildImportedFunctionTargetAndImplicitArg(
 }
 
 template <typename Assembler>
+inline auto WasmGraphBuilderBase<Assembler>::LoadInternalFunctionFromFuncRef(
+    V<WasmFuncRef> func_ref, LoadOp::Kind load_kind)
+    -> V<WasmInternalFunction> {
+  return V<WasmInternalFunction>::Cast(__ LoadTrustedPointer(
+      func_ref, load_kind, kWasmInternalFunctionTrustedPointerTag,
+      offsetof(WasmFuncRef, trusted_internal_)));
+}
+
+template <typename Assembler>
 inline auto WasmGraphBuilderBase<Assembler>::BuildFunctionTargetAndImplicitArg(
     V<WasmInternalFunction> internal_function)
     -> std::pair<V<Word32>, V<ExposedTrustedObject>> {
@@ -116,8 +126,22 @@ inline auto WasmGraphBuilderBase<Assembler>::BuildFunctionTargetAndImplicitArg(
   V<Word32> target =
       __ Load(internal_function, LoadOp::Kind::TaggedBase().Immutable(),
               MemoryRepresentation::Uint32(),
-              offsetof(WasmInternalFunction, raw_call_target_));
+              offsetof(WasmInternalFunction, call_target_));
 
+  return {target, implicit_arg};
+}
+
+template <typename Assembler>
+inline auto WasmGraphBuilderBase<Assembler>::BuildFunctionTargetAndImplicitArg(
+    DirectHandle<WasmInternalFunction> internal_function)
+    -> std::pair<V<Word32>, V<ExposedTrustedObject>> {
+  DCHECK(!__ data()->is_wasm());
+  DCHECK_NOT_NULL(__ data()->broker());
+  V<ExposedTrustedObject> implicit_arg = V<ExposedTrustedObject>::Cast(
+      __ HeapConstant(__ data()->broker()->CanonicalPersistentHandle(
+          internal_function->implicit_arg())));
+  V<Word32> target =
+      __ Word32Constant(internal_function->call_target().value());
   return {target, implicit_arg};
 }
 

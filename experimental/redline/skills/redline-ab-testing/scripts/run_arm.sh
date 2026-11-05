@@ -3,14 +3,16 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 #
-# Starts one arm of a fair comparison. All arms get the same d8, the same
-# timeout and the same number of workers. The d8 flags come from the preset
+# Starts one arm of a fair comparison. All arms get the same timeout and the
+# same number of workers. The Redline arms get the same d8. The fuzzilli arm
+# needs a d8 of the same revision built with v8_fuzzilli=true: fuzzilli/d8 of
+# a bundle, or the d8 that TARGET names. The d8 flags come from the preset
 # file in PRESETS, so all arms with the same PRESETS get the same flags.
 #
 # Usage: run_arm.sh ARM TARGET OUT DURATION_SEC [SEED]
-#   ARM     redline-normal, redline-diff or fuzzilli
+#   ARM     redline-normal, redline-change or fuzzilli
 #   TARGET  a bug bundle (see the redline-bug-reinjection skill), or a d8
-#           binary for the coverage setup. redline-diff needs a bundle.
+#           binary for the coverage setup. redline-change needs a bundle.
 #   OUT     the output directory. It must not exist.
 #   SEED    the random seed of Redline (default 1)
 # Environment:
@@ -48,12 +50,14 @@ if [ -d "$TARGET" ]; then
   BUNDLE=$TARGET
   BITS=$BUNDLE/bits/d8
   COUNTERS=$BUNDLE/counters/d8
+  FUZZILLI_D8=$BUNDLE/fuzzilli/d8
   DEFAULT_PRESET=maglev
   [ -f "$BUNDLE/preset" ] && DEFAULT_PRESET=$(cat "$BUNDLE/preset")
 else
   BUNDLE=""
   BITS=$TARGET
   COUNTERS=""
+  FUZZILLI_D8=$TARGET
   DEFAULT_PRESET=maglev
 fi
 [ -x "$BITS" ] || { echo "no d8 at $BITS" >&2; exit 1; }
@@ -80,7 +84,7 @@ fi
 
 D8_USED=$BITS
 case "$ARM" in
-  redline-normal|redline-diff)
+  redline-normal|redline-change)
     [ -x "${REDLINE:-}" ] || { echo "set REDLINE to the redline binary" >&2; exit 1; }
     TOOL=$REDLINE
     COMMON=(--d8-args="$BASE" --preset="$PRESET" --timeout-ms="$TIMEOUT_MS"
@@ -97,7 +101,7 @@ case "$ARM" in
       CMD=("$REDLINE" fuzz --d8="$BITS" "${COMMON[@]}" --d8-extra-args="$EXTRA")
     else
       [ -n "$BUNDLE" ] && [ -x "$COUNTERS" ] && [ -f "$BUNDLE/targets.json" ] || {
-        echo "redline-diff needs a bundle with counters/d8 and targets.json" >&2
+        echo "redline-change needs a bundle with counters/d8 and targets.json" >&2
         exit 1
       }
       D8_USED=$COUNTERS
@@ -111,6 +115,8 @@ case "$ARM" in
       echo "Fuzzilli cannot import JavaScript seed files directly. Run all arms without seeds." >&2
       exit 1
     fi
+    [ -x "$FUZZILLI_D8" ] || { echo "no d8 of Fuzzilli at $FUZZILLI_D8" >&2; exit 1; }
+    D8_USED=$FUZZILLI_D8
     TOOL=$FUZZILLI
     read -r -a FZ_ARGS <<< "${FUZZILLI_ARGS:---corpus=rarity --workerDelay=0}"
     CMD=("$FUZZILLI" --profile=v8 --storagePath="$OUT" "${FZ_ARGS[@]}"
@@ -123,9 +129,9 @@ case "$ARM" in
     if [ "${RANDOM_FLAGS:-0}" = 1 ]; then
       CMD+=(--argumentRandomization)
     fi
-    CMD+=("$BITS") ;;
+    CMD+=("$FUZZILLI_D8") ;;
   *)
-    echo "unknown arm $ARM (redline-normal, redline-diff or fuzzilli)" >&2
+    echo "unknown arm $ARM (redline-normal, redline-change or fuzzilli)" >&2
     exit 2 ;;
 esac
 

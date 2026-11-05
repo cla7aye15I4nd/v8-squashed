@@ -1153,7 +1153,8 @@ class CallSiteBuilder {
   bool IsStrictFrame(DirectHandle<JSFunction> function) {
     if (!encountered_strict_function_) {
       encountered_strict_function_ =
-          is_strict(function->shared()->language_mode());
+          is_strict(function->shared()->language_mode()) ||
+          function->shared()->IsApiFunction();
     }
     return encountered_strict_function_;
   }
@@ -3583,13 +3584,13 @@ void Isolate::PrintCurrentStackTrace(
                               SKIP_NONE, factory()->undefined_value());
   frames = CallSiteInfo::ExpandDeferredFrames(this, frames);
 
-  IncrementalStringBuilder builder(this);
   uint32_t frame_count =
       frames->ulength().value() / CallSiteInfo::Fields::kCount;
   for (uint32_t i = 0; i < frame_count; ++i) {
     DirectHandle<CallSiteInfo> frame =
         CallSiteInfo::ConstructFromRawData(this, frames, i);
 
+    bool include_frame = true;
     if (should_include_frame_callback) {
       Tagged<Object> raw_script_name = frame->GetScriptNameOrSourceURL();
       v8::Local<v8::String> script_name_local;
@@ -3602,21 +3603,24 @@ void Isolate::PrintCurrentStackTrace(
       } else {
         script_name_local = v8::String::Empty(v8_isolate);
       }
-
-      if (should_include_frame_callback(v8_isolate, script_name_local)) {
-        SerializeCallSiteInfo(this, frame, &builder);
-      } else {
-        builder.AppendString("<redacted>");
-      }
-    } else {
-      SerializeCallSiteInfo(this, frame, &builder);
+      include_frame =
+          should_include_frame_callback(v8_isolate, script_name_local);
     }
 
-    if (i != frame_count - 1) builder.AppendCharacter('\n');
-  }
+    if (include_frame) {
+      DirectHandle<String> serialized_frame;
+      if (SerializeCallSiteInfo(this, frame, kDontThrow)
+              .ToHandle(&serialized_frame)) {
+        serialized_frame->PrintOn(out);
+      } else {
+        out << "<error>";
+      }
+    } else {
+      out << "<redacted>";
+    }
 
-  DirectHandle<String> stack_trace = builder.Finish().ToHandleChecked();
-  stack_trace->PrintOn(out);
+    if (i != frame_count - 1) out << '\n';
+  }
 }
 
 bool Isolate::ComputeLocation(MessageLocation* target) {
@@ -4638,8 +4642,7 @@ void Isolate::SwitchStacks(wasm::StackMemory* from, wasm::StackMemory* to,
   stack_guard()->SetStackLimitForStackSwitching(limit);
 
   // Update the central stack info.
-  if (!thread_local_top()->is_on_central_stack_flag_ &&
-      to->jmpbuf()->is_on_central_stack) {
+  if (to->jmpbuf()->is_on_central_stack) {
     DCHECK(is_suspend || is_return);
     DCHECK_EQ(expected_target_state, wasm::JumpBuffer::Inactive);
     thread_local_top()->is_on_central_stack_flag_ = true;
@@ -4649,8 +4652,7 @@ void Isolate::SwitchStacks(wasm::StackMemory* from, wasm::StackMemory* to,
 #endif
     thread_local_top()->central_stack_limit_ =
         reinterpret_cast<Address>(to->jmpbuf()->stack_limit);
-  } else if (thread_local_top()->is_on_central_stack_flag_ &&
-             !to->jmpbuf()->is_on_central_stack) {
+  } else if (thread_local_top()->is_on_central_stack_flag_) {
     thread_local_top()->is_on_central_stack_flag_ = false;
     if (is_resume) {
       // Record the current central stack SP, we will switch back to it for
@@ -4678,11 +4680,14 @@ Isolate::SwitchStacks<wasm::JumpBuffer::Retired, wasm::JumpBuffer::Inactive>(
     Address pc);
 
 void Isolate::RetireWasmStack(wasm::StackMemory* stack) {
+  // Clear the owning {WasmStackObject}'s external pointer to prevent a UAF.
+#ifdef V8_ENABLE_SANDBOX
+  stack->ClearExternalPointerTableEntry();
+#else
   if (!stack->stack_obj().is_null()) {
-    // Clear the owning {WasmStackObject}'s external pointer to prevent a UAF.
     stack->stack_obj()->set_stack(this, nullptr);
-    stack->set_stack_obj({});
   }
+#endif
   size_t index = stack->index();
   // We can only return from a stack that was still in the global list.
   DCHECK_LT(index, wasm_stacks().size());
@@ -5556,9 +5561,23 @@ void Isolate::NotifyExceptionPropagationCallback() {
     // "C++ -> JS" or "C++ -> Api callback" boundary.
     return;
   }
-  if (it.done() ||
-      (ext_callback_scope &&
-       ext_callback_scope->JSStackComparableAddress() < it.frame()->fp())) {
+  bool is_direct_api_throw = it.done();
+  if (!is_direct_api_throw && ext_callback_scope != nullptr) {
+    Address comparable_fp = it.frame()->fp();
+#if V8_ENABLE_WEBASSEMBLY
+    if (!IsOnCentralStack(comparable_fp)) {
+      // The topmost frame is on a Wasm secondary stack, whereas
+      // |ext_callback_scope| is always on the central stack. Compare against
+      // the central-stack SP saved when switching to the secondary stack.
+      comparable_fp = thread_local_top()->central_stack_sp_;
+      DCHECK_NE(comparable_fp, kNullAddress);
+      DCHECK(IsOnCentralStack(comparable_fp));
+    }
+#endif  // V8_ENABLE_WEBASSEMBLY
+    is_direct_api_throw =
+        ext_callback_scope->JSStackComparableAddress() < comparable_fp;
+  }
+  if (is_direct_api_throw) {
     // There were no crossings of "C++ -> JS" boundary at all or they happened
     // earlier than the last crossing of the  "C++ -> Api callback" boundary.
     // In this case all the data about Api callback is available in the
@@ -5669,6 +5688,9 @@ void Isolate::NotifyExceptionPropagationCallback() {
       // These frames are not created yet.
       UNREACHABLE();
     case StackFrame::TURBOFAN_JS:
+#if V8_ENABLE_WEBASSEMBLY
+    case StackFrame::WASM_TO_JS:
+#endif  // V8_ENABLE_WEBASSEMBLY
       // This must be a fast Api call.
       CHECK(it.frame()->InFastCCall());
       // TODO(ishell): support fast Api calls.
@@ -5679,6 +5701,7 @@ void Isolate::NotifyExceptionPropagationCallback() {
       return;
 #if V8_ENABLE_WEBASSEMBLY
     case StackFrame::WASM:
+    case StackFrame::WASM_EXIT:
       // No more info.
       return;
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -6841,7 +6864,7 @@ void Isolate::DumpAndResetStats() {
 
 void Isolate::DumpAndResetBuiltinsProfileData() {
   if (BasicBlockProfiler::Get()->HasData(this)) {
-#ifndef V8_FUZZILLI
+#if !defined(V8_FUZZILLI) && !defined(V8_REDLINE)
     if (v8_flags.turbo_profiling_output) {
       FILE* f = std::fopen(v8_flags.turbo_profiling_output, "w");
       if (f == nullptr) {
@@ -6854,7 +6877,7 @@ void Isolate::DumpAndResetBuiltinsProfileData() {
       StdoutStream out;
       BasicBlockProfiler::Get()->Print(this, out);
     }
-#endif  // !V8_FUZZILLI
+#endif  // !defined(V8_FUZZILLI) && !defined(V8_REDLINE)
     BasicBlockProfiler::Get()->ResetCounts(this);
   }
 }
@@ -7637,10 +7660,6 @@ void Isolate::SetFilterETWSessionByURL2Callback(
     FilterETWSessionByURL2Callback callback) {
   filter_etw_session_by_url2_callback_ = callback;
 }
-void Isolate::RequestEnableETW() {
-  etw_tracing_requested_ = true;
-  ETWJITInterface::MaybeSetHandlerNow(this);
-}
 
 FilterETWSessionByURLResult Isolate::RunFilterETWSessionByURLCallback(
     const std::string& etw_filter_payload) {
@@ -7657,7 +7676,10 @@ FilterETWSessionByURLResult Isolate::RunFilterETWSessionByURLCallback(
         filter_etw_session_by_url_callback_(context, etw_filter_payload);
     return {enable_etw_tracing, v8_flags.interpreted_frames_native_stack};
   }
-  return {false, false};
+
+  // If no callback is installed, by default enable etw tracing but disable
+  // tracing of interpreter stack frames.
+  return {true, v8_flags.interpreted_frames_native_stack};
 }
 
 #endif  // V8_ENABLE_ETW_STACK_WALKING

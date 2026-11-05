@@ -252,9 +252,20 @@ std::ostream& operator<<(std::ostream& os, const StringEqualInputMode mode) {
 bool Phi::is_loop_phi() const { return merge_state()->is_loop(); }
 
 namespace {
+bool IsAnyHoleConstant(const ValueNode* node) {
+  if (const RootConstant* root = node->TryCast<RootConstant>()) {
+    return root->IsAnyHole();
+  }
+  if (const HeapConstant* heap = node->TryCast<HeapConstant>()) {
+    return heap->IsAnyHole();
+  }
+  return false;
+}
+
 template <typename UnwrapFunction>
 ValueNode* UnwrapSinglePhis(ValueNode* node, UnwrapFunction&& unwrap) {
   ValueNode* prev = nullptr;
+  ValueNode* last_was_loop_phi = nullptr;
   while (prev != node) {
     prev = node;
     node = unwrap(node);
@@ -263,11 +274,23 @@ ValueNode* UnwrapSinglePhis(ValueNode* node, UnwrapFunction&& unwrap) {
       // defined within the loop itself.
       if (phi->input_count() == 1 && !phi->is_exception_phi() &&
           !(phi->is_loop_phi() && phi->merge_state()->is_resumable_loop())) {
+        if (phi->merge_state()->was_loop()) {
+          last_was_loop_phi = phi;
+        }
         // This is a Phi with a single input ==> replacing with the input
         // itself.
         node = phi->input_node(0);
       }
     }
+  }
+  // Constant-folding for nodes like BranchIfToBooleanTrue, ToBoolean, and Call
+  // DCHECKs that constant inputs are not holes. In runtime-unreachable code
+  // (after a Throw*IfHole that could not fold while the loop backedge was
+  // alive), these nodes can have as input a loop phi that later lost its
+  // backedge input and became Phi(Hole). Keep the phi instead of unwrapping it
+  // into a hole constant.
+  if (last_was_loop_phi != nullptr && IsAnyHoleConstant(node)) {
+    return last_was_loop_phi;
   }
   return node;
 }
@@ -500,6 +523,17 @@ void DeoptInfo::InitializeInputLocations(Zone* zone, size_t count) {
     new (&input_locations_[i]) InputLocation();
   }
   input_location_count_ = count;
+}
+
+bool RootConstant::IsAnyHole() const {
+  switch (index_) {
+#define CASE(Type, Value, CamelName) case RootIndex::k##CamelName:
+    HOLE_LIST(CASE)
+#undef CASE
+    return true;
+    default:
+      return false;
+  }
 }
 
 bool RootConstant::ToBoolean(LocalIsolate* local_isolate) const {
@@ -806,6 +840,10 @@ NodeType ValueNode::GetStaticType(compiler::JSHeapBroker* broker) {
     case ValueRepresentation::kIntPtr:
       return NodeType::kNumber;
     case ValueRepresentation::kHoleyFloat64:
+      if (const HoleyFloat64Constant* cst = TryCast<HoleyFloat64Constant>()) {
+        return cst->value().is_undefined_or_hole_nan() ? NodeType::kUndefined
+                                                       : NodeType::kNumber;
+      }
       return NodeType::kNumberOrOddball;
     case ValueRepresentation::kTagged:
       break;
@@ -871,16 +909,16 @@ Tribool ValueNode::IsHole(RootIndex hole_index) const {
   }
   if (const Phi* phi = TryCast<Phi>()) {
     if (!phi->is_loop_phi() && !phi->is_exception_phi()) {
-      bool can_be_the_hole = false;
+      bool all_true = phi->input_count() > 0;
+      bool all_false = true;
       for (ConstInput input : phi->inputs()) {
-        if (input.node()->IsHole(hole_index) != Tribool::kFalse) {
-          can_be_the_hole = true;
-          break;
-        }
+        Tribool is_hole = input.node()->IsHole(hole_index);
+        all_true = all_true && (is_hole == Tribool::kTrue);
+        all_false = all_false && (is_hole == Tribool::kFalse);
+        if (!all_true && !all_false) break;
       }
-      if (!can_be_the_hole) {
-        return Tribool::kFalse;
-      }
+      if (all_true) return Tribool::kTrue;
+      if (all_false) return Tribool::kFalse;
     }
   }
   return Tribool::kMaybe;
@@ -5341,10 +5379,16 @@ void SetNamedGeneric::GenerateCode(MaglevAssembler* masm,
 
 int DefineNamedOwnGeneric::MaxCallStackArgs() const {
   using D = CallInterfaceDescriptorFor<Builtin::kDefineNamedOwnIC>::type;
+  static_assert(
+      std::is_same_v<D, CallInterfaceDescriptorFor<
+                            Builtin::kDefineNamedOwnInLiteralIC>::type>);
   return D::GetStackParameterCount();
 }
 void DefineNamedOwnGeneric::SetValueLocationConstraints() {
   using D = CallInterfaceDescriptorFor<Builtin::kDefineNamedOwnIC>::type;
+  static_assert(
+      std::is_same_v<D, CallInterfaceDescriptorFor<
+                            Builtin::kDefineNamedOwnInLiteralIC>::type>);
   UseFixed(ContextInput(), kContextRegister);
   UseFixed(ObjectInput(), D::GetRegisterParameter(D::kReceiver));
   UseFixed(ValueInput(), D::GetRegisterParameter(D::kValue));
@@ -5352,14 +5396,25 @@ void DefineNamedOwnGeneric::SetValueLocationConstraints() {
 }
 void DefineNamedOwnGeneric::GenerateCode(MaglevAssembler* masm,
                                          const ProcessingState& state) {
-  __ CallBuiltin<Builtin::kDefineNamedOwnIC>(
-      ContextInput(),                               // context
-      ObjectInput(),                                // receiver
-      name().object(),                              // name
-      ValueInput(),                                 // value
-      TaggedIndex::FromIntptr(feedback().index()),  // feedback slot
-      feedback().vector                             // feedback vector
-  );
+  if (in_literal()) {
+    __ CallBuiltin<Builtin::kDefineNamedOwnInLiteralIC>(
+        ContextInput(),                               // context
+        ObjectInput(),                                // receiver
+        name().object(),                              // name
+        ValueInput(),                                 // value
+        TaggedIndex::FromIntptr(feedback().index()),  // feedback slot
+        feedback().vector                             // feedback vector
+    );
+  } else {
+    __ CallBuiltin<Builtin::kDefineNamedOwnIC>(
+        ContextInput(),                               // context
+        ObjectInput(),                                // receiver
+        name().object(),                              // name
+        ValueInput(),                                 // value
+        TaggedIndex::FromIntptr(feedback().index()),  // feedback slot
+        feedback().vector                             // feedback vector
+    );
+  }
   masm->DefineExceptionHandlerAndLazyDeoptPoint(this);
 }
 
@@ -6226,62 +6281,100 @@ void StringLength::GenerateCode(MaglevAssembler* masm,
   __ StringLength(ToRegister(result()), ToRegister(StringInput()));
 }
 
+namespace {
+
+// A constant slice index that is negative or at least String::kMaxLength is
+// clamped from the string length alone, so it never needs to be in a register.
+bool IsClampedFromLength(std::optional<int32_t> index) {
+  return index.has_value() &&
+         (*index < 0 || *index >= static_cast<int32_t>(String::kMaxLength));
+}
+
+bool IsLength(std::optional<int32_t> index) {
+  return index.has_value() &&
+         *index >= static_cast<int32_t>(String::kMaxLength);
+}
+
+}  // namespace
+
 void StringSlice::SetValueLocationConstraints() {
   using D = StringSubstringDescriptor;
   UseFixed(StringInput(), D::GetRegisterParameter(D::kString));
-  UseAndClobberFixed(StartIndexInput(), D::GetRegisterParameter(D::kFrom));
-  UseAndClobberFixed(EndIndexInput(), D::GetRegisterParameter(D::kTo));
+  auto use_index = [&](Input input, int input_index, Register reg) {
+    if (IsClampedFromLength(TryGetInt32ConstantInput(input_index))) {
+      UseAny(input);
+      RequireSpecificTemporary(reg);
+    } else {
+      UseAndClobberFixed(input, reg);
+    }
+  };
+  use_index(StartIndexInput(), kStartIndexIndex,
+            D::GetRegisterParameter(D::kFrom));
+  use_index(EndIndexInput(), kEndIndexIndex, D::GetRegisterParameter(D::kTo));
   DefineAsFixed(this, kReturnRegister0);
-  set_temporaries_needed(1);
+  // An end that is the length gets the length directly.
+  if (!IsLength(TryGetInt32ConstantInput(kEndIndexIndex))) {
+    set_temporaries_needed(1);
+  }
 }
 
 void StringSlice::GenerateCode(MaglevAssembler* masm,
                                const ProcessingState& state) {
+  using D = StringSubstringDescriptor;
   Register string = ToRegister(StringInput());
-  Register start = ToRegister(StartIndexInput());
-  Register end = ToRegister(EndIndexInput());
+  Register start = D::GetRegisterParameter(D::kFrom);
+  Register end = D::GetRegisterParameter(D::kTo);
+  std::optional<int32_t> end_constant =
+      TryGetInt32ConstantInput(kEndIndexIndex);
 
   MaglevAssembler::TemporaryRegisterScope temps(masm);
-  Register length = temps.Acquire();
+  // The index registers can be temporaries too; keep them for the indices.
+  temps.SetAvailable(temps.Available() - RegList{start, end});
+  Register length = IsLength(end_constant) ? end : temps.Acquire();
 
   __ StringLength(length, string);
 
-  // Calculate relative start.
-  {
-    Label is_neg, done;
-    __ CompareInt32AndJumpIf(start, 0, kLessThan, &is_neg);
+  // Clamp a relative index to [0, length]. A constant index has a known
+  // sign, so at most one of the two checks remains.
+  auto clamp = [&](Register index, int input_index) {
+    std::optional<int32_t> constant = TryGetInt32ConstantInput(input_index);
+    Label done;
+    if (constant) {
+      if (IsLength(constant)) {
+        if (index != length) __ Move(index, length);
+      } else if (*constant > 0) {
+        DCHECK_EQ(ToRegister(input(input_index)), index);
+        __ CompareInt32AndJumpIf(index, length, kLessThan, &done);
+        __ Move(index, length);
+      } else if (*constant < 0) {
+        __ AddInt32(index, length, *constant);
+        __ CompareInt32AndJumpIf(index, 0, kGreaterThanEqual, &done);
+        __ Move(index, 0);
+      } else {
+        DCHECK_EQ(ToRegister(input(input_index)), index);
+      }
+      __ bind(&done);
+      return;
+    }
 
-    // start >= 0
-    __ CompareInt32AndJumpIf(start, length, kLessThan, &done);
-    __ Move(start, length);
+    Label is_neg;
+    __ CompareInt32AndJumpIf(index, 0, kLessThan, &is_neg);
+
+    // index >= 0
+    __ CompareInt32AndJumpIf(index, length, kLessThan, &done);
+    __ Move(index, length);
     __ Jump(&done);
 
     __ bind(&is_neg);
-    // start < 0
-    __ AddInt32(start, length);
-    __ CompareInt32AndJumpIf(start, 0, kGreaterThanEqual, &done);
-    __ Move(start, 0);
+    // index < 0
+    __ AddInt32(index, length);
+    __ CompareInt32AndJumpIf(index, 0, kGreaterThanEqual, &done);
+    __ Move(index, 0);
 
     __ bind(&done);
-  }
-
-  {
-    Label is_neg, done;
-    __ CompareInt32AndJumpIf(end, 0, kLessThan, &is_neg);
-
-    // end >= 0
-    __ CompareInt32AndJumpIf(end, length, kLessThan, &done);
-    __ Move(end, length);
-    __ Jump(&done);
-
-    __ bind(&is_neg);
-    // end < 0
-    __ AddInt32(end, length);
-    __ CompareInt32AndJumpIf(end, 0, kGreaterThanEqual, &done);
-    __ Move(end, 0);
-
-    __ bind(&done);
-  }
+  };
+  clamp(start, kStartIndexIndex);
+  clamp(end, kEndIndexIndex);
 
   Label empty_string;
   __ CompareInt32AndJumpIf(end, start, kLessThanEqual, &empty_string);
@@ -9361,7 +9454,7 @@ void SetNamedGeneric::PrintParams(std::ostream& os) const {
 }
 
 void DefineNamedOwnGeneric::PrintParams(std::ostream& os) const {
-  os << "(" << *name_.object() << ")";
+  os << "(" << *name_.object() << ", in_literal:" << in_literal() << ")";
 }
 
 void GapMove::PrintParams(std::ostream& os) const {

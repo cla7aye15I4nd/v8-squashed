@@ -642,7 +642,7 @@ class CompilationStateImpl {
 
   void OnFinishedUnits(base::Vector<WasmCode*>);
 
-  void OnCompilationStopped(WasmDetectedFeatures detected);
+  void OnDetectedFeatures(WasmDetectedFeatures detected);
   void SchedulePublishCompilationResults(
       std::vector<UnpublishedWasmCode> unpublished_code, CompilationTier tier);
 
@@ -1136,7 +1136,7 @@ void CompileLazy(Isolate* isolate, NativeModule* native_module,
   WasmCompilationResult result = baseline_unit.ExecuteCompilation(
       &env, compilation_state->GetWireBytesStorage().get(),
       native_module->counter_updates(), &detected_features);
-  compilation_state->OnCompilationStopped(detected_features);
+  compilation_state->OnDetectedFeatures(detected_features);
 
   // The module was fully validated before starting its execution, so lazy
   // compilation cannot fail.
@@ -1976,10 +1976,12 @@ CompilationExecutionResult ExecuteCompilationUnits(
             std::move(counter_updates));
         DCHECK_EQ(0, counter_updates.NumOutstandingUpdates());
         results_to_publish.clear();
+        // Flush detected features before publishing code, which may trigger
+        // {kFinishedBaselineCompilation} and publish detected features.
+        compile_scope.compilation_state()->OnDetectedFeatures(
+            global_detected_features);
         compile_scope.compilation_state()->SchedulePublishCompilationResults(
             std::move(unpublished_code), tier);
-        compile_scope.compilation_state()->OnCompilationStopped(
-            global_detected_features);
         return yield ? kYield : kNoMoreUnits;
       }
 
@@ -1997,6 +1999,11 @@ CompilationExecutionResult ExecuteCompilationUnits(
             compile_scope.native_module()->AddCompiledCode(
                 base::VectorOf(results_to_publish));
         results_to_publish.clear();
+        // Flush detected features before publishing code, which may trigger
+        // {kFinishedBaselineCompilation} and publish detected features.
+        compile_scope.compilation_state()->OnDetectedFeatures(
+            global_detected_features);
+        global_detected_features = {};
         compile_scope.compilation_state()->SchedulePublishCompilationResults(
             std::move(unpublished_code), tier);
       }
@@ -2468,10 +2475,6 @@ class AsyncStreamingProcessor final : public StreamingProcessor {
 
  private:
   void CommitCompilationUnits();
-  // Sets a crash key ("v8-wasm-streaming-error") with the first encountered
-  // failure to help diagnose unexpected streaming compilation errors (see
-  // issue 455046584). Must be called on the main thread.
-  void SetCrashKey(std::string_view message);
 
   ModuleDecoder decoder_;
   AsyncCompileJob* job_;
@@ -2479,7 +2482,6 @@ class AsyncStreamingProcessor final : public StreamingProcessor {
   int num_functions_ = 0;
   bool prefix_cache_hit_ = false;
   bool before_code_section_ = true;
-  bool has_error_ = false;
   ValidateFunctionsStreamingJobData validate_functions_job_data_;
   std::unique_ptr<JobHandle> validate_functions_job_handle_;
 
@@ -2682,7 +2684,7 @@ void AsyncCompileJob::FinishCompile(
   }
 }
 
-void AsyncCompileJob::Failed() && {
+void AsyncCompileJob::Failed(std::string_view failure_reason) && {
   PrepareForRemoval();
   // {job} keeps the {this} pointer alive.
   std::unique_ptr<AsyncCompileJob> job =
@@ -2695,6 +2697,18 @@ void AsyncCompileJob::Failed() && {
     // Publish any delayed counter updates for the "unfinished" native module in
     // the isolate.
     new_native_module_->counter_updates()->Publish(isolate);
+  }
+
+  DCHECK(!failure_reason.empty());
+  if (isolate->HasCrashKeyStringCallbacks()) {
+    // Crash keys allocated via the embedder callback are process-wide and never
+    // freed, while mutating a single CrashKey across threads requires external
+    // synchronization (e.g. Crashpad's StringAnnotation::Set).
+    static base::LazyMutex crash_key_mutex = LAZY_MUTEX_INITIALIZER;
+    base::MutexGuard guard(crash_key_mutex.Pointer());
+    static v8::CrashKey crash_key = isolate->AllocateCrashKeyString(
+        "v8-wasm-streaming-error", v8::CrashKeySize::Size1024);
+    isolate->SetCrashKeyString(crash_key, failure_reason);
   }
 
   // Revalidate the whole module to produce a deterministic error message.
@@ -2776,7 +2790,7 @@ class AsyncCompileJob::CompilationStateCallback
           GetWasmEngine()->UpdateNativeModuleCache(
               true, job_->new_native_module_,
               job_->isolate_specific_info_.isolate_);
-          job_->DoSync<Fail>();
+          job_->DoSync<Fail>("CompilationStateCallback failed");
         }
         break;
     }
@@ -2824,12 +2838,9 @@ void AsyncCompileJob::StartBackgroundTask() {
   }
 }
 
-template <typename Step,
-          AsyncCompileJob::UseExistingForegroundTask use_existing_fg_task,
-          typename... Args>
+template <typename Step, typename... Args>
 void AsyncCompileJob::DoSync(Args&&... args) {
   NextStep<Step>(std::forward<Args>(args)...);
-  if (use_existing_fg_task && pending_foreground_task_ != nullptr) return;
   StartForegroundTask();
 }
 
@@ -2874,7 +2885,7 @@ class AsyncCompileJob::DecodeModule : public AsyncCompileJob::CompileStep {
     }
     if (result.failed()) {
       // Decoding failure; reject the promise and clean up.
-      job->DoSync<Fail>();
+      job->DoSync<Fail>("DecodeModule: " + result.error().message());
     } else {
       // Decode passed.
       std::shared_ptr<WasmModule> module = std::move(result).value();
@@ -2935,9 +2946,10 @@ class AsyncCompileJob::PrepareNativeModule : public CompileStep {
       // been validated yet (would have happened in the {DecodeModule} phase
       // if we would not come via the non-streaming path). Thus do this now.
       DCHECK(start_compilation_);
-      if (ValidateFunctions(*final_native_module).has_error()) {
+      if (WasmError error = ValidateFunctions(*final_native_module)) {
         // Fail compilation synchronously.
-        job->DoSync<Fail>();
+        job->DoSync<Fail>("PrepareNativeModule ValidateFunctions: " +
+                          error.message());
         return;
       }
     }
@@ -2996,12 +3008,20 @@ class AsyncCompileJob::FinishCompilation : public CompileStep {
 // Step 4 (sync): Decoding or compilation failed.
 //==========================================================================
 class AsyncCompileJob::Fail : public CompileStep {
+ public:
+  explicit Fail(std::string failure_reason)
+      : failure_reason_(std::move(failure_reason)) {
+    DCHECK(!failure_reason_.empty());
+  }
+
  private:
   void RunInForeground(AsyncCompileJob* job) override {
     TRACE_COMPILE("(4) Async compilation failed.\n");
     // Fail compilation, invalidating the {AsyncCompileJob}.
-    std::move(*job).Failed();
+    std::move(*job).Failed(failure_reason_);
   }
+
+  const std::string failure_reason_;
 };
 
 AsyncStreamingProcessor::AsyncStreamingProcessor(AsyncCompileJob* job)
@@ -3180,34 +3200,18 @@ void AsyncStreamingProcessor::OnFinishedChunk() {
   if (compilation_unit_builder_) CommitCompilationUnits();
 }
 
-void AsyncStreamingProcessor::SetCrashKey(std::string_view message) {
-  if (has_error_) return;
-  has_error_ = true;
-  Isolate* isolate = job_->isolate_specific_info_.isolate_;
-  if (isolate && isolate->HasCrashKeyStringCallbacks()) {
-    // Crash keys allocated via the embedder callback are process-wide and never
-    // freed, while mutating a single CrashKey across threads requires external
-    // synchronization (e.g. Crashpad's StringAnnotation::Set).
-    static base::LazyMutex crash_key_mutex = LAZY_MUTEX_INITIALIZER;
-    base::MutexGuard guard(crash_key_mutex.Pointer());
-    static v8::CrashKey crash_key = isolate->AllocateCrashKeyString(
-        "v8-wasm-streaming-error", v8::CrashKeySize::Size1024);
-    isolate->SetCrashKeyString(crash_key, message);
-  }
-}
-
 // Finish the processing of the stream.
 void AsyncStreamingProcessor::OnFinishedStream(
     base::UniqueArray<const uint8_t> bytes, bool after_error) {
   TRACE_STREAMING("Finish stream...\n");
+  std::string failure_reason;
   ModuleResult module_result = decoder_.FinishDecoding();
   if (module_result.failed()) {
-    SetCrashKey("ModuleDecoder: " + module_result.error().message());
-    after_error = true;
+    failure_reason = "ModuleDecoder: " + module_result.error().message();
   } else if (after_error) {
     // `after_error` was passed in as true from StreamingDecoder, but
     // ModuleDecoder did not fail (e.g. unexpected EOF or varint error).
-    SetCrashKey("StreamingDecoder failed");
+    failure_reason = "StreamingDecoder failed";
   }
 
   if (validate_functions_job_handle_) {
@@ -3217,9 +3221,8 @@ void AsyncStreamingProcessor::OnFinishedStream(
     // instead.
     validate_functions_job_handle_->Join();
     validate_functions_job_handle_.reset();
-    if (validate_functions_job_data_.found_error) {
-      SetCrashKey("FunctionValidation failed");
-      after_error = true;
+    if (validate_functions_job_data_.found_error && failure_reason.empty()) {
+      failure_reason = "FunctionValidation failed";
     }
     job_->detected_features_ |=
         validate_functions_job_data_.detected_features.load(
@@ -3229,15 +3232,14 @@ void AsyncStreamingProcessor::OnFinishedStream(
   job_->wire_bytes_ = ModuleWireBytes(bytes.as_span());
   job_->bytes_copy_ = std::move(bytes);
 
-  if (!after_error) {
+  if (failure_reason.empty()) {
     WasmDetectedFeatures detected_imports_features;
     // TODO(jkummerow): We should probably do this before creating compilation
     // tasks while processing the code section.
     if (WasmError error = ValidateAndSetBuiltinImports(
             module_result.value().get(), job_->wire_bytes_.module_bytes(),
             job_->compile_imports_, &detected_imports_features)) {
-      SetCrashKey("ValidateBuiltinImports: " + error.message());
-      after_error = true;
+      failure_reason = "ValidateBuiltinImports: " + error.message();
     } else {
       job_->detected_features_ |= detected_imports_features;
     }
@@ -3247,7 +3249,7 @@ void AsyncStreamingProcessor::OnFinishedStream(
   v8::metrics::WasmModuleDecoded decode_event{
       .async = true,
       .streamed = true,
-      .success = !after_error,
+      .success = failure_reason.empty(),
       .module_size_in_bytes = job_->wire_bytes_.length(),
       .function_count = static_cast<size_t>(num_functions_)};
   if (!job_->start_time_.IsNull()) {
@@ -3258,7 +3260,7 @@ void AsyncStreamingProcessor::OnFinishedStream(
   isolate->metrics_recorder()->AddMainThreadEvent(
       decode_event, job_->isolate_specific_info_.context_id_);
 
-  if (after_error) {
+  if (!failure_reason.empty()) {
     if (owns_cache_entry_) {
       // Clean up the temporary cache entry.
       GetWasmEngine()->StreamingCompilationFailed(prefix_hasher_.hash(),
@@ -3268,7 +3270,7 @@ void AsyncStreamingProcessor::OnFinishedStream(
     }
     // Calling {Failed} will invalidate the {AsyncCompileJob} and delete {this}.
     HandleScope handle_scope(isolate);
-    std::move(*job_).Failed();
+    std::move(*job_).Failed(failure_reason);
     return;
   }
 
@@ -3357,8 +3359,7 @@ void AsyncStreamingProcessor::OnFinishedStream(
     // We finally call {Failed} or {FinishCompile}, which will invalidate the
     // {AsyncCompileJob} and delete {this}.
     if (failed) {
-      SetCrashKey("CompilationState failed");
-      std::move(*job_).Failed();
+      std::move(*job_).Failed("CompilationState failed");
       return;
     }
   }
@@ -4097,17 +4098,27 @@ void CompilationStateImpl::TriggerCachingAfterTimeout() {
   bytes_since_last_chunk_ = 0;
 }
 
-void CompilationStateImpl::OnCompilationStopped(
+void CompilationStateImpl::OnDetectedFeatures(
     WasmDetectedFeatures detected_features) {
   WasmDetectedFeatures new_detected_features =
       UpdateDetectedFeatures(detected_features);
   if (new_detected_features.empty()) return;
 
-  // New detected features can only happen during eager compilation.
-  // Compilation hints enables eager compilation if there are
-  // compilation-priority hints in the module, so it should be included here.
+  // New detected features can only happen during eager compilation (in
+  // particular, streaming compilation delegates validation of eagerly compiled
+  // functions to the compile job). Both --wasm-eager-tier-up-function and
+  // compilation-priority hints trigger eager compilation of selected functions
+  // even when --wasm-lazy-compilation is enabled. Check
+  // --wasm-eager-tier-up-function before `compilation_priorities` so we do not
+  // read `compilation_priorities` if a custom priority section is decoded after
+  // the code section during streaming.
   DCHECK(!v8_flags.wasm_lazy_compilation ||
-         (v8_flags.wasm_compilation_hints &&
+         (!v8_flags.liftoff_only && v8_flags.wasm_eager_tier_up_function >= 0 &&
+          static_cast<uint32_t>(v8_flags.wasm_eager_tier_up_function) >=
+              native_module_->num_imported_functions() &&
+          static_cast<uint32_t>(v8_flags.wasm_eager_tier_up_function) <
+              native_module_->num_functions()) ||
+         (native_module_->enabled_features().has_compilation_hints() &&
           !native_module_->module()->compilation_priorities.empty()));
 }
 

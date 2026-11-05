@@ -569,6 +569,18 @@ DEFINE_UINT(
     "Scavenger in chaos mode")
 DEFINE_MAX_VALUE_IMPLICATION(scavenger_chaos_mode_threshold, 100u)
 
+DEFINE_UINT(scavenger_high_survival_threshold, 70,
+            "Percentage of the young generation capacity that has to survive a "
+            "scavenge for the young generation survival rate to be considered "
+            "high")
+DEFINE_MAX_VALUE_IMPLICATION(scavenger_high_survival_threshold, 100u)
+DEFINE_BOOL(scavenger_high_survival_promotion, true,
+            "Scavenger promotes all surviving young objects to old space if "
+            "the previous scavenge had a high survival rate")
+DEFINE_BOOL(scavenger_fast_growth, false,
+            "Grow the young generation right away and by twice the growth "
+            "factor if a scavenge had a high survival rate")
+
 #ifdef V8_ENABLE_LOCAL_OFF_STACK_CHECK
 #define V8_ENABLE_LOCAL_OFF_STACK_CHECK_BOOL true
 #else
@@ -656,11 +668,9 @@ DEFINE_BOOL(maglev_poly_calls, true, "Support (inlining) polymorphic calls")
 DEFINE_BOOL(maglev_truncation, true, "Enable Maglev truncation pass")
 DEFINE_DEVELOPER_FLAG(trace_maglev_truncation, "trace maglev truncation pass")
 
-DEFINE_EXPERIMENTAL_FEATURE(maglev_licm, "loop invariant code motion")
 DEFINE_WEAK_IMPLICATION(maglev_future, maglev_speculative_hoist_phi_untagging)
 DEFINE_WEAK_IMPLICATION(maglev_future, maglev_inline_api_calls)
 DEFINE_WEAK_IMPLICATION(maglev_future, maglev_escape_analysis)
-DEFINE_WEAK_IMPLICATION(maglev_future, maglev_licm)
 
 DEFINE_BOOL(turbolev_truncated_int32_phis, true,
             "Enable truncated to int32 representation in the phi selector")
@@ -1096,8 +1106,6 @@ DEFINE_BOOL_READONLY(minor_ms_shortcut_strings, false,
                      "short cut strings during marking")
 #endif
 
-DEFINE_EXPERIMENTAL_FEATURE(feedback_normalization,
-                            "feed back normalization to constructors")
 // TODO(jkummerow): This currently adds too much load on the stub cache.
 DEFINE_BOOL_READONLY(internalize_on_the_fly, true,
                      "internalize string keys for generic keyed ICs on the fly")
@@ -1403,10 +1411,6 @@ DEFINE_BOOL_READONLY(opt, false,
                      "use the Turbofan optimizing compiler for JavaScript code "
                      "(Wasm uses separate flags)")
 #endif  // V8_ENABLE_TURBOFAN
-
-DEFINE_BOOL(
-    turbo_always_optimize_spills, true,
-    "optimize placement of all spill instructions, not just loop-top phis")
 
 DEFINE_BOOL(turbo_wasm_address_reassociation, true,
             "refactor address components for immediate indexing")
@@ -2771,7 +2775,7 @@ DEFINE_INT(external_memory_max_reasonable_size, 32,
            "Max external memory value (in GB) checked for a reasonable size, 0 "
            "to disable the check.")
 DEFINE_BOOL(
-    sqrt_allocation_limits, false,
+    sqrt_allocation_limits, true,
     "Old generation and global heap limit growth scale based on the sqrt of "
     "estimated GC cost.")
 DEFINE_INT(
@@ -3238,7 +3242,7 @@ DEFINE_NEG_IMPLICATION(hole_fuzzing, hard_abort)
 DEFINE_NEG_IMPLICATION(sandbox_fuzzing, hard_abort)
 
 // fuzzilli
-#if defined(V8_FUZZILLI)
+#if defined(V8_FUZZILLI) || defined(V8_REDLINE)
 DEFINE_BOOL(fuzzilli_enable_optimized_code_coverage, false,
             "enable optimized code coverage for fuzzilli")
 #else
@@ -3760,6 +3764,17 @@ DEFINE_BOOL(sandbox_trap_fuzzing, false,
 // Only one of these can be enabled.
 DEFINE_NEG_IMPLICATION(sandbox_fuzzing, sandbox_testing)
 DEFINE_NEG_IMPLICATION(sandbox_testing, sandbox_fuzzing)
+
+#ifdef V8_ENABLE_MEMORY_CORRUPTION_API
+DEFINE_BOOL(code_cache_fuzzing, false,
+            "Expose %GetCodeCache and %ConsumeCodeCache, which consume a code "
+            "cache with a replaced untrusted section.")
+DEFINE_NEG_IMPLICATION(code_cache_fuzzing, verify_snapshot_checksum)
+#else
+DEFINE_BOOL_READONLY(code_cache_fuzzing, false,
+                     "Expose %GetCodeCache and %ConsumeCodeCache, which "
+                     "consume a code cache with a replaced untrusted section.")
+#endif  // V8_ENABLE_MEMORY_CORRUPTION_API
 
 DEFINE_BOOL(verify_bytecode_light, false,
             "Perform lightweight bytecode verification to ensure basic safety "
@@ -4386,7 +4401,6 @@ DISALLOW_UNSAFE_FLAG(perf_prof)
 DISALLOW_UNSAFE_FLAG(perf_prof_annotate_wasm)
 DISALLOW_UNSAFE_FLAG(vtune_prof_annotate_wasm)
 // Known-broken features/configuration.
-DISALLOW_UNSAFE_FLAG(feedback_normalization)
 DISALLOW_UNSAFE_FLAG(array_destructure_bytecode)
 DISALLOW_UNSAFE_FLAG(turboshaft_random_rescheduling)
 // Disabled-by-default misc. "unsafe" flags that should not be enabled.

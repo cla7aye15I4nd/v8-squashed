@@ -1033,14 +1033,20 @@ bool CompileTurbofan_NotConcurrent(Isolate* isolate,
   // Success!
   job->RecordCompilationStats(ConcurrencyMode::kSynchronous, isolate);
   DCHECK(!isolate->has_exception());
-  if (job->compilation_info()->is_osr()) {
-    OptimizedOSRCodeCache::Insert(
-        isolate, *compilation_info->closure(), compilation_info->osr_offset(),
-        *compilation_info->code(),
-        compilation_info->function_context_specializing());
-  } else if (!compilation_info->function_context_specializing()) {
-    compilation_info->shared_info()->set_function_context_independent_compiled(
-        true);
+  if (V8_LIKELY(!compilation_info->discard_result_for_testing())) {
+    if (job->compilation_info()->is_osr()) {
+      OptimizedOSRCodeCache::Insert(
+          isolate, *compilation_info->closure(), compilation_info->osr_offset(),
+          *compilation_info->code(),
+          compilation_info->function_context_specializing());
+    } else {
+      if (!compilation_info->function_context_specializing()) {
+        compilation_info->shared_info()
+            ->set_function_context_independent_compiled(true);
+      }
+      compilation_info->closure()->UpdateOptimizedCode(
+          isolate, *compilation_info->code());
+    }
   }
   job->RecordFunctionCompilation(LogEventListener::CodeTag::kFunction, isolate);
   return true;
@@ -2213,6 +2219,11 @@ class ConstantPoolPointerForwarder {
     }
   }
 
+  bool HasScopeInfoToUpdate(Tagged<ScopeInfo> scope_info) const {
+    return scope_infos_to_update_.find(scope_info->UniqueIdInScript()) !=
+           scope_infos_to_update_.end();
+  }
+
   void UpdateStandaloneScopeInfo(Tagged<ScopeInfo> scope_info) {
     if (!scope_info->HasOuterScopeInfo()) return;
 
@@ -2390,6 +2401,23 @@ void VerifyCodeMerge(Isolate* isolate, DirectHandle<Script> script) {
   //   * All constant pool SFI entries point to an SFI referring to the old
   //     script (i.e. references were updated correctly).
   std::unordered_map<int, Tagged<ScopeInfo>> scope_infos;
+  auto verify_scope_info = [&](Tagged<ScopeInfo> scope_info) {
+    while (true) {
+      auto it = scope_infos.find(scope_info->UniqueIdInScript());
+      if (it != scope_infos.end()) {
+        if (it->second != scope_info) {
+          isolate->PushParamsAndDie("duplicate scope info unique id",
+                                    reinterpret_cast<void*>(it->second.ptr()),
+                                    reinterpret_cast<void*>(scope_info.ptr()));
+          UNREACHABLE();
+        }
+        break;
+      }
+      scope_infos[scope_info->UniqueIdInScript()] = scope_info;
+      if (!scope_info->HasOuterScopeInfo()) break;
+      scope_info = scope_info->OuterScopeInfo();
+    }
+  };
   uint32_t script_infos_len = script->infos()->ulength().value();
   for (uint32_t info_idx = 0; info_idx < script_infos_len; info_idx++) {
     Tagged<ScopeInfo> scope_info;
@@ -2413,6 +2441,8 @@ void VerifyCodeMerge(Isolate* isolate, DirectHandle<Script> script) {
             int id = inner_sfi->function_literal_id(kRelaxedLoad);
             CHECK_EQ(MakeWeak(inner_sfi), script->infos()->get(id));
             CHECK_EQ(inner_sfi->script(), *script);
+          } else if (Is<ScopeInfo>(entry)) {
+            verify_scope_info(Cast<ScopeInfo>(entry));
           }
         }
       }
@@ -2427,21 +2457,7 @@ void VerifyCodeMerge(Isolate* isolate, DirectHandle<Script> script) {
     } else {
       scope_info = Cast<ScopeInfo>(info);
     }
-    while (true) {
-      auto it = scope_infos.find(scope_info->UniqueIdInScript());
-      if (it != scope_infos.end()) {
-        if (it->second != scope_info) {
-          isolate->PushParamsAndDie("duplicate scope info unique id",
-                                    reinterpret_cast<void*>(it->second.ptr()),
-                                    reinterpret_cast<void*>(scope_info.ptr()));
-          UNREACHABLE();
-        }
-        break;
-      }
-      scope_infos[scope_info->UniqueIdInScript()] = scope_info;
-      if (!scope_info->HasOuterScopeInfo()) break;
-      scope_info = scope_info->OuterScopeInfo();
-    }
+    verify_scope_info(scope_info);
   }
 }
 }  // namespace
@@ -2589,6 +2605,9 @@ void BackgroundMergeTask::BeginMergeInBackground(
     for (DirectHandle<SharedFunctionInfo> new_sfi : used_new_sfis_) {
       forwarder.UpdateScopeInfo(*new_sfi);
     }
+    for (DirectHandle<ScopeInfo> new_scope : used_new_scope_infos_) {
+      forwarder.UpdateStandaloneScopeInfo(*new_scope);
+    }
     for (const auto& new_compiled_data : new_compiled_data_for_cached_sfis_) {
       // It's possible that new_compiled_data.cached_sfi had
       // scope_info()->IsEmpty() while an inner function has scope info if the
@@ -2695,6 +2714,14 @@ Handle<SharedFunctionInfo> BackgroundMergeTask::CompleteMergeInForeground(
         compiled_data_it++;
       }
     } else if (!maybe_old_info.IsWeak()) {
+      // Standalone eval ScopeInfos are only recorded for scopes within their
+      // owning closure, so if the slot in old_script was cleared, the ScopeInfo
+      // itself cannot still be alive in old_script.
+      DCHECK_IMPLIES(
+          maybe_new_info.IsWeak() &&
+              Is<ScopeInfo>(maybe_new_info.GetHeapObjectAssumeWeak()),
+          !forwarder.HasScopeInfoToUpdate(
+              Cast<ScopeInfo>(maybe_new_info.GetHeapObjectAssumeWeak())));
       old_script->infos()->set(i, maybe_new_info, kReleaseStore);
     }
   }
@@ -3051,8 +3078,9 @@ bool Compiler::CollectSourcePositions(
     if (debug_info.value()->HasInstrumentedBytecodeArray()) {
       Tagged<TrustedByteArray> source_position_table =
           job->compilation_info()->bytecode_array()->SourcePositionTable();
-      shared_info->GetActiveBytecodeArray(isolate)->set_source_position_table(
-          source_position_table, kReleaseStore);
+      debug_info.value()
+          ->DebugBytecodeArray(isolate)
+          ->set_source_position_table(source_position_table, kReleaseStore);
     }
   }
 
@@ -3333,7 +3361,6 @@ void Compiler::CompileOptimized(Isolate* isolate,
   DirectHandle<Code> code;
   if (GetOrCompileOptimized(isolate, function, mode, code_kind)
           .ToHandle(&code)) {
-    function->UpdateOptimizedCode(isolate, *code);
     DCHECK_IMPLIES(v8_flags.log_function_events,
                    function->IsLoggingRequested(isolate));
   } else {

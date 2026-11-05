@@ -1566,6 +1566,9 @@ config("features") {
   if (v8_fuzzilli) {
     defines += [ "V8_FUZZILLI" ]
   }
+  if (v8_redline) {
+    defines += [ "V8_REDLINE" ]
+  }
   if (v8_enable_builtins_profiling) {
     defines += [ "V8_ENABLE_BUILTINS_PROFILING" ]
   }
@@ -3281,7 +3284,6 @@ template("run_mksnapshot") {
                                         "root_out_dir") + "/mksnapshot",
                          root_build_dir),
       "--turbo_instruction_scheduling",
-      "--turbo-always-optimize-spills",
 
       # In cross builds, the snapshot may be generated for both the host and
       # target toolchains.  The same host binary is used to generate both, so
@@ -7387,7 +7389,6 @@ v8_cluster_source_set("v8_base_without_compiler") {
       "src/diagnostics/etw-isolate-operations-win.cc",
       "src/diagnostics/etw-jit-metadata-win.cc",
       "src/diagnostics/etw-jit-win.cc",
-      "src/runtime/runtime-etw.cc",
     ]
   }
 
@@ -7445,6 +7446,10 @@ v8_cluster_source_set("v8_base_without_compiler") {
   if (v8_fuzzilli) {
     sources += [ "src/fuzzilli/fuzzilli.cc" ]
     public_deps += [ ":fuzzilli_cov" ]
+  }
+
+  if (v8_redline) {
+    public_deps += [ "experimental/redline/d8:v8_redline" ]
   }
 
   if (v8_dumpling) {
@@ -8952,6 +8957,7 @@ group("v8_fuzzers") {
 if (is_component_build) {
   v8_component("v8") {
     sources = [ "src/utils/v8dll-main.cc" ]
+    public = []
 
     deps = [
       ":v8_base",

@@ -2159,11 +2159,16 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       Register value = i.InputRegister(index);
 
       DCHECK(v8_flags.verify_write_barriers);
-      auto ool = zone()->New<OutOfLineVerifySkippedWriteBarrier>(
-          this, object, value, i.TempRegister(0));
-      __ MaybeJumpIfReadOnlyOrSmallSmi(value, ool->exit());
-      __ JumpIfNotSmi(value, ool->entry());
-      __ bind(ool->exit());
+      if (CheckSmiField::decode(instr->opcode())) {
+        Condition is_smi = __ CheckSmi(value);
+        __ Check(is_smi, AbortReason::kTaggedSignedNotSmi);
+      } else {
+        auto ool = zone()->New<OutOfLineVerifySkippedWriteBarrier>(
+            this, object, value, i.TempRegister(0));
+        __ MaybeJumpIfReadOnlyOrSmallSmi(value, ool->exit());
+        __ JumpIfNotSmi(value, ool->entry());
+        __ bind(ool->exit());
+      }
 
       if (arch_opcode == kArchStoreSkippedWriteBarrier) {
         EmitTSANAwareStore(zone(), this, masm(), operand, value, i,
@@ -3973,12 +3978,16 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
         switch (lane_size) {
           case LaneSize::kL16: {
             // F16x8Sqrt
-            CpuFeatureScope f16c_scope(masm(), F16C);
-            CpuFeatureScope avx_scope(masm(), AVX);
-
-            __ vcvtph2ps(kScratchSimd256Reg, src);
-            __ vsqrtps(kScratchSimd256Reg, kScratchSimd256Reg);
-            __ vcvtps2ph(dst, kScratchSimd256Reg, 0);
+            if (UseAvx10_1()) {
+              CpuFeatureScope avx10_1_scope(masm(), AVX10_1);
+              __ vsqrtph(dst, src);
+            } else {
+              CpuFeatureScope f16c_scope(masm(), F16C);
+              CpuFeatureScope avx_scope(masm(), AVX);
+              __ vcvtph2ps(kScratchSimd256Reg, src);
+              __ vsqrtps(kScratchSimd256Reg, kScratchSimd256Reg);
+              __ vcvtps2ph(dst, kScratchSimd256Reg, 0);
+            }
             break;
           }
           case LaneSize::kL32: {
@@ -4522,11 +4531,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       __ Cvtdq2pd(i.OutputSimd128Register(), i.InputSimd128Register(0));
       break;
     }
-    case kX64F64x4ConvertI32x4S: {
-      CpuFeatureScope avx_scope(masm(), AVX);
-      __ vcvtdq2pd(i.OutputSimd256Register(), i.InputSimd128Register(0));
-      break;
-    }
     case kX64F64x2ConvertLowI32x4U: {
       __ F64x2ConvertLowI32x4U(i.OutputSimd128Register(),
                                i.InputSimd128Register(0), kScratchRegister);
@@ -4543,11 +4547,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     }
     case kX64F32x4DemoteF64x2Zero: {
       __ Cvtpd2ps(i.OutputSimd128Register(), i.InputSimd128Register(0));
-      break;
-    }
-    case kX64F32x4DemoteF64x4: {
-      CpuFeatureScope avx_scope(masm(), AVX);
-      __ vcvtpd2ps(i.OutputSimd128Register(), i.InputSimd256Register(0));
       break;
     }
     case kX64I32x4TruncSatF64x2SZero: {
@@ -4746,12 +4745,24 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     }
     case kX64Minph: {
       DCHECK_EQ(VectorLengthField::decode(opcode), VectorLength::kV128);
-      ASSEMBLE_SIMD_F16x8_BINOP(vminps);
+      if (UseAvx10_1()) {
+        CpuFeatureScope avx10_1_scope(masm(), AVX10_1);
+        __ vminph(i.OutputSimd128Register(), i.InputSimd128Register(0),
+                  i.InputSimd128Register(1));
+      } else {
+        ASSEMBLE_SIMD_F16x8_BINOP(vminps);
+      }
       break;
     }
     case kX64Maxph: {
       DCHECK_EQ(VectorLengthField::decode(opcode), VectorLength::kV128);
-      ASSEMBLE_SIMD_F16x8_BINOP(vmaxps);
+      if (UseAvx10_1()) {
+        CpuFeatureScope avx10_1_scope(masm(), AVX10_1);
+        __ vmaxph(i.OutputSimd128Register(), i.InputSimd128Register(0),
+                  i.InputSimd128Register(1));
+      } else {
+        ASSEMBLE_SIMD_F16x8_BINOP(vmaxps);
+      }
       break;
     }
     case kX64F32x8Pmin: {
@@ -8707,7 +8718,11 @@ void CodeGenerator::AssembleReturn(InstructionOperand* additional_pop_count) {
     Register scratch_reg = r10;
     DCHECK(!call_descriptor->CalleeSavedRegisters().has(scratch_reg));
     int additional_count = g.ToConstant(additional_pop_count).ToInt32();
-    size_t pop_size = (parameter_slots + additional_count) * kSystemPointerSize;
+    // With 16-byte stack alignment, the caller pushed a padding slot above an
+    // odd number of stack arguments. Like on arm64, the callee drops it.
+    size_t pop_size =
+        AddArgumentPaddingSlots(parameter_slots + additional_count) *
+        kSystemPointerSize;
     CHECK_LE(pop_size, static_cast<size_t>(std::numeric_limits<int>::max()));
     __ Ret(static_cast<int>(pop_size), scratch_reg);
   } else {

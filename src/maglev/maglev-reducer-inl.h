@@ -875,6 +875,8 @@ ReduceResult MaglevReducer<BaseT>::BuildInitializeStore_Tagged(
   }
 
   DCHECK(value->is_tagged());
+  RETURN_IF_ABORT(BuildStoreTaggedField(object, value, desc.offset, store_mode,
+                                        PropertyKey::None(), maybe_assigned));
   if (InlinedAllocation* inlined_value = value->TryCast<InlinedAllocation>()) {
     // Add to the escape set.
     auto escape_deps = graph()->allocations_escape_map().find(object);
@@ -884,11 +886,10 @@ ReduceResult MaglevReducer<BaseT>::BuildInitializeStore_Tagged(
     auto& elided_map = graph()->allocations_elide_map();
     auto elided_deps = elided_map.try_emplace(inlined_value, zone()).first;
     elided_deps->second.push_back(object);
-    inlined_value->AddNonEscapingUses();
+    AddNonEscapingUses(inlined_value, 1);
   }
 
-  return BuildStoreTaggedField(object, value, desc.offset, store_mode,
-                               PropertyKey::None(), maybe_assigned);
+  return ReduceResult::Done();
 }
 
 template <typename BaseT>
@@ -5042,13 +5043,13 @@ void MaglevReducer<BaseT>::RecordKnownProperty(
     PropertyConstness constness, compiler::AccessMode access_mode) {
   DCHECK(!value->is_conversion());
   auto& props_for_key =
-      known_node_aspects().GetLoadedPropertiesForKey(zone(), constness, key);
+      known_node_aspects().GetLoadedPropertiesForKey(constness, key);
   if (constness == PropertyConstness::kMutable && IsAnyStore(access_mode)) {
     if constexpr (ReducerBaseWithLoopEffectTracking<BaseT>) {
       if (base_->loop_effects()) {
         base_->loop_effects()->keys_cleared.insert(key);
         if (key.type() == PropertyKey::kName) {
-          // Also mark the double-field HeapNumber box key as cleared for LICM.
+          // Also mark the double-field HeapNumber box key as cleared.
           base_->loop_effects()->keys_cleared.insert(
               PropertyKey::DoubleField(key.name()));
         }

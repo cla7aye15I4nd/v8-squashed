@@ -1481,7 +1481,12 @@ void VisitStoreCommon(InstructionSelector* selector,
 
   if (write_barrier_kind != kNoWriteBarrier &&
       !v8_flags.disable_write_barriers) {
-    DCHECK(CanBeTaggedOrCompressedOrTrustedPointer(store_rep.representation()));
+#if DEBUG
+    MachineRepresentation mach_rep = store_rep.representation();
+    DCHECK(CanBeTaggedOrCompressedOrTrustedPointer(mach_rep) ||
+           (write_barrier_kind == kSkippedWriteBarrier &&
+            mach_rep == MachineRepresentation::kTaggedSigned));
+#endif  // DEBUG
     // Uncompressed stores should not happen if we need a write barrier.
     CHECK((store.ts_stored_rep() !=
            MemoryRepresentation::AnyUncompressedTagged()) &&
@@ -1514,6 +1519,8 @@ void VisitStoreCommon(InstructionSelector* selector,
     } else if (write_barrier_kind == kSkippedWriteBarrier) {
       code = is_atomic ? kArchAtomicStoreSkippedWriteBarrier
                        : kArchStoreSkippedWriteBarrier;
+      code |= CheckSmiField::encode(store_rep.representation() ==
+                                    MachineRepresentation::kTaggedSigned);
     } else {
       code = is_atomic ? kArchAtomicStoreWithWriteBarrier
                        : kArchStoreWithWriteBarrier;
@@ -1553,22 +1560,11 @@ void VisitStoreCommon(InstructionSelector* selector,
 
     if (is_seqcst) {
       // SeqCst stores emit XCHG instead of MOV, so encode the inputs as we
-      // would for XCHG. XCHG can't encode the value as an immediate and has
-      // fewer addressing modes available.
+      // would for XCHG. XCHG can't encode the value as an immediate.
       inputs[input_count++] = g.UseUniqueRegister(value);
-      inputs[input_count++] = g.UseUniqueRegister(base);
-      DCHECK_EQ(element_size_log2, 0);
-      if (index.valid()) {
-        DCHECK_EQ(displacement, 0);
-        inputs[input_count++] =
-            g.GetEffectiveIndexOperand(index.value(), &addressing_mode);
-      } else if (displacement != 0) {
-        DCHECK(ValueFitsIntoImmediate(displacement));
-        inputs[input_count++] = g.UseImmediate(displacement);
-        addressing_mode = kMode_MRI;
-      } else {
-        addressing_mode = kMode_MR;
-      }
+      addressing_mode = g.GetEffectiveAddressMemoryOperand(
+          store, inputs, &input_count,
+          X64OperandGenerator::RegisterUseKind::kUseUniqueRegister);
       opcode = GetSeqCstStoreOpcode(store_rep);
     } else {
       if (ElementSizeLog2Of(store_rep.representation()) <
@@ -4808,11 +4804,9 @@ VISIT_ATOMIC_BINOP(Xor)
 
 #define SIMD_UNOP_LIST(V)   \
   V(F64x2ConvertLowI32x4S)  \
-  V(F64x4ConvertI32x4S)     \
   V(F32x4SConvertI32x4)     \
   V(F32x8SConvertI32x8)     \
   V(F32x4DemoteF64x2Zero)   \
-  V(F32x4DemoteF64x4)       \
   V(I16x8SConvertF16x8)     \
   V(I16x8UConvertF16x8)     \
   V(F16x8SConvertI16x8)     \
@@ -5676,8 +5670,6 @@ void InstructionSelector::VisitExtractF128(OpIndex node) {
          g.UseImmediate(op.lane));
   }
 }
-
-void InstructionSelector::VisitI8x32Shuffle(OpIndex node) { UNREACHABLE(); }
 #endif  // V8_ENABLE_SIMD256
 #endif  // V8_ENABLE_SIMD128
 
@@ -6023,34 +6015,35 @@ void InstructionSelector::VisitI64x4RelaxedLaneSelect(OpIndex node) {
 }
 #endif  // V8_ENABLE_SIMD256
 
-void InstructionSelector::VisitF16x8Pmin(OpIndex node) {
-  X64OperandGenerator g(this);
-  const Simd128BinopOp& op = Cast<Simd128BinopOp>(node);
+namespace {
+void VisitF16x8PminOrPmax(InstructionSelector* selector, OpIndex node,
+                          ArchOpcode opcode) {
+  X64OperandGenerator g(selector);
+  const Simd128BinopOp& op = selector->Cast<Simd128BinopOp>(node);
   DCHECK_EQ(op.input_count, 2);
   InstructionOperand dst = g.DefineAsRegister(node);
   InstructionCode instr_code =
-      kX64Minph | VectorLengthField::encode(VectorLength::kV128);
+      opcode | VectorLengthField::encode(VectorLength::kV128);
+  if (UseAvx10_1()) {
+    selector->Emit(instr_code, dst, g.UseRegister(op.right()),
+                   g.UseRegister(op.left()));
+    return;
+  }
   InstructionOperand temps[] = {g.TempSimd256Register(),
                                 g.TempSimd256Register()};
   size_t temp_count = arraysize(temps);
 
-  Emit(instr_code, dst, g.UseUniqueRegister(op.right()),
-       g.UseUniqueRegister(op.left()), temp_count, temps);
+  selector->Emit(instr_code, dst, g.UseUniqueRegister(op.right()),
+                 g.UseUniqueRegister(op.left()), temp_count, temps);
+}
+}  // namespace
+
+void InstructionSelector::VisitF16x8Pmin(OpIndex node) {
+  VisitF16x8PminOrPmax(this, node, kX64Minph);
 }
 
 void InstructionSelector::VisitF16x8Pmax(OpIndex node) {
-  X64OperandGenerator g(this);
-  const Simd128BinopOp& op = Cast<Simd128BinopOp>(node);
-  DCHECK_EQ(op.input_count, 2);
-  InstructionOperand dst = g.DefineAsRegister(node);
-  InstructionCode instr_code =
-      kX64Maxph | VectorLengthField::encode(VectorLength::kV128);
-  InstructionOperand temps[] = {g.TempSimd256Register(),
-                                g.TempSimd256Register()};
-  size_t temp_count = arraysize(temps);
-
-  Emit(instr_code, dst, g.UseUniqueRegister(op.right()),
-       g.UseUniqueRegister(op.left()), temp_count, temps);
+  VisitF16x8PminOrPmax(this, node, kX64Maxph);
 }
 
 void InstructionSelector::VisitF16x8DemoteF64x2Zero(OpIndex node) {

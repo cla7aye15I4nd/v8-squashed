@@ -569,6 +569,7 @@ constexpr bool CanTriggerGC(T... properties) {
   F(ConstructInternalizedString, 1, 1)                                   \
   F(ConstructSlicedString, 2, 1)                                         \
   F(ConstructThinString, 1, 1)                                           \
+  F(ConsumeCodeCache, 2, 1)                                              \
   F(CurrentFrameIsTurbofan, 0, 1)                                        \
   F(DebugPrint, -1, 1, RuntimeCallProperty::kCannotTriggerGC)            \
   F(DebugPrintCppHeapPointerTable, -1, 1)                                \
@@ -595,6 +596,7 @@ constexpr bool CanTriggerGC(T... properties) {
   F(GetBytecode, 1, 1)                                                   \
   F(ExhaustInterruptBudget, 1, 1)                                        \
   F(GetCallable, 1, 1)                                                   \
+  F(GetCodeCache, 1, 1)                                                  \
   F(GetFeedback, 1, 1)                                                   \
   F(GetFunctionForCurrentFrame, 0, 1)                                    \
   F(GetInitializerFunction, 1, 1)                                        \
@@ -703,8 +705,6 @@ constexpr bool CanTriggerGC(T... properties) {
   F(GetHoleNaNUpper, 0, 1)                                               \
   F(GetHoleNaN, 0, 1)                                                    \
   F(GetUndefinedNaN, 0, 1)
-
-#define FOR_EACH_INTRINSIC_ETW(F, I) F(RequestEnableETW, 0, 1)
 
 #define FOR_EACH_INTRINSIC_TYPEDARRAY(F, I)    \
   F(ArrayBufferDetach, -1, 1)                  \
@@ -920,8 +920,7 @@ constexpr bool CanTriggerGC(T... properties) {
   IF_WASM(FOR_EACH_INTRINSIC_WASM, F, I)                          \
   IF_WASM(FOR_EACH_INTRINSIC_WASM_TEST, F, I)                     \
   IF_WASM_DRUMBRAKE(FOR_EACH_INTRINSIC_WASM_DRUMBRAKE_TEST, F, I) \
-  FOR_EACH_INTRINSIC_WEAKREF(F, I)                                \
-  IF_ETW(FOR_EACH_INTRINSIC_ETW, F, I)
+  FOR_EACH_INTRINSIC_WEAKREF(F, I)
 
 #define FOR_EACH_THROWING_INTRINSIC(F)       \
   FOR_EACH_THROWING_INTRINSIC_CLASSES(F, F)  \

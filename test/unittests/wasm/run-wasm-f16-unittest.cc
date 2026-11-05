@@ -159,6 +159,75 @@ UN_OP_LIST(TEST_UN_OP)
 #undef TEST_UN_OP
 #undef UN_OP_LIST
 
+WASM_COMPILED_EXEC_TEST(F16x8SqrtRaw) {
+  i::v8_flags.wasm_fp16.Set(true);
+  WasmRunner<int32_t> runner(execution_tier);
+  constexpr int kLanes = 8;
+  uint16_t* memory = runner.builder().AddMemoryElems<uint16_t>(5 * kLanes);
+  uint8_t input = runner.AllocateLocal(kWasmS128);
+  uint8_t root = runner.AllocateLocal(kWasmS128);
+  runner.Build(
+      {WASM_LOCAL_SET(input, WASM_SIMD_LOAD_MEM(WASM_ZERO)),
+       WASM_LOCAL_SET(root,
+                      WASM_SIMD_UNOP(kExprF16x8Sqrt, WASM_LOCAL_GET(input))),
+       WASM_SIMD_STORE_MEM(WASM_I32V(16), WASM_LOCAL_GET(root)),
+       WASM_SIMD_STORE_MEM(
+           WASM_I32V(32), WASM_SIMD_UNOP(kExprF16x8Sqrt, WASM_LOCAL_GET(root))),
+       WASM_SIMD_STORE_MEM(
+           WASM_I32V(48),
+           WASM_SIMD_UNOP(kExprF16x8Sqrt, WASM_SIMD_LOAD_MEM(WASM_ZERO))),
+       WASM_SIMD_STORE_MEM(WASM_I32V(64), WASM_LOCAL_GET(input)), WASM_ONE});
+
+  auto square_root = [](uint16_t bits) {
+    double value = fp16_ieee_to_fp32_value(bits);
+    return DoubleToFloat16(std::sqrt(value));
+  };
+  auto check_lane = [](uint16_t input_bits, uint16_t expected,
+                       uint16_t actual) {
+    if (!isnan(expected)) {
+      CHECK_EQ(expected, actual);
+      return;
+    }
+    CHECK_EQ(0x7e00, actual & 0x7e00);
+    if (!isnan(input_bits) || IsCanonical(input_bits)) {
+      CHECK(IsCanonical(actual));
+    }
+  };
+  auto check = [&]() {
+    CHECK_EQ(1, runner.Call());
+    for (int lane = 0; lane < kLanes; ++lane) {
+      uint16_t input_bits = runner.builder().ReadMemory(&memory[lane]);
+      uint16_t expected_root = square_root(input_bits);
+      uint16_t actual_root =
+          runner.builder().ReadMemory(&memory[kLanes + lane]);
+      check_lane(input_bits, expected_root, actual_root);
+      check_lane(actual_root, square_root(expected_root),
+                 runner.builder().ReadMemory(&memory[2 * kLanes + lane]));
+      check_lane(input_bits, expected_root,
+                 runner.builder().ReadMemory(&memory[3 * kLanes + lane]));
+      CHECK_EQ(input_bits,
+               runner.builder().ReadMemory(&memory[4 * kLanes + lane]));
+    }
+  };
+
+  constexpr struct {
+    uint16_t input;
+    uint16_t expected;
+  } rounding_cases[kLanes] = {
+      {0x0000, 0x0000}, {0x8000, 0x8000}, {0x0001, 0x0c00}, {0x03ff, 0x1fff},
+      {0x0401, 0x2000}, {0x4000, 0x3da8}, {0x7bff, 0x5bff}, {0x7c00, 0x7c00}};
+  for (int lane = 0; lane < kLanes; ++lane) {
+    const auto& test = rounding_cases[lane];
+    CHECK_EQ(test.expected, square_root(test.input));
+    runner.builder().WriteMemory(&memory[lane], test.input);
+  }
+  check();
+  for (int lane = 0; lane < kLanes; ++lane) {
+    CHECK_EQ(rounding_cases[lane].expected,
+             runner.builder().ReadMemory(&memory[kLanes + lane]));
+  }
+}
+
 #define CMP_OP_LIST(V) \
   V(Eq, ==)            \
   V(Ne, !=)            \
@@ -640,6 +709,117 @@ WASM_COMPILED_EXEC_TEST(F16x8DivRaw) {
     }
     check();
   }
+}
+
+void RunF16x8PminPmaxRaw(TestExecutionTier execution_tier, bool is_min) {
+  i::v8_flags.wasm_fp16.Set(true);
+  WasmRunner<int32_t> runner(execution_tier);
+  constexpr int kLanes = 8;
+  uint16_t* memory = runner.builder().AddMemoryElems<uint16_t>(11 * kLanes);
+  uint8_t lhs = runner.AllocateLocal(kWasmS128);
+  uint8_t rhs = runner.AllocateLocal(kWasmS128);
+  uint8_t result = runner.AllocateLocal(kWasmS128);
+  WasmOpcode opcode = is_min ? kExprF16x8Pmin : kExprF16x8Pmax;
+  runner.Build(
+      {WASM_LOCAL_SET(lhs, WASM_SIMD_LOAD_MEM(WASM_ZERO)),
+       WASM_LOCAL_SET(rhs, WASM_SIMD_LOAD_MEM(WASM_I32V(16))),
+       WASM_LOCAL_SET(result, WASM_SIMD_BINOP(opcode, WASM_LOCAL_GET(lhs),
+                                              WASM_LOCAL_GET(rhs))),
+       WASM_SIMD_STORE_MEM(WASM_I32V(32), WASM_LOCAL_GET(result)),
+       WASM_SIMD_STORE_MEM(
+           WASM_I32V(48),
+           WASM_SIMD_BINOP(opcode, WASM_LOCAL_GET(rhs), WASM_LOCAL_GET(lhs))),
+       WASM_SIMD_STORE_MEM(
+           WASM_I32V(64),
+           WASM_SIMD_BINOP(opcode, WASM_LOCAL_GET(lhs), WASM_LOCAL_GET(lhs))),
+       WASM_SIMD_STORE_MEM(WASM_I32V(80),
+                           WASM_SIMD_BINOP(opcode, WASM_LOCAL_GET(rhs),
+                                           WASM_LOCAL_GET(result))),
+       WASM_SIMD_STORE_MEM(
+           WASM_I32V(96), WASM_SIMD_BINOP(opcode, WASM_SIMD_LOAD_MEM(WASM_ZERO),
+                                          WASM_LOCAL_GET(rhs))),
+       WASM_SIMD_STORE_MEM(WASM_I32V(112),
+                           WASM_SIMD_BINOP(opcode, WASM_LOCAL_GET(lhs),
+                                           WASM_SIMD_LOAD_MEM(WASM_I32V(16)))),
+       WASM_SIMD_STORE_MEM(WASM_I32V(128), WASM_LOCAL_GET(lhs)),
+       WASM_SIMD_STORE_MEM(WASM_I32V(144), WASM_LOCAL_GET(rhs)),
+       WASM_LOCAL_SET(lhs, WASM_SIMD_LOAD_MEM(WASM_ZERO)),
+       WASM_SIMD_STORE_MEM(
+           WASM_I32V(160),
+           WASM_SIMD_OPN(
+               opcode, WASM_LOCAL_GET(lhs), WASM_LOCAL_GET(lhs),
+               WASM_LOCAL_SET(lhs, WASM_SIMD_I32x4_SPLAT(WASM_ZERO)))),
+       WASM_ONE});
+
+  bool native = false;
+#if V8_TARGET_ARCH_X64
+  native = UseAvx10_1() && (execution_tier == TestExecutionTier::kLiftoff ||
+                            CpuFeatures::IsSupported(F16C));
+#endif
+  auto check_lane = [=](uint16_t lhs_bits, uint16_t rhs_bits, uint16_t actual) {
+    float lhs_value = fp16_ieee_to_fp32_value(lhs_bits);
+    float rhs_value = fp16_ieee_to_fp32_value(rhs_bits);
+    bool select_rhs = is_min ? rhs_value < lhs_value : lhs_value < rhs_value;
+    uint16_t expected = select_rhs ? rhs_bits : lhs_bits;
+    if (native || !isnan(expected)) {
+      CHECK_EQ(expected, actual);
+      return;
+    }
+    CHECK(actual == expected || (actual & 0x7e00) == 0x7e00);
+    if (IsCanonical(expected)) CHECK(IsCanonical(actual));
+  };
+  auto check = [&]() {
+    CHECK_EQ(1, runner.Call());
+    for (int lane = 0; lane < kLanes; ++lane) {
+      auto read = [&](int slot) {
+        return runner.builder().ReadMemory(&memory[slot * kLanes + lane]);
+      };
+      uint16_t lhs_bits = read(0), rhs_bits = read(1);
+      check_lane(lhs_bits, rhs_bits, read(2));
+      check_lane(rhs_bits, lhs_bits, read(3));
+      check_lane(lhs_bits, lhs_bits, read(4));
+      check_lane(rhs_bits, read(2), read(5));
+      check_lane(lhs_bits, rhs_bits, read(6));
+      check_lane(lhs_bits, rhs_bits, read(7));
+      CHECK_EQ(lhs_bits, read(8));
+      CHECK_EQ(rhs_bits, read(9));
+      check_lane(lhs_bits, lhs_bits, read(10));
+    }
+  };
+
+  constexpr uint16_t inputs[] = {
+      0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x83ff, 0x0400, 0x8400,
+      0x0401, 0x8401, 0x3800, 0xb800, 0x3bff, 0xbbff, 0x3c00, 0xbc00,
+      0x3c01, 0xbc01, 0x4000, 0xc000, 0x7bff, 0xfbff, 0x7c00, 0xfc00,
+      0x7c01, 0xfc01, 0x7dff, 0xfdff, 0x7e00, 0xfe00, 0x7e55, 0xfe55};
+  for (size_t left = 0; left < arraysize(inputs); left += kLanes) {
+    for (size_t right = 0; right < arraysize(inputs); ++right) {
+      for (int lane = 0; lane < kLanes; ++lane) {
+        runner.builder().WriteMemory(&memory[lane], inputs[left + lane]);
+        runner.builder().WriteMemory(
+            &memory[kLanes + lane],
+            inputs[(right + 3 * lane) % arraysize(inputs)]);
+      }
+      check();
+    }
+  }
+
+  base::RandomNumberGenerator rng(v8_flags.random_seed);
+  for (int trial = 0; trial < 512; ++trial) {
+    for (int lane = 0; lane < 2 * kLanes; ++lane) {
+      runner.builder().WriteMemory(&memory[lane],
+                                   static_cast<uint16_t>(rng.NextInt(65536)));
+    }
+    check();
+  }
+}
+
+WASM_COMPILED_EXEC_TEST(F16x8PminRaw) {
+  RunF16x8PminPmaxRaw(execution_tier, true);
+}
+
+WASM_COMPILED_EXEC_TEST(F16x8PmaxRaw) {
+  RunF16x8PminPmaxRaw(execution_tier, false);
 }
 
 WASM_EXEC_TEST(F16x8ConvertI16x8) {

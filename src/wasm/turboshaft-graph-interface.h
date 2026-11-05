@@ -102,8 +102,23 @@ class V8_EXPORT_PRIVATE WasmGraphBuilderBase {
       ConstOrV<Word32> func_index,
       V<WasmTrustedInstanceData> trusted_instance_data);
 
+  V<WasmInternalFunction> LoadInternalFunctionFromFuncRef(
+      V<WasmFuncRef> func_ref, LoadOp::Kind load_kind);
+
+  // Dynamically loads the call target and `implicit_arg` at runtime from a
+  // `V<WasmInternalFunction>` node (used by standalone wrappers and Wasm
+  // `call_ref`).
   std::pair<V<Word32>, V<ExposedTrustedObject>>
   BuildFunctionTargetAndImplicitArg(V<WasmInternalFunction> internal_function);
+
+  // Resolves the call target (a permanent `WasmCodePointer` table index) and
+  // `implicit_arg` at compile time from a statically known
+  // `WasmInternalFunction` handle, embedding them as constants.
+  // Only valid when inlining into isolate-dependent JS code where the target
+  // `WasmInternalFunction` is fixed at compile time.
+  std::pair<V<Word32>, V<ExposedTrustedObject>>
+  BuildFunctionTargetAndImplicitArg(
+      DirectHandle<WasmInternalFunction> internal_function);
 
   RegisterRepresentation RepresentationFor(ValueTypeBase type);
 

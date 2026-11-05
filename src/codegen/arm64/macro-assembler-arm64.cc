@@ -992,11 +992,11 @@ void MacroAssembler::LoadStoreMacroComplex(const CPURegister& rt,
     // Post-index beyond unscaled addressing range.
     DCHECK(!is_imm_unscaled);
     LoadStore(rt, MemOperand(addr.base()), op);
-    add(addr.base(), addr.base(), offset);
+    Add(addr.base(), addr.base(), offset);
   } else {
     // Pre-index beyond unscaled addressing range.
     DCHECK(!is_imm_unscaled && addr.IsPreIndex());
-    add(addr.base(), addr.base(), offset);
+    Add(addr.base(), addr.base(), offset);
     LoadStore(rt, MemOperand(addr.base()), op);
   }
 }
@@ -4191,6 +4191,7 @@ void MacroAssembler::PushDispatchHandle(Register dispatch_handle,
 #ifdef V8_ENABLE_SANDBOX
   DCHECK(!AreAliased(dispatch_handle, other, scratch1, scratch2));
   AssertZeroExtended(dispatch_handle);
+  Bic(dispatch_handle, dispatch_handle, (1 << kJSDispatchHandleShift) - 1);
   LoadParameterCountFromJSDispatchTable(scratch1, dispatch_handle, scratch2);
   Bfi(dispatch_handle, scratch1, 32, 32);
 #endif

@@ -214,15 +214,15 @@ uint32_t RelocInfo::wasm_call_tag() const {
 Operand::Operand(Handle<HeapObject> handle, RelocInfo::Mode rmode)
     : rm_(no_reg), rmode_(rmode) {
   DCHECK(RelocInfo::IsEmbeddedObjectMode(rmode) || RelocInfo::IsNoInfo(rmode));
-  value_.immediate = static_cast<intptr_t>(handle.address());
+  immediate_ = static_cast<intptr_t>(handle.address());
 }
 
 Operand Operand::EmbeddedNumber(double value) {
   int32_t smi;
   if (DoubleToSmiInteger(value, &smi)) return Operand(Smi::FromInt(smi));
   Operand result(0, RelocInfo::FULL_EMBEDDED_OBJECT);
-  result.is_heap_number_request_ = true;
-  result.value_.heap_number_request = HeapNumberRequest(value);
+  result.heap_number_request_.emplace(value);
+  DCHECK(result.IsHeapNumberRequest());
   return result;
 }
 
@@ -1153,7 +1153,10 @@ void Assembler::stop(uint32_t code) {
   DCHECK_GT(code, kMaxWatchpointCode);
   DCHECK_LE(code, kMaxStopCode);
 #if defined(V8_HOST_ARCH_RISCV64) || defined(V8_HOST_ARCH_RISCV32)
-  break_(0x54321);
+  // break_() follows the ebreak with a lui carrying the code for the
+  // simulator. Running natively there is no simulator to read it, and the
+  // trap ends execution at the ebreak.
+  ebreak();
 #else  // V8_HOST_ARCH_RISCV64 || V8_HOST_ARCH_RISCV32
   break_(code, true);
 #endif
