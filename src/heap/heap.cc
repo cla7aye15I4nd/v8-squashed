@@ -123,7 +123,6 @@
 #include "src/objects/heap-object-field-inl.h"
 #include "src/objects/heap-object-set-map-inl.h"
 #include "src/objects/instance-type.h"
-#include "src/objects/js-struct.h"
 #include "src/objects/js-weak-refs-inl.h"
 #include "src/objects/maybe-object.h"
 #include "src/objects/objects.h"
@@ -769,10 +768,8 @@ void Heap::PrintFreeListsStats() {
                  "[category: length || total free bytes]\n");
   }
 
-  std::vector<int> categories_lengths(
-      old_space()->free_list()->number_of_categories(), 0);
-  std::vector<size_t> categories_sums(
-      old_space()->free_list()->number_of_categories(), 0);
+  std::vector<int> categories_lengths(FreeList::kNumberOfCategories, 0);
+  std::vector<size_t> categories_sums(FreeList::kNumberOfCategories, 0);
   unsigned int pageCnt = 0;
 
   // This loops computes freelists lengths and sum.
@@ -785,8 +782,7 @@ void Heap::PrintFreeListsStats() {
       out_str << "Page " << std::setw(4) << pageCnt;
     }
 
-    for (int cat = kFirstCategory;
-         cat <= old_space()->free_list()->last_category(); cat++) {
+    for (int cat = kFirstCategory; cat <= FreeList::kLastCategory; cat++) {
       FreeListCategory* free_list =
           page->free_list_category(static_cast<FreeListCategoryType>(cat));
       int length = free_list->FreeListLength();
@@ -795,8 +791,7 @@ void Heap::PrintFreeListsStats() {
       if (v8_flags.trace_gc_freelists_verbose) {
         out_str << "[" << cat << ": " << std::setw(4) << length << " || "
                 << std::setw(6) << sum << " ]"
-                << (cat == old_space()->free_list()->last_category() ? "\n"
-                                                                     : ", ");
+                << (cat == FreeList::kLastCategory ? "\n" : ", ");
       }
       categories_lengths[cat] += length;
       categories_sums[cat] += sum;
@@ -825,12 +820,11 @@ void Heap::PrintFreeListsStats() {
                "FreeLists global statistics: "
                "[category: length || total free KB]\n");
   std::ostringstream out_str;
-  for (int cat = kFirstCategory;
-       cat <= old_space()->free_list()->last_category(); cat++) {
+  for (int cat = kFirstCategory; cat <= FreeList::kLastCategory; cat++) {
     out_str << "[" << cat << ": " << categories_lengths[cat] << " || "
             << std::fixed << std::setprecision(2)
             << static_cast<double>(categories_sums[cat]) / KB << " KB]"
-            << (cat == old_space()->free_list()->last_category() ? "\n" : ", ");
+            << (cat == FreeList::kLastCategory ? "\n" : ", ");
   }
   PrintIsolate(isolate_, "%s", out_str.str().c_str());
 }
@@ -3091,10 +3085,9 @@ class LeftTrimmerVerifierRootVisitor : public RootVisitor {
   void VisitCompressedRootPointers(Root root, const char* description,
                                    OffHeapObjectSlot start,
                                    OffHeapObjectSlot end) override {
-    DCHECK(root == Root::kStringTable ||
-           root == Root::kSharedStructTypeRegistry);
-    // We can skip iterating the string table and shared struct type registry,
-    // they don't point to any fixed arrays.
+    DCHECK_EQ(root, Root::kStringTable);
+    // We can skip iterating the string table, it doesn't point to any fixed
+    // arrays.
   }
 
  private:
@@ -4422,13 +4415,6 @@ void Heap::IterateWeakRoots(RootVisitor* v, base::EnumSet<SkipRoot> options) {
     external_string_table_.Iterate(v);
   }
   v->Synchronize(VisitorSynchronization::kExternalStringsTable);
-  if (!options.contains(SkipRoot::kOldGeneration) &&
-      !options.contains(SkipRoot::kUnserializable) &&
-      isolate()->is_shared_space_isolate() &&
-      isolate()->shared_struct_type_registry()) {
-    isolate()->shared_struct_type_registry()->IterateElements(isolate(), v);
-  }
-  v->Synchronize(VisitorSynchronization::kSharedStructTypeRegistry);
 }
 
 void Heap::IterateSmiRoots(RootVisitor* v) {
@@ -7463,24 +7449,29 @@ bool Heap::IsStressingScavenge() {
   return v8_flags.stress_scavenge > 0 && new_space();
 }
 
+void Heap::SetMarkingFlag(IsolateMarkingFlag flag, bool value) {
+  isolate()->isolate_data()->set_marking_flag(flag, value);
+}
+
 void Heap::SetIsMarkingFlag(bool value) {
-  isolate()->isolate_data()->is_marking_flag_ = value;
+  SetMarkingFlag(IsolateMarkingFlag::kLocalMajorMarking, value);
 }
 
 uint8_t* Heap::IsMarkingFlagAddress() {
-  return &isolate()->isolate_data()->is_marking_flag_;
+  return reinterpret_cast<uint8_t*>(
+      &isolate()->isolate_data()->is_marking_flag_);
 }
 
 void Heap::SetIsMinorMarkingFlag(bool value) {
-  isolate()->isolate_data()->is_minor_marking_flag_ = value;
+  SetMarkingFlag(IsolateMarkingFlag::kLocalMinorMarking, value);
+}
+
+void Heap::SetIsSharedMarkingFlag(bool value) {
+  SetMarkingFlag(IsolateMarkingFlag::kSharedMarking, value);
 }
 
 size_t Heap::PromotedSinceLastGC() {
   return limits()->PromotedSinceLastGC(OldGenerationSizeOfObjects());
-}
-
-uint8_t* Heap::IsMinorMarkingFlagAddress() {
-  return &isolate()->isolate_data()->is_minor_marking_flag_;
 }
 
 StrongRootAllocatorBase::StrongRootAllocatorBase(LocalHeap* heap)
@@ -7531,6 +7522,13 @@ void StrongRootAllocatorBase::deallocate_impl(Address* p, size_t n) noexcept {
 #ifdef V8_ENABLE_ALLOCATION_TIMEOUT
 void Heap::set_allocation_timeout(int allocation_timeout) {
   heap_allocator_->SetAllocationTimeout(allocation_timeout);
+}
+
+void Heap::ResetAllocationTimeouts() {
+  HeapAllocator::SetAllocationGcInterval(v8_flags.gc_interval);
+  heap_allocator_->UpdateAllocationTimeout();
+  set_dispatch_table_gc_interval(v8_flags.dispatch_table_gc_interval);
+  dispatch_table_allocations_ = 0;
 }
 #endif  // V8_ENABLE_ALLOCATION_TIMEOUT
 

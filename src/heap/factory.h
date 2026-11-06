@@ -284,8 +284,7 @@ class V8_EXPORT_PRIVATE Factory : public FactoryBase<Factory> {
     requires(
         std::is_convertible_v<HandleType<SeqString>, DirectHandle<SeqString>>)
   Handle<String> InternalizeSubString(HandleType<SeqString>, uint32_t from,
-                                      uint32_t length,
-                                      bool convert_encoding = false);
+                                      uint32_t length);
 
   // Internalized strings are created in the old generation (data space).
   // TODO(b/42203211): InternalizeString and InternalizeName are templatized so
@@ -1215,10 +1214,6 @@ class V8_EXPORT_PRIVATE Factory : public FactoryBase<Factory> {
                                 AllocationType allocation) {
     return New(map, allocation);
   }
-
-  DirectHandle<JSSharedStruct> NewJSSharedStruct(
-      DirectHandle<JSFunction> constructor,
-      MaybeDirectHandle<NumberDictionary> maybe_elements_template);
 
   DirectHandle<FunctionTemplateInfo> NewFunctionTemplateInfo(int length,
                                                              bool do_not_cache);

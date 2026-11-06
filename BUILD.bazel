@@ -171,6 +171,11 @@ v8_flag(
 )
 
 v8_flag(
+    name = "v8_enable_maglev_kna_btree",
+    default = True,
+)
+
+v8_flag(
     name = "v8_enable_undefined_double",
     default = True,
 )
@@ -579,6 +584,7 @@ v8_config(
         "v8_jitless": "V8_JITLESS",
         "v8_enable_vtunejit": "ENABLE_VTUNE_JIT_INTERFACE",
         "v8_enable_undefined_double": "V8_ENABLE_UNDEFINED_DOUBLE",
+        "v8_enable_maglev_kna_btree": "V8_ENABLE_MAGLEV_KNA_BTREE",
         "v8_use_host_cpu_arm_features": "V8_USE_HOST_CPU_ARM_FEATURES",
         "v8_x64_16byte_stack_alignment": "V8_X64_16BYTE_STACK_ALIGNMENT",
         "v8_support_la57": "V8_SUPPORT_LA57",
@@ -1334,7 +1340,6 @@ filegroup(
         "src/objects/js-regexp.tq",
         "src/objects/js-regexp-string-iterator.tq",
         "src/objects/js-shadow-realm.tq",
-        "src/objects/js-struct.tq",
         # Temporal is currently gn-only
         # "src/objects/js-temporal-objects.tq",
         "src/objects/js-weak-refs.tq",
@@ -1574,7 +1579,6 @@ filegroup(
         "src/builtins/builtins-shadow-realm.cc",
         "src/builtins/builtins-sharedarraybuffer.cc",
         "src/builtins/builtins-string.cc",
-        "src/builtins/builtins-struct.cc",
         "src/builtins/builtins-symbol.cc",
         # Temporal is currently gn-only
         # "src/builtins/builtins-temporal.cc",
@@ -2296,8 +2300,6 @@ filegroup(
         "src/objects/js-regexp-string-iterator-inl.h",
         "src/objects/js-shadow-realm.h",
         "src/objects/js-shadow-realm-inl.h",
-        "src/objects/js-struct.cc",
-        "src/objects/js-struct.h",
         # Temporal is currently gn-only
         # "src/objects/js-temporal-objects.cc",
         # "src/objects/js-temporal-objects.h",

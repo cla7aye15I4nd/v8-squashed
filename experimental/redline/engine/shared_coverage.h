@@ -34,18 +34,19 @@ class SharedCoverage {
   // the state; later calls only check that the target is the same binary.
   // `num_edges` is the size of the feature index space (CoverageMap::
   // num_edges()). Only features 1..counted_edges count for found_edges() and
-  // coverage_fraction(). Crash deduplication reads only the first
-  // `edge_bitmap_size` bytes (the edges, without bucket features). Zero means
-  // num_edges and bitmap_size.
+  // coverage_fraction(). Crash deduplication reads only the edges
+  // 1..real_edges (CoverageMap::real_edges()), not the bucket features. Zero
+  // means num_edges.
   bool Initialize(uint32_t num_edges, uint32_t bitmap_size, std::string* error,
-                  uint32_t counted_edges = 0, uint32_t edge_bitmap_size = 0);
+                  uint32_t counted_edges = 0, uint32_t real_edges = 0);
   bool initialized() const { return words_ != 0; }
 
   uint32_t num_edges() const { return num_edges_; }
   uint32_t found_edges() const {
     return found_edges_.load(std::memory_order_relaxed);
   }
-  // found_edges() / (num_edges() + 1), the ratio Fuzzilli reports.
+  // (found_edges() - suppressed_flaky_edges()) / (counted_edges + 1): the
+  // ratio Fuzzilli reports, without the suppressed flaky edges.
   double coverage_fraction() const;
 
   // Claims every edge set in `bitmap` that nobody claimed before and
@@ -73,6 +74,8 @@ class SharedCoverage {
   // should keep it claimed (so that it stops costing determinism re-runs)
   // instead of releasing it.
   bool RecordFlaky(uint32_t edge, int threshold);
+  // The number of counted edges (1..counted_edges) that reached the flaky
+  // threshold. Like found_edges(), it does not include the other features.
   uint64_t suppressed_flaky_edges() const {
     return suppressed_.load(std::memory_order_relaxed);
   }

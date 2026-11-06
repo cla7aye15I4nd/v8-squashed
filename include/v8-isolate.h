@@ -1513,6 +1513,7 @@ class V8_EXPORT Isolate {
    * predefined set of data as crash keys to be used in postmortem debugging in
    * case of a crash.
    */
+  V8_DEPRECATE_SOON("Use V8::SetCrashKeyCallbacks instead")
   void SetAddCrashKeyCallback(AddCrashKeyCallback);
 
   /**
@@ -1768,10 +1769,10 @@ class V8_EXPORT Isolate {
    * is that the embedder sets them at most once.
    */
   void SetWasmModuleCallback(WasmModuleCallback callback);
-  V8_DEPRECATE_SOON("Use the WasmModuleCallback overload instead")
+  V8_DEPRECATED("Use the WasmModuleCallback overload instead")
   void SetWasmModuleCallback(ExtensionCallback callback);
   void SetWasmInstanceCallback(WasmInstanceCallback callback);
-  V8_DEPRECATE_SOON("Use the WasmInstanceCallback overload instead")
+  V8_DEPRECATED("Use the WasmInstanceCallback overload instead")
   void SetWasmInstanceCallback(ExtensionCallback callback);
 
   void SetWasmStreamingCallback(WasmStreamingCallback callback);

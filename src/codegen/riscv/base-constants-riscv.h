@@ -754,7 +754,10 @@ class InstructionBase {
     return FirstHalfWord == 0;
   }
 
-  bool IsShortInstruction() const;
+  inline bool IsShortInstruction() const {
+    uint8_t FirstByte = *reinterpret_cast<const uint8_t*>(this);
+    return (FirstByte & 0x03) <= C2;
+  }
 
   inline uint8_t InstructionSize() const {
     return (this->IsShortInstruction()) ? kShortInstrSize : kInstrSize;
@@ -1003,6 +1006,11 @@ class InstructionGetters : public T {
     //  31        12
     int32_t Bits = this->InstructionBits();
     return Bits >> 12;
+  }
+
+  inline uint32_t Imm20UValueUnsigned() const {
+    DCHECK(this->InstructionType() == InstructionBase::kUType);
+    return static_cast<uint32_t>(this->InstructionBits()) >> 12;
   }
 
   inline int Imm20JValue() const {

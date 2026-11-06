@@ -492,6 +492,12 @@ declare_args() {
   # Sets -DV8_ENABLE_MAGLEV_GRAPH_PRINTER.
   v8_enable_maglev_graph_printer = !build_with_chromium
 
+  # Use a Copy-on-Write B+Tree map in Maglev KnownNodeAspects.
+  # TODO(leszeks): Remove the ZoneMap fallback shim and this build flag once the
+  # B+Tree rollout is complete.
+  # Sets -DV8_ENABLE_MAGLEV_KNA_BTREE.
+  v8_enable_maglev_kna_btree = true
+
   # Enable slow tracing, e.g., tracing on every instruction or Turbofan node.
   # Sets -DV8_ENABLE_SLOW_TRACING.
   v8_enable_slow_tracing = is_debug
@@ -1699,6 +1705,9 @@ config("features") {
   if (v8_enable_maglev_graph_printer) {
     defines += [ "V8_ENABLE_MAGLEV_GRAPH_PRINTER" ]
   }
+  if (v8_enable_maglev_kna_btree) {
+    defines += [ "V8_ENABLE_MAGLEV_KNA_BTREE" ]
+  }
   if (v8_enable_slow_tracing) {
     defines += [ "V8_ENABLE_SLOW_TRACING" ]
   }
@@ -2433,7 +2442,6 @@ torque_files = [
   "src/objects/js-regexp-string-iterator.tq",
   "src/objects/js-regexp.tq",
   "src/objects/js-shadow-realm.tq",
-  "src/objects/js-struct.tq",
   "src/objects/js-weak-refs.tq",
   "src/objects/literal-objects.tq",
   "src/objects/managed.tq",
@@ -4929,7 +4937,6 @@ v8_header_set("v8_internal_headers") {
     "src/objects/js-segments.h",
     "src/objects/js-shadow-realm-inl.h",
     "src/objects/js-shadow-realm.h",
-    "src/objects/js-struct.h",
     "src/objects/js-temporal-helpers.h",
     "src/objects/js-weak-refs-inl.h",
     "src/objects/js-weak-refs.h",
@@ -6483,7 +6490,6 @@ v8_cluster_source_set("v8_base_without_compiler") {
     "src/builtins/builtins-shadow-realm.cc",
     "src/builtins/builtins-sharedarraybuffer.cc",
     "src/builtins/builtins-string.cc",
-    "src/builtins/builtins-struct.cc",
     "src/builtins/builtins-symbol.cc",
     "src/builtins/builtins-trace.cc",
     "src/builtins/builtins-typed-array.cc",
@@ -6742,7 +6748,6 @@ v8_cluster_source_set("v8_base_without_compiler") {
     "src/objects/js-segment-iterator.cc",
     "src/objects/js-segmenter.cc",
     "src/objects/js-segments.cc",
-    "src/objects/js-struct.cc",
     "src/objects/js-temporal-helpers.cc",
     "src/objects/js-weak-refs.cc",
     "src/objects/keys.cc",

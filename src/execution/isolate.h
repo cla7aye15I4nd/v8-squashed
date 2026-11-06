@@ -158,7 +158,6 @@ class PersistentHandlesList;
 class ReadOnlyArtifacts;
 class RootVisitor;
 class SetupIsolateDelegate;
-class SharedStructTypeRegistry;
 class Simulator;
 class SnapshotData;
 class StackFrame;
@@ -787,12 +786,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
                : shared_space_isolate()->string_forwarding_table_.get();
   }
 
-  SharedStructTypeRegistry* shared_struct_type_registry() const {
-    return is_shared_space_isolate()
-               ? shared_struct_type_registry_.get()
-               : shared_space_isolate()->shared_struct_type_registry_.get();
-  }
-
   // Access to top context (where the current function object was created).
   Tagged<Context> context() const { return thread_local_top()->context_; }
   inline void set_context(Tagged<Context> context);
@@ -1138,6 +1131,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   Tagged<Object> StackOverflow();
   Tagged<Object> TerminateExecution();
   void CancelTerminateExecution();
+  V8_WARN_UNUSED_RESULT bool CheckTerminationAfterCallback();
 
   void RequestInterrupt(InterruptCallback callback, void* data);
   void InvokeApiInterruptCallbacks();
@@ -2117,13 +2111,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
       DirectHandle<JSArray> sites);
   bool HasPrepareStackTraceCallback() const;
 
-  void SetAddCrashKeyCallback(AddCrashKeyCallback callback);
-  void AddCrashKey(CrashKeyId id, const std::string& value) {
-    if (add_crash_key_callback_) {
-      add_crash_key_callback_(id, value);
-    }
-  }
-
   v8::CrashKey AllocateCrashKeyString(const char key[], CrashKeySize size);
   v8::CrashKey AddCrashKeyString(const char key[], CrashKeySize size,
                                  std::string_view value);
@@ -2976,11 +2963,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   // Stores the isolate containing the shared space.
   std::optional<Isolate*> shared_space_isolate_;
 
-  // Used to deduplicate registered SharedStructType shapes.
-  //
-  // This is guaranteed empty when !is_shared_space_isolate().
-  std::unique_ptr<SharedStructTypeRegistry> shared_struct_type_registry_;
-
 #ifdef V8_COMPRESS_POINTERS
   // Stores the external pointer table space for the shared external pointer
   // table.
@@ -3018,11 +3000,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   wasm::WasmOrphanedGlobalHandle* wasm_orphaned_handle_ = nullptr;
   wasm::StackPool stack_pool_;
 #endif  // V8_ENABLE_WEBASSEMBLY
-
-  // Enables the host application to provide a mechanism for recording a
-  // predefined set of data as crash keys to be used in postmortem debugging
-  // in case of a crash.
-  AddCrashKeyCallback add_crash_key_callback_ = nullptr;
 
   AllocateCrashKeyStringCallback allocate_crash_key_string_callback_;
   SetCrashKeyStringCallback set_crash_key_string_callback_;

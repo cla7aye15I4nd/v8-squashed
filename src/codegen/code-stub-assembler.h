@@ -802,6 +802,51 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
     return value.value();
   }
 
+  TNode<BoolT> LogicalOr(TNode<BoolT> left, TNode<BoolT> right) {
+    return Word32Or(left, right);
+  }
+
+  TNode<BoolT> LogicalOr(TNode<BoolT> left, const NodeGenerator<BoolT>& right) {
+    return Select<BoolT>(left, [this] { return Int32TrueConstant(); }, right);
+  }
+
+  TNode<BoolT> LogicalAnd(TNode<BoolT> left, TNode<BoolT> right) {
+    return Word32And(left, right);
+  }
+
+  TNode<BoolT> LogicalAnd(TNode<BoolT> left,
+                          const NodeGenerator<BoolT>& right) {
+    return Select<BoolT>(left, right, [this] { return Int32FalseConstant(); });
+  }
+
+  // Variadic version of LogicalOr. Callable arguments are short-circuited.
+  template <typename First, typename Second, typename... Rest>
+  TNode<BoolT> LogicalAny(First&& first, Second&& second, Rest&&... rest) {
+    TNode<BoolT> first_node;
+    if constexpr (std::invocable<First>) {
+      first_node = std::forward<First>(first)();
+    } else {
+      first_node = first;
+    }
+    if constexpr (!std::invocable<Second>) {
+      if constexpr (sizeof...(Rest) == 0) {
+        return LogicalOr(first_node, second);
+      } else {
+        return LogicalAny(LogicalOr(first_node, second),
+                          std::forward<Rest>(rest)...);
+      }
+    } else {
+      return LogicalOr(first_node, [&]() {
+        if constexpr (sizeof...(Rest) == 0) {
+          return std::forward<Second>(second)();
+        } else {
+          return LogicalAny(std::forward<Second>(second)(),
+                            std::forward<Rest>(rest)...);
+        }
+      });
+    }
+  }
+
   template <class A>
   TNode<A> SelectConstant(TNode<BoolT> condition, TNode<A> true_value,
                           TNode<A> false_value) {
@@ -1510,10 +1555,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   // non-computed case manually.
   TNode<Uint32T> LoadNameHashAssumeComputed(TNode<Name> name);
 
-  // Load the Name::RawHash() value of a name as an uint32 value. Follows
-  // through the forwarding table.
-  TNode<Uint32T> LoadNameRawHash(TNode<Name> name);
-
   // Load length field of a String object as Smi value.
   TNode<Smi> LoadStringLengthAsSmi(TNode<String> string);
   // Load length field of a String object as intptr_t value.
@@ -2052,15 +2093,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
       WriteBarrierMode barrier_mode = UPDATE_WRITE_BARRIER,
       int additional_offset = 0);
 
-  void StoreSharedObjectField(TNode<HeapObject> object, TNode<IntPtrT> offset,
-                              TNode<Object> value);
-
-  void StoreJSSharedStructPropertyArrayElement(TNode<PropertyArray> array,
-                                               TNode<IntPtrT> index,
-                                               TNode<Object> value) {
-    StoreFixedArrayOrPropertyArrayElement(array, index, value);
-  }
-
   void StoreWeakFixedArrayElement(TNode<WeakFixedArray> array,
                                   TNode<IntPtrT> index,
                                   TNode<MaybeObject> value,
@@ -2318,6 +2350,8 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
                                   const Function& materialize_target,
                                   bool target_is_new);
 
+  TNode<BoolT> BelongsToSameNativeContextAs(TNode<Map> map,
+                                            TNode<Context> context);
   TNode<NativeContext> GetCreationContextFromMap(TNode<Map> map,
                                                  Label* if_bailout);
   TNode<NativeContext> GetCreationContext(TNode<JSReceiver> receiver,
@@ -2828,11 +2862,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
                       Label* if_bigint64, TVariable<BigInt>* var_bigint,
                       TVariable<Smi>* var_feedback);
 
-  // Ensures that {var_shared_value} is shareable across Isolates, and throws if
-  // not.
-  void SharedValueBarrier(TNode<Context> context,
-                          TVariable<Object>* var_shared_value);
-
   TNode<WordT> TimesSystemPointerSize(TNode<WordT> value);
   TNode<IntPtrT> TimesSystemPointerSize(TNode<IntPtrT> value) {
     return Signed(TimesSystemPointerSize(implicit_cast<TNode<WordT>>(value)));
@@ -2915,8 +2944,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> InstanceTypeEqual(TNode<Int32T> instance_type, int type);
   TNode<BoolT> IsNoElementsProtectorCellInvalid();
   TNode<BoolT> IsMegaDOMProtectorCellInvalid();
-  TNode<BoolT> IsAlwaysSharedSpaceJSObjectInstanceType(
-      TNode<Int32T> instance_type);
   TNode<BoolT> IsArrayIteratorProtectorCellInvalid();
   TNode<BoolT> IsBigIntInstanceType(TNode<Int32T> instance_type);
   TNode<BoolT> IsBigInt(TNode<HeapObject> object);
@@ -3016,10 +3043,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> IsJSPrimitiveWrapperInstanceType(TNode<Int32T> instance_type);
   TNode<BoolT> IsJSPrimitiveWrapperMap(TNode<Map> map);
   TNode<BoolT> IsJSPrimitiveWrapper(TNode<HeapObject> object);
-  TNode<BoolT> IsJSSharedStructInstanceType(TNode<Int32T> instance_type);
-  TNode<BoolT> IsJSSharedStructMap(TNode<Map> map);
-  TNode<BoolT> IsJSSharedStruct(TNode<HeapObject> object);
-  TNode<BoolT> IsJSSharedStruct(TNode<Object> object);
   TNode<BoolT> IsJSWrappedFunction(TNode<HeapObject> object);
   TNode<BoolT> IsMapMap(TNode<Map> map);
   TNode<BoolT> IsMap(TNode<HeapObject> object);
@@ -3677,15 +3700,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
                             TVariable<IntPtrT>* var_name_index,
                             Label* if_not_found,
                             LookupMode mode = kFindExisting);
-  // Slow lookup for unique_names with forwarding index.
-  // Both resolving the actual hash and the lookup are handled via runtime.
-  template <typename Dictionary>
-  void NameDictionaryLookupWithForwardIndex(TNode<Dictionary> dictionary,
-                                            TNode<Name> unique_name,
-                                            Label* if_found,
-                                            TVariable<IntPtrT>* var_name_index,
-                                            Label* if_not_found,
-                                            LookupMode mode = kFindExisting);
 
   TNode<Word32T> ComputeSeededHash(TNode<IntPtrT> key);
 

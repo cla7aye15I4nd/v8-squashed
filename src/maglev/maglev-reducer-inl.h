@@ -685,8 +685,8 @@ bool MaglevReducer<BaseT>::CanElideWriteBarrier(ValueNode* object,
 
   // If its alternative conversion node is Smi, {value} will be converted to
   // a Smi when tagged.
-  NodeInfo* node_info = GetOrCreateInfoFor(value);
-  if (ValueNode* tagged_alt = node_info->alternative().tagged()) {
+  if (ValueNode* tagged_alt = known_node_aspects().TryGetAlternativeFor(
+          value, UseRepresentation::kTagged)) {
     DCHECK(tagged_alt->is_conversion());
     return CheckType(tagged_alt, NodeType::kSmi);
   }
@@ -1256,7 +1256,8 @@ MaybeReduceResult MaglevReducer<BaseT>::TryReduceArrayIsArray(
     }
     if ((has_array_map ^ has_other_map) && !has_proxy_map) {
       if (has_array_map) {
-        if (auto node_info = known_node_aspects().TryGetInfoFor(node)) {
+        if (NodeInfo* node_info =
+                known_node_aspects().TryGetMutableInfoFor(node)) {
           node_info->IntersectType(NodeType::kJSArray);
         }
       }
@@ -1898,11 +1899,8 @@ ReduceResult MaglevReducer<BaseT>::GetFloat64ForToNumber(
   // We could emit unconditional eager deopts for other kinds of constant, but
   // it's not necessary, the appropriate checking conversion nodes will deopt.
 
-  NodeInfo* node_info =
-      known_node_aspects().GetOrCreateInfoFor(broker(), value);
-  auto& alternative = node_info->alternative();
-
-  if (ValueNode* alt_f64 = alternative.float64()) {
+  if (ValueNode* alt_f64 = known_node_aspects().TryGetAlternativeFor(
+          value, UseRepresentation::kFloat64)) {
     return alt_f64;
   }
 
@@ -1913,6 +1911,13 @@ ReduceResult MaglevReducer<BaseT>::GetFloat64ForToNumber(
   if (IsEmptyNodeType(known_type)) {
     return EmitUnconditionalDeopt(DeoptimizeReason::kWrongValue);
   }
+
+  auto set_float64_alternative = [&](ValueNode* float64_value) {
+    return known_node_aspects()
+        .GetOrCreateInfoFor(broker(), value)
+        ->alternative()
+        .set_float64(float64_value);
+  };
 
   switch (value->properties().value_representation()) {
     case ValueRepresentation::kTagged: {
@@ -1940,7 +1945,7 @@ ReduceResult MaglevReducer<BaseT>::GetFloat64ForToNumber(
                                               value, NodeType::kNumber));
         // Number->Float64 conversions are exact alternatives, so they can
         // also become the canonical float64_alternative.
-        return alternative.set_float64(float64_value);
+        return set_float64_alternative(float64_value);
       }
       // NumberOrOddball->Float64 conversions are not exact alternatives, since
       // they lose the information that this is an oddball, so they can only
@@ -1950,13 +1955,13 @@ ReduceResult MaglevReducer<BaseT>::GetFloat64ForToNumber(
       return BuildNumberOrOddballToFloat64(value, narrowed_input_type);
     }
     case ValueRepresentation::kInt32:
-      return alternative.set_float64(
+      return set_float64_alternative(
           AddNewNodeNoInputConversion<ChangeInt32ToFloat64>({value}));
     case ValueRepresentation::kUint32:
-      return alternative.set_float64(
+      return set_float64_alternative(
           AddNewNodeNoInputConversion<ChangeUint32ToFloat64>({value}));
     case ValueRepresentation::kIntPtr:
-      return alternative.set_float64(
+      return set_float64_alternative(
           AddNewNodeNoInputConversion<ChangeIntPtrToFloat64>({value}));
     case ValueRepresentation::kHoleyFloat64: {
       if (NodeTypeIs(assumed_input_type, NodeType::kNumberOrBoolean)) {
@@ -1965,7 +1970,7 @@ ReduceResult MaglevReducer<BaseT>::GetFloat64ForToNumber(
         // representation can represent undefined but no other oddballs, so
         // booleans cannot occur here and kNumberOrBoolean can be grouped with
         // kNumber.
-        return alternative.set_float64(
+        return set_float64_alternative(
             AddNewNodeNoInputConversion<CheckedHoleyFloat64ToFloat64>({value}));
       }
       DCHECK(NodeTypeIs(assumed_input_type, NodeType::kNumberOrOddball));
@@ -1999,10 +2004,6 @@ ReduceResult MaglevReducer<BaseT>::GetHoleyFloat64ForToNumber(
     return graph()->GetHoleyFloat64Constant(cst.value());
   }
 
-  NodeInfo* node_info =
-      known_node_aspects().GetOrCreateInfoFor(broker(), value);
-  auto& alternative = node_info->alternative();
-
   NodeType known_type = GetType(value);
 
   // When we want to use the `holey_float64` alternative, we need to make sure
@@ -2014,7 +2015,8 @@ ReduceResult MaglevReducer<BaseT>::GetHoleyFloat64ForToNumber(
   // allow more narrow types (e.g. kSmi) we need to explicitly check for that
   // range, because the `holey_float64` alternative can contain values outside
   // of smi range.
-  if (ValueNode* alt_hf64 = alternative.holey_float64()) {
+  if (ValueNode* alt_hf64 = known_node_aspects().TryGetAlternativeFor(
+          value, UseRepresentation::kHoleyFloat64)) {
     if (NodeTypeIs(IntersectType(NodeType::kNumberOrUndefined, known_type),
                    assumed_input_type)) {
       return alt_hf64;
@@ -2045,6 +2047,8 @@ ReduceResult MaglevReducer<BaseT>::GetHoleyFloat64ForToNumber(
 
   ValueNode* float64;
   GET_VALUE_OR_ABORT(float64, GetFloat64ForToNumber(value, assumed_input_type));
+  auto& alternative =
+      known_node_aspects().GetOrCreateInfoFor(broker(), value)->alternative();
   if (float64->MayBeHoleOrUndefinedNan()) {
     // The value is a number, so its bits must not start meaning the hole or
     // undefined in the wider representation.
@@ -2536,7 +2540,7 @@ MaybeReduceResult MaglevReducer<BaseT>::TryFoldToBoolean(ValueNode* value) {
       UNREACHABLE();
   }
 
-  NodeInfo* node_info = known_node_aspects().TryGetInfoFor(value);
+  const NodeInfo* node_info = known_node_aspects().TryGetInfoFor(value);
   if (node_info) {
     if (ValueNode* as_int32 = node_info->alternative().int32()) {
       return AddNewNodeNoInputConversion<Int32ToBoolean>({as_int32}, flip);
@@ -3470,9 +3474,8 @@ CallBuiltin* MaglevReducer<BaseT>::BuildCallBuiltin(
 // never lazily-deoptimize with a JSReceiver triggering valueOf
 // (crbug.com/493307329). We wrap all args here (Maglev doesn't know the wasm
 // signature); the reducer only uses the frame state for numeric params.
-// LINT.IfChange(WasmWrapperInliningConditions)
 template <typename BaseT>
-bool MaglevReducer<BaseT>::ShouldWrapArgsForWasmInlining(
+bool MaglevReducer<BaseT>::CanInlineJSToWasmWrapper(
     JSDispatchHandle dispatch_handle) {
   if (!is_turbolev()) return false;
   if (!v8_flags.wasm_in_js_inlining_wrapper) return false;
@@ -3481,13 +3484,14 @@ bool MaglevReducer<BaseT>::ShouldWrapArgsForWasmInlining(
   //  - The generic kJSToWasmWrapper builtin (used before a per-signature
   //    wrapper has been compiled), or
   //  - A jitted per-signature wrapper (CodeKind::JS_TO_WASM_FUNCTION).
-  // We detect both cases by inspecting the Code object via the dispatch table.
+  // Checking CodeKind alone is not sufficient because e.g.
+  // Builtin::kWasmPromising also has CodeKind::BUILTIN and carries
+  // WasmExportedFunctionData on its SharedFunctionInfo.
   Tagged<Code> code =
       local_isolate()->js_dispatch_table().GetCode(dispatch_handle);
   return code->builtin_id() == Builtin::kJSToWasmWrapper ||
          code->kind() == CodeKind::JS_TO_WASM_FUNCTION;
 }
-// LINT.ThenChange(src/compiler/turboshaft/turbolev-graph-builder.cc:WasmWrapperInliningConditions)
 #endif  // V8_ENABLE_WEBASSEMBLY
 
 template <typename BaseT>
@@ -3498,8 +3502,10 @@ ReduceResult MaglevReducer<BaseT>::BuildCallKnownJSFunction(
     base::FunctionRef<ReduceResult(int)> get_arg,
     compiler::FeedbackSource const& feedback_source) {
 #if V8_ENABLE_WEBASSEMBLY
-  const bool wrap_args_for_wasm =
-      ShouldWrapArgsForWasmInlining(dispatch_handle);
+  const bool can_inline_js_to_wasm_wrapper =
+      CanInlineJSToWasmWrapper(dispatch_handle);
+#else
+  const bool can_inline_js_to_wasm_wrapper = false;
 #endif  // V8_ENABLE_WEBASSEMBLY
 
   size_t input_count = arg_count + CallKnownJSFunction::kFixedInputCount;
@@ -3510,7 +3516,7 @@ ReduceResult MaglevReducer<BaseT>::BuildCallKnownJSFunction(
           ValueNode* arg;
           GET_VALUE_OR_ABORT(arg, get_arg(i));
 #if V8_ENABLE_WEBASSEMBLY
-          if (wrap_args_for_wasm) {
+          if (can_inline_js_to_wasm_wrapper) {
             GET_VALUE_OR_ABORT(arg, AddNewNode<ProcessWasmArgument>({arg}));
           }
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -3519,7 +3525,7 @@ ReduceResult MaglevReducer<BaseT>::BuildCallKnownJSFunction(
         return ReduceResult::Done();
       },
       dispatch_handle, shared, tagged_function, tagged_context, tagged_receiver,
-      tagged_new_target, feedback_source);
+      tagged_new_target, feedback_source, can_inline_js_to_wasm_wrapper);
 }
 
 template <typename BaseT>

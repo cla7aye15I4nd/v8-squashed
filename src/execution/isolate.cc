@@ -98,7 +98,6 @@
 #include "src/objects/js-array-inl.h"
 #include "src/objects/js-function.h"
 #include "src/objects/js-generator-inl.h"
-#include "src/objects/js-struct.h"
 #include "src/objects/js-weak-refs-inl.h"
 #include "src/objects/managed-inl.h"
 #include "src/objects/module-inl.h"
@@ -2601,6 +2600,19 @@ void Isolate::CancelTerminateExecution() {
   if (!is_execution_terminating()) return;
   clear_internal_exception();
   if (try_catch_handler()) try_catch_handler()->ResetInternal();
+}
+
+bool Isolate::CheckTerminationAfterCallback() {
+  if (has_exception()) {
+    DCHECK_IMPLIES(v8_flags.strict_termination_checks,
+                   is_execution_terminating());
+    return true;
+  }
+  if (debug()->IsRestartFrameScheduled()) {
+    TerminateExecution();
+    return true;
+  }
+  return false;
 }
 
 void Isolate::RequestInterrupt(InterruptCallback callback, void* data) {
@@ -5311,10 +5323,6 @@ void Isolate::Deinit() {
     DCHECK_NULL(string_forwarding_table_.get());
   }
 
-  if (!is_shared_space_isolate()) {
-    DCHECK_NULL(shared_struct_type_registry_.get());
-  }
-
 #ifdef V8_COMPRESS_POINTERS
   external_pointer_table().TearDownSpace(
       heap()->young_external_pointer_space());
@@ -5998,43 +6006,44 @@ static std::string ToHexString(uintptr_t address) {
 }  // namespace
 
 void Isolate::AddCrashKeysForIsolateAndHeapPointers() {
-  DCHECK_NOT_NULL(add_crash_key_callback_);
+  if (!V8::HasCrashKeyCallbacks()) return;
 
-  const uintptr_t isolate_address = reinterpret_cast<uintptr_t>(this);
-  add_crash_key_callback_(v8::CrashKeyId::kIsolateAddress,
-                          ToHexString(isolate_address));
+  static base::LazyMutex crash_key_mutex = LAZY_MUTEX_INITIALIZER;
+  base::MutexGuard guard(crash_key_mutex.Pointer());
 
-  const uintptr_t ro_space_firstpage_address =
-      heap()->read_only_space()->FirstPageAddress();
-  add_crash_key_callback_(v8::CrashKeyId::kReadonlySpaceFirstPageAddress,
-                          ToHexString(ro_space_firstpage_address));
+#define SET_CRASH_KEY(key_name, value)                        \
+  do {                                                        \
+    static CrashKey key =                                     \
+        V8::AllocateCrashKey(key_name, CrashKeySize::Size32); \
+    V8::SetCrashKey(key, ToHexString(value));                 \
+  } while (false)
 
-  const uintptr_t old_space_firstpage_address =
-      heap()->old_space()->FirstPageAddress();
-  add_crash_key_callback_(v8::CrashKeyId::kOldSpaceFirstPageAddress,
-                          ToHexString(old_space_firstpage_address));
+  SET_CRASH_KEY("v8_isolate_address", reinterpret_cast<uintptr_t>(this));
+  SET_CRASH_KEY("v8_ro_space_firstpage_address",
+                heap()->read_only_space()->FirstPageAddress());
+  SET_CRASH_KEY("v8_old_space_firstpage_address",
+                heap()->old_space()->FirstPageAddress());
 
   if (heap()->code_range_base()) {
-    const uintptr_t code_range_base_address = heap()->code_range_base();
-    add_crash_key_callback_(v8::CrashKeyId::kCodeRangeBaseAddress,
-                            ToHexString(code_range_base_address));
+    SET_CRASH_KEY("v8_code_range_base_address", heap()->code_range_base());
   }
 
   if (heap()->code_space()->first_page()) {
-    const uintptr_t code_space_firstpage_address =
-        heap()->code_space()->FirstPageAddress();
-    add_crash_key_callback_(v8::CrashKeyId::kCodeSpaceFirstPageAddress,
-                            ToHexString(code_space_firstpage_address));
+    SET_CRASH_KEY("v8_code_space_firstpage_address",
+                  heap()->code_space()->FirstPageAddress());
   }
-  const v8::StartupData* data = Snapshot::DefaultSnapshotBlob();
-  // TODO(cbruni): Implement strategy to infrequently collect this.
-  const uint32_t v8_snapshot_checksum_calculated = 0;
-  add_crash_key_callback_(v8::CrashKeyId::kSnapshotChecksumCalculated,
-                          ToHexString(v8_snapshot_checksum_calculated));
-  const uint32_t v8_snapshot_checksum_expected =
-      Snapshot::GetExpectedChecksum(data);
-  add_crash_key_callback_(v8::CrashKeyId::kSnapshotChecksumExpected,
-                          ToHexString(v8_snapshot_checksum_expected));
+
+  if (snapshot_available()) {
+    // TODO(cbruni): Implement strategy to infrequently collect this.
+    const uint32_t v8_snapshot_checksum_calculated = 0;
+    SET_CRASH_KEY("v8_snapshot_checksum_calculated",
+                  v8_snapshot_checksum_calculated);
+    const uint32_t v8_snapshot_checksum_expected =
+        Snapshot::GetExpectedChecksum(snapshot_blob());
+    SET_CRASH_KEY("v8_snapshot_checksum_expected",
+                  v8_snapshot_checksum_expected);
+  }
+#undef SET_CRASH_KEY
 }
 
 void Isolate::InitializeCodeRanges() {
@@ -6331,7 +6340,7 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
       use_shared_space_isolate->heap()
           ->incremental_marking()
           ->IsMajorMarking()) {
-    heap_.SetIsMarkingFlag(true);
+    heap_.SetIsSharedMarkingFlag(true);
   }
 
   // Set up the object heap.
@@ -6657,16 +6666,6 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
     SLOW_DCHECK(SharedFunctionInfo::UniqueIdsAreUnique(this));
   }
 
-  if (v8_flags.harmony_struct) {
-    // Initialize or get the struct type registry shared by all isolates.
-    if (is_shared_space_isolate()) {
-      shared_struct_type_registry_ =
-          std::make_unique<SharedStructTypeRegistry>();
-    } else {
-      DCHECK_NOT_NULL(shared_struct_type_registry());
-    }
-  }
-
   // A read-only heap deserialized from a snapshot was already protected when
   // it was set up. One created from scratch only has its holes now.
   if (create_heap_objects) read_only_heap()->DecommitGuardRegions(this);
@@ -6686,6 +6685,12 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
 #if defined(V8_USE_PERFETTO)
   PerfettoLogger::RegisterIsolate(this);
 #endif  // defined(V8_USE_PERFETTO)
+
+  // Crash keys are process-wide; only record pointer crash keys for the main
+  // isolate so worker isolates do not overwrite them.
+  if (isolate_group()->main_isolate() == this) {
+    AddCrashKeysForIsolateAndHeapPointers();
+  }
 
   initialized_ = true;
 
@@ -7683,13 +7688,6 @@ FilterETWSessionByURLResult Isolate::RunFilterETWSessionByURLCallback(
 }
 
 #endif  // V8_ENABLE_ETW_STACK_WALKING
-
-void Isolate::SetAddCrashKeyCallback(AddCrashKeyCallback callback) {
-  add_crash_key_callback_ = callback;
-
-  // Log the initial set of data.
-  AddCrashKeysForIsolateAndHeapPointers();
-}
 
 void Isolate::SetCrashKeyStringCallbacks(
     AllocateCrashKeyStringCallback allocate_callback,

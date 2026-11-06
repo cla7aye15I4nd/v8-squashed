@@ -2852,7 +2852,7 @@ TNode<Uint32T> CodeStubAssembler::UnseedArrayIndexValue(TNode<Uint32T> value) {
 #endif  // V8_ENABLE_SEEDED_ARRAY_INDEX_HASH
 
 TNode<Uint32T> CodeStubAssembler::LoadNameHashAssumeComputed(TNode<Name> name) {
-  TNode<Uint32T> hash_field = LoadNameRawHash(name);
+  TNode<Uint32T> hash_field = LoadNameRawHashField(name);
   CSA_DCHECK(this, IsClearWord32(hash_field, Name::kHashNotComputedMask));
   return DecodeWord32<Name::HashBits>(hash_field);
 }
@@ -2864,42 +2864,6 @@ TNode<Uint32T> CodeStubAssembler::LoadNameHash(TNode<Name> name,
   GotoIf(IsSetWord32(raw_hash_field, Name::kHashNotComputedMask),
          if_hash_not_computed);
   return DecodeWord32<Name::HashBits>(raw_hash_field);
-}
-
-TNode<Uint32T> CodeStubAssembler::LoadNameRawHash(TNode<Name> name) {
-  TVARIABLE(Uint32T, var_raw_hash);
-
-  Label if_forwarding_index(this, Label::kDeferred), done(this);
-
-  TNode<Uint32T> raw_hash_field = LoadNameRawHashField(name);
-  GotoIf(IsSetWord32(raw_hash_field, Name::kHashNotComputedMask),
-         &if_forwarding_index);
-
-  var_raw_hash = raw_hash_field;
-  Goto(&done);
-
-  BIND(&if_forwarding_index);
-  {
-    CSA_DCHECK(this,
-               IsEqualInWord32<Name::HashFieldTypeBits>(
-                   raw_hash_field, Name::HashFieldType::kForwardingIndex));
-    TNode<ExternalReference> function =
-        ExternalConstant(ExternalReference::raw_hash_from_forward_table());
-    const TNode<ExternalReference> isolate_ptr =
-        ExternalConstant(ExternalReference::isolate_address());
-    TNode<Uint32T> result = UncheckedCast<Uint32T>(CallCFunction(
-        function, MachineType::Uint32(),
-        std::make_pair(MachineType::Pointer(), isolate_ptr),
-        std::make_pair(
-            MachineType::Int32(),
-            DecodeWord32<Name::ForwardingIndexValueBits>(raw_hash_field))));
-
-    var_raw_hash = result;
-    Goto(&done);
-  }
-
-  BIND(&done);
-  return var_raw_hash.value();
 }
 
 TNode<Smi> CodeStubAssembler::LoadStringLengthAsSmi(TNode<String> string) {
@@ -4350,19 +4314,6 @@ void CodeStubAssembler::UnsafeStoreObjectFieldNoWriteBarrier(
   DCHECK_NE(offsetof(HeapObject, map_), offset);  // Use StoreMap instead.
   OptimizedStoreFieldUnsafeNoWriteBarrier(MachineRepresentation::kTagged,
                                           object, offset, value);
-}
-
-void CodeStubAssembler::StoreSharedObjectField(TNode<HeapObject> object,
-                                               TNode<IntPtrT> offset,
-                                               TNode<Object> value) {
-  CSA_DCHECK(this, IsPageFlagSet(BitcastTaggedToWord(object),
-                                 MemoryChunk::IN_WRITABLE_SHARED_SPACE));
-  int const_offset;
-  if (TryToInt32Constant(offset, &const_offset)) {
-    StoreObjectField(object, const_offset, value);
-  } else {
-    Store(object, IntPtrSub(offset, IntPtrConstant(kHeapObjectTag)), value);
-  }
 }
 
 void CodeStubAssembler::StoreMap(TNode<HeapObject> object, TNode<Map> map) {
@@ -9009,34 +8960,6 @@ TNode<BoolT> CodeStubAssembler::IsJSArrayIterator(TNode<HeapObject> object) {
   return HasInstanceType(object, JS_ARRAY_ITERATOR_TYPE);
 }
 
-TNode<BoolT> CodeStubAssembler::IsAlwaysSharedSpaceJSObjectInstanceType(
-    TNode<Int32T> instance_type) {
-  return IsInRange(instance_type, FIRST_ALWAYS_SHARED_SPACE_JS_OBJECT_TYPE,
-                   LAST_ALWAYS_SHARED_SPACE_JS_OBJECT_TYPE);
-}
-
-TNode<BoolT> CodeStubAssembler::IsJSSharedStructInstanceType(
-    TNode<Int32T> instance_type) {
-  return InstanceTypeEqual(instance_type, JS_SHARED_STRUCT_TYPE);
-}
-
-TNode<BoolT> CodeStubAssembler::IsJSSharedStructMap(TNode<Map> map) {
-  return IsJSSharedStructInstanceType(LoadMapInstanceType(map));
-}
-
-TNode<BoolT> CodeStubAssembler::IsJSSharedStruct(TNode<HeapObject> object) {
-  return IsJSSharedStructMap(LoadMap(object));
-}
-
-TNode<BoolT> CodeStubAssembler::IsJSSharedStruct(TNode<Object> object) {
-  return Select<BoolT>(
-      TaggedIsSmi(object), [=, this] { return Int32FalseConstant(); },
-      [=, this] {
-        TNode<HeapObject> heap_object = CAST(object);
-        return IsJSSharedStruct(heap_object);
-      });
-}
-
 TNode<BoolT> CodeStubAssembler::IsJSAsyncGeneratorObject(
     TNode<HeapObject> object) {
   return HasInstanceType(object, JS_ASYNC_GENERATOR_OBJECT_TYPE);
@@ -9258,19 +9181,14 @@ TNode<BoolT> CodeStubAssembler::IsUniqueName(TNode<HeapObject> object) {
 // characters, or is outside MAX_SAFE_INTEGER/size_t range). Note that for
 // non-TypedArray receivers, there are additional strings that must be treated
 // as named property keys, namely the range [0xFFFFFFFF, MAX_SAFE_INTEGER].
-// The hash could be a forwarding index to an integer index.
-// For now we conservatively assume that all forwarded hashes could be integer
-// indices, allowing false negatives.
-// TODO(pthier): We could use 1 bit of the forward index to indicate whether the
-// forwarded hash contains an integer index, if this is turns out to be a
-// performance issue, at the cost of slowing down creating the forwarded string.
 TNode<BoolT> CodeStubAssembler::IsUniqueNameNoIndex(TNode<HeapObject> object) {
   TNode<Uint16T> instance_type = LoadInstanceType(object);
   return Select<BoolT>(
       IsInternalizedStringInstanceType(instance_type),
       [=, this] {
-        return IsSetWord32(LoadNameRawHashField(CAST(object)),
-                           Name::kDoesNotContainIntegerOrForwardingIndexMask);
+        return IsNotEqualInWord32<Name::HashFieldTypeBits>(
+            LoadNameRawHashField(CAST(object)),
+            Name::HashFieldType::kIntegerIndex);
       },
       [=, this] { return IsSymbolInstanceType(instance_type); });
 }
@@ -9287,7 +9205,7 @@ TNode<BoolT> CodeStubAssembler::IsUniqueNameNoCachedIndex(
   return Select<BoolT>(
       IsInternalizedStringInstanceType(instance_type),
       [=, this] {
-        return IsSetWord32(LoadNameRawHash(CAST(object)),
+        return IsSetWord32(LoadNameRawHashField(CAST(object)),
                            Name::kDoesNotContainCachedArrayIndexMask);
       },
       [=, this] { return IsSymbolInstanceType(instance_type); });
@@ -11034,108 +10952,45 @@ void CodeStubAssembler::TryToName(TNode<Object> key, Label* if_keyisindex,
 
     BIND(&if_string);
     {
-      TVARIABLE(Uint32T, var_raw_hash);
-      Label check_string_hash(this, {&var_raw_hash});
+      Label if_thinstring(this), if_has_cached_index(this);
 
-      // TODO(v8:12007): LoadNameRawHashField() should be an acquire load.
-      var_raw_hash = LoadNameRawHashField(CAST(key));
-      Goto(&check_string_hash);
-      BIND(&check_string_hash);
+      TNode<Uint32T> raw_hash_field = LoadNameRawHashField(CAST(key));
+      GotoIf(IsClearWord32(raw_hash_field,
+                           Name::kDoesNotContainCachedArrayIndexMask),
+             &if_has_cached_index);
+      // No cached array index. If the string knows that it contains an index,
+      // then it must be an uncacheable index. Handle this case in the
+      // runtime.
+      GotoIf(IsEqualInWord32<Name::HashFieldTypeBits>(
+                 raw_hash_field, Name::HashFieldType::kIntegerIndex),
+             if_bailout);
+
+      static_assert(base::bits::CountPopulation(kThinStringTagBit) == 1);
+      GotoIf(IsSetWord32(var_instance_type.value(), kThinStringTagBit),
+             &if_thinstring);
+
+      // Finally, check if |key| is internalized.
+      static_assert(kNotInternalizedTag != 0);
+      GotoIf(IsSetWord32(var_instance_type.value(), kIsNotInternalizedMask),
+             if_notinternalized != nullptr ? if_notinternalized : if_bailout);
+
+      *var_unique = CAST(key);
+      Goto(if_keyisunique);
+
+      BIND(&if_thinstring);
       {
-        Label if_thinstring(this), if_has_cached_index(this),
-            if_forwarding_index(this, Label::kDeferred);
-
-        TNode<Uint32T> raw_hash_field = var_raw_hash.value();
-        GotoIf(IsClearWord32(raw_hash_field,
-                             Name::kDoesNotContainCachedArrayIndexMask),
-               &if_has_cached_index);
-        // No cached array index. If the string knows that it contains an index,
-        // then it must be an uncacheable index. Handle this case in the
-        // runtime.
-        GotoIf(IsEqualInWord32<Name::HashFieldTypeBits>(
-                   raw_hash_field, Name::HashFieldType::kIntegerIndex),
-               if_bailout);
-
-        static_assert(base::bits::CountPopulation(kThinStringTagBit) == 1);
-        GotoIf(IsSetWord32(var_instance_type.value(), kThinStringTagBit),
-               &if_thinstring);
-
-        // Check if the hash field encodes a forwarding index.
-        GotoIf(IsEqualInWord32<Name::HashFieldTypeBits>(
-                   raw_hash_field, Name::HashFieldType::kForwardingIndex),
-               &if_forwarding_index);
-
-        // Finally, check if |key| is internalized.
-        static_assert(kNotInternalizedTag != 0);
-        GotoIf(IsSetWord32(var_instance_type.value(), kIsNotInternalizedMask),
-               if_notinternalized != nullptr ? if_notinternalized : if_bailout);
-
-        *var_unique = CAST(key);
+        *var_unique =
+            LoadObjectField<String>(CAST(key), offsetof(ThinString, actual_));
         Goto(if_keyisunique);
+      }
 
-        BIND(&if_thinstring);
-        {
-          *var_unique =
-              LoadObjectField<String>(CAST(key), offsetof(ThinString, actual_));
-          Goto(if_keyisunique);
-        }
-
-        BIND(&if_forwarding_index);
-        {
-          Label if_external(this), if_internalized(this);
-          Branch(IsEqualInWord32<Name::IsExternalForwardingIndexBit>(
-                     raw_hash_field, true),
-                 &if_external, &if_internalized);
-          BIND(&if_external);
-          {
-            // We know nothing about external forwarding indices, so load the
-            // forwarded hash and check all possibilities again.
-            TNode<ExternalReference> function = ExternalConstant(
-                ExternalReference::raw_hash_from_forward_table());
-            const TNode<ExternalReference> isolate_ptr =
-                ExternalConstant(ExternalReference::isolate_address());
-            TNode<Uint32T> result = UncheckedCast<Uint32T>(CallCFunction(
-                function, MachineType::Uint32(),
-                std::make_pair(MachineType::Pointer(), isolate_ptr),
-                std::make_pair(MachineType::Int32(),
-                               DecodeWord32<Name::ForwardingIndexValueBits>(
-                                   raw_hash_field))));
-
-            var_raw_hash = result;
-            Goto(&check_string_hash);
-          }
-
-          BIND(&if_internalized);
-          {
-            // Integer indices are not overwritten with internalized forwarding
-            // indices, so we are guaranteed forwarding to a unique name.
-            CSA_DCHECK(this,
-                       IsEqualInWord32<Name::IsExternalForwardingIndexBit>(
-                           raw_hash_field, false));
-            TNode<ExternalReference> function = ExternalConstant(
-                ExternalReference::string_from_forward_table());
-            const TNode<ExternalReference> isolate_ptr =
-                ExternalConstant(ExternalReference::isolate_address());
-            TNode<Object> result = CAST(CallCFunction(
-                function, MachineType::AnyTagged(),
-                std::make_pair(MachineType::Pointer(), isolate_ptr),
-                std::make_pair(MachineType::Int32(),
-                               DecodeWord32<Name::ForwardingIndexValueBits>(
-                                   raw_hash_field))));
-
-            *var_unique = CAST(result);
-            Goto(if_keyisunique);
-          }
-        }
-
-        BIND(&if_has_cached_index);
-        {
-          TNode<IntPtrT> index = Signed(ChangeUint32ToWord(
-              DecodeArrayIndexFromHashField(raw_hash_field)));
-          CSA_DCHECK(this, IntPtrLessThan(index, IntPtrConstant(INT_MAX)));
-          *var_index = index;
-          Goto(if_keyisindex);
-        }
+      BIND(&if_has_cached_index);
+      {
+        TNode<IntPtrT> index = Signed(
+            ChangeUint32ToWord(DecodeArrayIndexFromHashField(raw_hash_field)));
+        CSA_DCHECK(this, IntPtrLessThan(index, IntPtrConstant(INT_MAX)));
+        *var_index = index;
+        Goto(if_keyisindex);
       }
     }
 
@@ -11569,13 +11424,11 @@ void CodeStubAssembler::NameDictionaryLookup(
   CSA_DCHECK(this, IsUniqueName(unique_name));
   static_assert(!NameDictionaryShape::kDoHashSpreading);
 
-  Label if_not_computed(this, Label::kDeferred);
-
   TNode<IntPtrT> capacity =
       PositiveSmiUntag(GetCapacity<Dictionary>(dictionary));
   TNode<IntPtrT> mask = IntPtrSub(capacity, IntPtrConstant(1));
   TNode<UintPtrT> hash =
-      ChangeUint32ToWord(LoadNameHash(unique_name, &if_not_computed));
+      ChangeUint32ToWord(LoadNameHashAssumeComputed(unique_name));
 
   // See Dictionary::FirstProbe().
   TNode<IntPtrT> count = IntPtrConstant(0);
@@ -11625,16 +11478,6 @@ void CodeStubAssembler::NameDictionaryLookup(
     var_entry = entry;
     Goto(&loop);
   }
-
-  BIND(&if_not_computed);
-  {
-    // Strings will only have the forwarding index with experimental shared
-    // memory features turned on. To minimize affecting the fast path, the
-    // forwarding index branch defers both fetching the actual hash value and
-    // the dictionary lookup to the runtime.
-    NameDictionaryLookupWithForwardIndex(dictionary, unique_name, if_found,
-                                         var_name_index, if_not_found, mode);
-  }
 }
 
 // Instantiate template methods to workaround GCC compilation issue.
@@ -11649,67 +11492,6 @@ template V8_EXPORT_PRIVATE void CodeStubAssembler::NameDictionaryLookup<
 template V8_EXPORT_PRIVATE void CodeStubAssembler::NameDictionaryLookup<
     SimpleNameDictionary>(TNode<SimpleNameDictionary>, TNode<Name>, Label*,
                           TVariable<IntPtrT>*, Label*, LookupMode);
-
-template <typename Dictionary>
-void CodeStubAssembler::NameDictionaryLookupWithForwardIndex(
-    TNode<Dictionary> dictionary, TNode<Name> unique_name, Label* if_found,
-    TVariable<IntPtrT>* var_name_index, Label* if_not_found, LookupMode mode) {
-  using ER = ExternalReference;  // To avoid super long lines below.
-  ER func_ref;
-  if constexpr (std::is_same_v<Dictionary, NameDictionary>) {
-    func_ref = mode == kFindInsertionIndex
-                   ? ER::name_dictionary_find_insertion_entry_forwarded_string()
-                   : ER::name_dictionary_lookup_forwarded_string();
-  } else if constexpr (std::is_same_v<Dictionary, GlobalDictionary>) {
-    func_ref =
-        mode == kFindInsertionIndex
-            ? ER::global_dictionary_find_insertion_entry_forwarded_string()
-            : ER::global_dictionary_lookup_forwarded_string();
-  } else if constexpr (std::is_same_v<Dictionary, SimpleNameDictionary>) {
-    func_ref =
-        mode == kFindInsertionIndex
-            ? ER::simple_name_dictionary_find_insertion_entry_forwarded_string()
-            : ER::simple_name_dictionary_lookup_forwarded_string();
-  } else {
-    static_assert(std::is_same_v<Dictionary, NameToIndexHashTable>);
-    auto ref0 =
-        ER::name_to_index_hashtable_find_insertion_entry_forwarded_string();
-    auto ref1 = ER::name_to_index_hashtable_lookup_forwarded_string();
-    func_ref = mode == kFindInsertionIndex ? ref0 : ref1;
-  }
-  const TNode<ER> function = ExternalConstant(func_ref);
-  const TNode<ER> isolate_ptr = ExternalConstant(ER::isolate_address());
-  TNode<IntPtrT> entry = UncheckedCast<IntPtrT>(
-      CallCFunction(function, MachineType::IntPtr(),
-                    std::make_pair(MachineType::Pointer(), isolate_ptr),
-                    std::make_pair(MachineType::TaggedPointer(), dictionary),
-                    std::make_pair(MachineType::TaggedPointer(), unique_name)));
-
-  if (var_name_index) *var_name_index = EntryToIndex<Dictionary>(entry);
-  switch (mode) {
-    case kFindInsertionIndex:
-      CSA_DCHECK(
-          this,
-          WordNotEqual(entry,
-                       IntPtrConstant(InternalIndex::NotFound().raw_value())));
-      Goto(if_not_found);
-      break;
-    case kFindExisting:
-      GotoIf(IntPtrEqual(entry,
-                         IntPtrConstant(InternalIndex::NotFound().raw_value())),
-             if_not_found);
-      Goto(if_found);
-      break;
-    case kFindExistingOrInsertionIndex:
-      GotoIfNot(IntPtrEqual(entry, IntPtrConstant(
-                                       InternalIndex::NotFound().raw_value())),
-                if_found);
-      NameDictionaryLookupWithForwardIndex(dictionary, unique_name, if_found,
-                                           var_name_index, if_not_found,
-                                           kFindInsertionIndex);
-      break;
-  }
-}
 
 TNode<Word32T> CodeStubAssembler::ComputeSeededHash(TNode<IntPtrT> key) {
   const TNode<ExternalReference> function_addr =
@@ -12502,6 +12284,19 @@ TNode<Object> CodeStubAssembler::GetConstructor(TNode<Map> map) {
 
   BIND(&done);
   return var_maybe_constructor.value();
+}
+
+TNode<BoolT> CodeStubAssembler::BelongsToSameNativeContextAs(
+    TNode<Map> map, TNode<Context> context) {
+  TNode<Map> context_meta_map = LoadMap(LoadMap(context));
+  // Make sure context_meta_map is both contextful and meta map.
+  CSA_DCHECK(this, TaggedEqual(context_meta_map, LoadMap(context_meta_map)));
+  CSA_DCHECK(
+      this, IsNativeContext(CAST(LoadMapConstructorOrBackPointerOrNativeContext(
+                context_meta_map))));
+
+  TNode<Map> this_meta_map = LoadMap(map);
+  return TaggedEqual(this_meta_map, context_meta_map);
 }
 
 TNode<NativeContext> CodeStubAssembler::GetCreationContextFromMap(
@@ -21913,79 +21708,6 @@ void CodeStubAssembler::SwissNameDictionaryAdd(TNode<SwissNameDictionary> table,
     SwissNameDictionaryAddPortable(table, key, value, property_details,
                                    needs_resize);
   }
-}
-
-void CodeStubAssembler::SharedValueBarrier(
-    TNode<Context> context, TVariable<Object>* var_shared_value) {
-  // The barrier ensures that the value can be shared across Isolates.
-  // The fast paths should be kept in sync with Object::Share.
-
-  TNode<Object> value = var_shared_value->value();
-  Label check_in_shared_heap(this), slow(this), skip_barrier(this), done(this);
-
-#if CONTIGUOUS_COMPRESSED_READ_ONLY_SPACE_BOOL
-  // Fast path: Read-only objects are trivially shared. This also filters small
-  // Smis.
-  TNode<Word32T> object_as_word32 =
-      TruncateIntPtrToInt32(BitcastTaggedToWord(value));
-  GotoIf(Uint32LessThan(object_as_word32,
-                        Int32Constant(kContiguousReadOnlyReservationSize)),
-         &done);
-  // Fast path: Smis are trivially shared. This is now the exact check.
-  GotoIf(TaggedIsSmi(value), &done);
-  TNode<IntPtrT> page_flags = LoadMemoryChunkFlags(CAST(value));
-#else   // !CONTIGUOUS_COMPRESSED_READ_ONLY_SPACE_BOOL
-  // Fast path: Smis are trivially shared. This is now the exact check.
-  GotoIf(TaggedIsSmi(value), &done);
-  // Fast path: Read-only objects are trivially shared.
-  TNode<IntPtrT> page_flags = LoadMemoryChunkFlags(CAST(value));
-  GotoIf(WordNotEqual(
-             WordAnd(page_flags, IntPtrConstant(MemoryChunk::READ_ONLY_HEAP)),
-             IntPtrConstant(0)),
-         &done);
-#endif  // !CONTIGUOUS_COMPRESSED_READ_ONLY_SPACE_BOOL
-
-  // Fast path: Check if the HeapObject is already shared.
-  TNode<Uint16T> value_instance_type =
-      LoadMapInstanceType(LoadMap(CAST(value)));
-  GotoIf(IsSharedStringInstanceType(value_instance_type), &skip_barrier);
-  GotoIf(IsAlwaysSharedSpaceJSObjectInstanceType(value_instance_type),
-         &skip_barrier);
-  GotoIf(IsHeapNumberInstanceType(value_instance_type), &check_in_shared_heap);
-#if V8_ENABLE_WEBASSEMBLY
-  GotoIf(IsWasmObjectInstanceType(value_instance_type), &check_in_shared_heap);
-#endif  // V8_ENABLE_WEBASSEMBLY
-  Goto(&slow);
-
-  BIND(&check_in_shared_heap);
-  {
-    Branch(WordNotEqual(
-               WordAnd(page_flags,
-                       IntPtrConstant(MemoryChunk::IN_WRITABLE_SHARED_SPACE)),
-               IntPtrConstant(0)),
-           &skip_barrier, &slow);
-  }
-
-  // Slow path: Call out to runtime to share primitives and to throw on
-  // non-shared JS objects.
-  BIND(&slow);
-  {
-    *var_shared_value =
-        CallRuntime(Runtime::kSharedValueBarrierSlow, context, value);
-    Goto(&skip_barrier);
-  }
-
-  BIND(&skip_barrier);
-  {
-    // We skip the check for types that signal that they are shared. We do
-    // ensure that they are allocated in shared space though.
-    CSA_DCHECK(this,
-               IsPageFlagSet(BitcastTaggedToWord(var_shared_value->value()),
-                             MemoryChunk::IN_WRITABLE_SHARED_SPACE));
-    Goto(&done);
-  }
-
-  BIND(&done);
 }
 
 TNode<ArrayList> CodeStubAssembler::AllocateArrayList(TNode<Uint32T> capacity) {

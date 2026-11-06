@@ -298,6 +298,8 @@ class Heap final {
   void set_dispatch_table_gc_interval(int interval) {
     dispatch_table_gc_interval_ = interval;
   }
+
+  V8_EXPORT_PRIVATE void ResetAllocationTimeouts();
 #endif
 
   // Emits GC events for DevTools timeline.
@@ -1074,7 +1076,6 @@ class Heap final {
 
   // Used for query incremental marking status in generated code.
   uint8_t* IsMarkingFlagAddress();
-  uint8_t* IsMinorMarkingFlagAddress();
 
   void ClearRecordedSlotRange(
       Address start, Address end,
@@ -2093,8 +2094,10 @@ class Heap final {
 
   bool IsStressingScavenge();
 
+  void SetMarkingFlag(IsolateMarkingFlag flag, bool value);
   void SetIsMarkingFlag(bool value);
   V8_EXPORT_PRIVATE void SetIsMinorMarkingFlag(bool value);
+  void SetIsSharedMarkingFlag(bool value);
 
   V8_EXPORT_PRIVATE size_t PromotedSinceLastGC();
 

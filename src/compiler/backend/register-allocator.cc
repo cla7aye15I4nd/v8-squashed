@@ -4327,8 +4327,10 @@ void LinearScanAllocator::AllocateBlockedReg(LiveRange* current) {
   InstructionBlock* block =
       code()->GetInstructionBlock(current->Start().ToInstructionIndex());
   if (block->IsDeferred()) {
-    new_end = std::min(new_end, LifetimePosition::GapFromInstructionIndex(
-                                    LastDeferredInstructionIndex(block)));
+    new_end =
+        std::min(new_end, LifetimePosition::InstructionFromInstructionIndex(
+                              LastDeferredInstructionIndex(block))
+                              .NextFullStart());
   }
 
   // We couldn't spill until the next register use. Split before the register
@@ -4342,8 +4344,8 @@ void LinearScanAllocator::AllocateBlockedReg(LiveRange* current) {
   // If there is no register available at all, we can only spill this range.
   // Happens for instance on entry to deferred code where registers might
   // become blocked yet we aim to reload ranges.
-  if (new_end <= current->Start()) {
-    SpillBetween(current, current->Start(), register_use->pos());
+  if (new_end == current->Start()) {
+    SpillBetween(current, new_end, register_use->pos());
     return;
   }
 
@@ -4519,13 +4521,11 @@ void LinearScanAllocator::SpillBetweenUntil(LiveRange* range,
     // Split it at position between ]start+1, end[, spill the middle part
     // and put the rest to unhandled.
 
-    // Make sure that the third part always starts strictly after the start of
-    // the second part, as that likely is the current position of the register
-    // allocator and we cannot add ranges to unhandled that start before the
-    // current position. Note that `.End()` would be a no-op if
-    // `second_part->Start()` is already an END sub-position.
-    LifetimePosition split_start = std::max(
-        LifetimePosition::FromInt(second_part->Start().value() + 1), until);
+    // Make sure that the third part always starts after the start of the
+    // second part, as that likely is the current position of the register
+    // allocator and we cannot add ranges to unhandled that start before
+    // the current position.
+    LifetimePosition split_start = std::max(second_part->Start().End(), until);
 
     // If end is an actual use (which it typically is) we have to split
     // so that there is a gap before so that we have space for moving the

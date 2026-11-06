@@ -72,7 +72,6 @@
 #include "src/objects/js-objects.h"
 #include "src/objects/js-proxy-inl.h"
 #include "src/objects/js-regexp-inl.h"
-#include "src/objects/js-struct.h"
 #include "src/objects/js-weak-refs-inl.h"
 #include "src/objects/literal-objects-inl.h"
 #include "src/objects/managed-inl.h"
@@ -779,28 +778,22 @@ template <typename SeqString, template <typename> typename HandleType>
   requires(
       std::is_convertible_v<HandleType<SeqString>, DirectHandle<SeqString>>)
 Handle<String> Factory::InternalizeSubString(HandleType<SeqString> string,
-                                             uint32_t from, uint32_t length,
-                                             bool convert_encoding) {
+                                             uint32_t from, uint32_t length) {
   // Callers should handle the empty and one-char case themselves.
   DCHECK_GT(length, 1);
   DCHECK_IMPLIES(from == 0, length != string->length());
-  SeqSubStringKey<SeqString> key(isolate(), string, from, length,
-                                 convert_encoding);
+  SeqSubStringKey<SeqString> key(isolate(), string, from, length);
   return InternalizeStringWithKey(&key);
 }
 
 template Handle<String> Factory::InternalizeSubString(
-    Handle<SeqOneByteString> string, uint32_t from, uint32_t length,
-    bool convert_encoding);
+    Handle<SeqOneByteString> string, uint32_t from, uint32_t length);
 template Handle<String> Factory::InternalizeSubString(
-    Handle<SeqTwoByteString> string, uint32_t from, uint32_t length,
-    bool convert_encoding);
+    Handle<SeqTwoByteString> string, uint32_t from, uint32_t length);
 template Handle<String> Factory::InternalizeSubString(
-    DirectHandle<SeqOneByteString> string, uint32_t from, uint32_t length,
-    bool convert_encoding);
+    DirectHandle<SeqOneByteString> string, uint32_t from, uint32_t length);
 template Handle<String> Factory::InternalizeSubString(
-    DirectHandle<SeqTwoByteString> string, uint32_t from, uint32_t length,
-    bool convert_encoding);
+    DirectHandle<SeqTwoByteString> string, uint32_t from, uint32_t length);
 
 namespace {
 void ThrowInvalidEncodedStringBytes(Isolate* isolate, MessageTemplate message) {
@@ -2701,14 +2694,10 @@ Tagged<Map> Factory::InitializeMap(Tagged<Map> map, InstanceType type,
   }
   map->set_instance_size(instance_size);
   if (InstanceTypeChecker::IsJSObject(type)) {
-    // JSObjects that may be allocated in RO space must have RO maps.
-    DCHECK_IMPLIES(InstanceTypeChecker::IsMaybeReadOnlyJSObject(type),
-                   ReadOnlyHeap::Contains(map));
-    // Shared space JS objects have fixed layout and can have RO maps. No other
+    // JSObjects that may be allocated in RO space must have RO maps. No other
     // JS objects have RO maps.
-    DCHECK_IMPLIES(!IsMaybeReadOnlyJSObjectMap(map) &&
-                       !IsAlwaysSharedSpaceJSObjectMap(map),
-                   !ReadOnlyHeap::Contains(map));
+    DCHECK_EQ(InstanceTypeChecker::IsMaybeReadOnlyJSObject(type),
+              ReadOnlyHeap::Contains(map));
     map->SetInObjectPropertiesStartInWords(instance_size / kTaggedSize -
                                            inobject_properties);
     DCHECK_EQ(map->GetInObjectProperties(), inobject_properties);
@@ -5057,41 +5046,6 @@ Handle<JSFunction> Factory::NewFunctionForTesting(DirectHandle<String> name) {
   info->set_language_mode(LanguageMode::kSloppy);
   return JSFunctionBuilder{isolate(), info, isolate()->native_context()}
       .Build();
-}
-
-DirectHandle<JSSharedStruct> Factory::NewJSSharedStruct(
-    DirectHandle<JSFunction> constructor,
-    MaybeDirectHandle<NumberDictionary> maybe_elements_template) {
-  SharedObjectSafePublishGuard publish_guard;
-
-  DirectHandle<Map> instance_map(constructor->initial_map(), isolate());
-  DirectHandle<PropertyArray> property_array;
-  const int num_oob_fields =
-      instance_map->NumberOfFields(ConcurrencyMode::kSynchronous) -
-      instance_map->GetInObjectProperties();
-  if (num_oob_fields > 0) {
-    property_array = NewPropertyArray(static_cast<uint32_t>(num_oob_fields),
-                                      AllocationType::kSharedOld);
-  }
-
-  DirectHandle<NumberDictionary> elements_dictionary;
-  bool has_elements_dictionary;
-  if ((has_elements_dictionary =
-           maybe_elements_template.ToHandle(&elements_dictionary))) {
-    elements_dictionary = NumberDictionary::ShallowCopy(
-        isolate(), elements_dictionary, AllocationType::kSharedOld);
-  }
-
-  DirectHandle<JSSharedStruct> instance = Cast<JSSharedStruct>(
-      NewJSObject(constructor, AllocationType::kSharedOld));
-
-  // The struct object has not been fully initialized yet. Disallow allocation
-  // from this point on.
-  DisallowGarbageCollection no_gc;
-  if (!property_array.is_null()) instance->SetProperties(*property_array);
-  if (has_elements_dictionary) instance->set_elements(*elements_dictionary);
-
-  return instance;
 }
 
 namespace {
