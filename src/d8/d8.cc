@@ -760,7 +760,7 @@ class FileSourceStream : public CompileSourceStream {
     file_ = base::Fopen(filename, "rb");
     if (file_ == nullptr) {
       std::ostringstream oss;
-      oss << "Error loading file for streaming: " << filename;
+      oss << "Error loading file for streaming: " << TruncateForError(filename);
       ThrowError(isolate, oss.view());
     }
   }
@@ -1277,10 +1277,6 @@ bool Shell::ExecuteSource(Isolate* isolate, const Source& source,
   Local<Context> context(isolate->GetCurrentContext());
   ScriptOrigin origin = CreateScriptOrigin(isolate, name, ScriptType::kClassic);
 
-  i::CppGCManaged<ModuleEmbedderData>::Ptr module_data =
-      GetModuleDataFromContext(realm);
-  module_data->origin = ToSTLString(isolate, name);
-
   for (int i = 1; i < options.repeat_compile; ++i) {
     HandleScope handle_scope_for_compiling(isolate);
     if (CompileSource<Script>(isolate, context, source, origin).IsEmpty()) {
@@ -1292,6 +1288,10 @@ bool Shell::ExecuteSource(Isolate* isolate, const Source& source,
            .ToLocal(&script)) {
     return false;
   }
+
+  i::CppGCManaged<ModuleEmbedderData>::Ptr module_data =
+      GetModuleDataFromContext(realm);
+  module_data->origin = ToSTLString(isolate, name);
 
   if (options.code_cache_options ==
       ShellOptions::CodeCacheOptions::kProduceCache) {
@@ -1513,7 +1513,7 @@ MaybeLocal<Object> Shell::FetchModuleSource(Local<Module> referrer,
   // Loading modules is only allowed for local absolute paths.
   if (!IsAbsolutePath(module_specifier)) {
     std::ostringstream msg;
-    msg << "d8: Reading module from " << module_specifier
+    msg << "d8: Reading module from " << TruncateForError(module_specifier)
         << " is not supported.";
     if (!referrer.IsEmpty()) {
       std::string referrer_specifier =
@@ -1527,7 +1527,8 @@ MaybeLocal<Object> Shell::FetchModuleSource(Local<Module> referrer,
   auto file = ReadFileData(isolate, module_specifier.c_str());
   if (!file) {
     std::ostringstream msg;
-    msg << "d8: Error reading module from " << module_specifier;
+    msg << "d8: Error reading module from "
+        << TruncateForError(module_specifier);
     if (!referrer.IsEmpty()) {
       std::string referrer_specifier =
           module_data->GetModuleSpecifier(referrer);
@@ -1600,8 +1601,10 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
 
   if (!found_in_bundle) {
     if (module_specifier.starts_with(kDataURLPrefix)) {
-      source_text = String::NewFromUtf8(
-          isolate, module_specifier.c_str() + strlen(kDataURLPrefix));
+      if (module_specifier.length() <= String::kMaxLength) {
+        source_text = String::NewFromUtf8(
+            isolate, module_specifier.c_str() + strlen(kDataURLPrefix));
+      }
     } else if (IsAbsolutePath(module_specifier)) {
       if (module_type == ModuleType::kBytes) {
         raw_file = ReadFileData(isolate, module_specifier.c_str(), false);
@@ -1619,7 +1622,7 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
     } else {
       // Loading modules is only allowed for local absolute paths.
       std::ostringstream msg;
-      msg << "d8: Reading module from " << module_specifier
+      msg << "d8: Reading module from " << TruncateForError(module_specifier)
           << " is not supported.";
       if (!referrer.IsEmpty()) {
         std::string referrer_specifier =
@@ -1631,10 +1634,14 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
     }
   }
 
+  Local<String> resource_name;
   if ((module_type == ModuleType::kBytes && !raw_file) ||
-      (module_type != ModuleType::kBytes && source_text.IsEmpty())) {
+      (module_type != ModuleType::kBytes && source_text.IsEmpty()) ||
+      !String::NewFromUtf8(isolate, module_specifier.c_str())
+           .ToLocal(&resource_name)) {
     std::ostringstream msg;
-    msg << "d8: Error reading module from " << module_specifier;
+    msg << "d8: Error reading module from "
+        << TruncateForError(module_specifier);
     if (!referrer.IsEmpty()) {
       std::string referrer_specifier =
           module_data->GetModuleSpecifier(referrer);
@@ -1644,8 +1651,6 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
     return MaybeLocal<Module>();
   }
 
-  Local<String> resource_name =
-      String::NewFromUtf8(isolate, module_specifier.c_str()).ToLocalChecked();
   ScriptOrigin origin =
       CreateScriptOrigin(isolate, resource_name, ScriptType::kModule);
 
@@ -1682,17 +1687,14 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
         {String::NewFromUtf8(isolate, "default").ToLocalChecked()});
 
     module = v8::Module::CreateSyntheticModule(
-        isolate,
-        String::NewFromUtf8(isolate, module_specifier.c_str()).ToLocalChecked(),
-        export_names, Shell::JSONModuleEvaluationSteps, parsed_json);
+        isolate, resource_name, export_names, Shell::JSONModuleEvaluationSteps,
+        parsed_json);
   } else if (module_type == ModuleType::kText) {
     auto export_names = std::to_array<Local<String>>(
         {String::NewFromUtf8(isolate, "default").ToLocalChecked()});
 
     module = v8::Module::CreateSyntheticModule(
-        isolate,
-        String::NewFromUtf8(isolate, module_specifier.c_str()).ToLocalChecked(),
-        export_names, Shell::TextModuleEvaluationSteps,
+        isolate, resource_name, export_names, Shell::TextModuleEvaluationSteps,
         source_text.ToLocalChecked());
   } else if (module_type == ModuleType::kBytes) {
     CHECK(raw_file);
@@ -1712,9 +1714,8 @@ MaybeLocal<Module> Shell::FetchModuleTree(Local<Module> referrer,
         {String::NewFromUtf8(isolate, "default").ToLocalChecked()});
 
     module = v8::Module::CreateSyntheticModule(
-        isolate,
-        String::NewFromUtf8(isolate, module_specifier.c_str()).ToLocalChecked(),
-        export_names, Shell::BytesModuleEvaluationSteps, uint8_array);
+        isolate, resource_name, export_names, Shell::BytesModuleEvaluationSteps,
+        uint8_array);
   } else {
     UNREACHABLE();
   }
@@ -2763,7 +2764,7 @@ bool Shell::LookupPerformanceMark(Isolate* isolate, v8::Local<String> name,
   }
   std::ostringstream msg;
   msg << "Invalid performance.mark \"";
-  msg << (*utf8_name) << "\" does not exist";
+  msg << TruncateForError(*utf8_name) << "\" does not exist";
   ThrowError(isolate, msg.str());
   return false;
 }
@@ -3703,8 +3704,11 @@ void Shell::ResetOnProfileEndListener(Isolate* isolate) {
   }
 }
 
-#if defined(V8_FUZZILLI) || defined(V8_REDLINE)
 void Shell::ResetIsolateStateForReprl(Isolate* isolate) {
+  // A testcase can terminate itself, for example with %TerminateExecution().
+  // Shell::ExecuteSource then keeps the termination requested, which would
+  // stop the next testcase at once.
+  isolate->CancelTerminateExecution();
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
   i_isolate->descriptor_lookup_cache()->Clear();
   i_isolate->compilation_cache()->Clear();
@@ -3723,7 +3727,6 @@ void Shell::ResetIsolateStateForReprl(Isolate* isolate) {
 
   ResetOnProfileEndListener(isolate);
 }
-#endif  // defined(V8_FUZZILLI) || defined(V8_REDLINE)
 
 void Shell::ProfilerTriggerSample(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
@@ -3949,10 +3952,8 @@ void Shell::ExecuteFile(const v8::FunctionCallbackInfo<v8::Value>& info) {
     HandleScope handle_scope(isolate);
     SafeUtf8Value file_name(isolate, info[i]);
     if (!file_name) return;
-    if (!ExecuteSource(
-            isolate, Source::FromFile(*file_name),
-            String::NewFromUtf8(isolate, *file_name).ToLocalChecked(),
-            kNoReportExceptions)) {
+    if (!ExecuteSource(isolate, Source::FromFile(*file_name),
+                       file_name.string(), kNoReportExceptions)) {
       return;
     }
   }
@@ -4210,7 +4211,7 @@ void Shell::WorkerNew(const v8::FunctionCallbackInfo<v8::Value>& info) {
     if (!allow_new_workers_) return;
 
     String::Utf8Value script(isolate, source);
-    if (!*script) {
+    if (!*script || script.length() > String::kMaxLength) {
       ThrowError(isolate, "Can't get worker script");
       return;
     }
@@ -4504,6 +4505,9 @@ bool SkipTerminationForFuzzing() {
   // being processed. This will in turn desynchronize the communication
   // between d8 and Fuzzilli, leading to a crash.
   if (fuzzilli_reprl) return true;
+  // --bundle-reprl runs the parts of a bundle in the same way as REPRL runs
+  // testcases, so it skips termination too.
+  if (Shell::options.bundle_reprl) return true;
   return false;
 }
 
@@ -5943,7 +5947,7 @@ std::unique_ptr<base::OS::MemoryMappedFile> Shell::ReadFileData(
   if (!file) {
     if (should_throw) {
       std::ostringstream oss;
-      oss << "Error loading file: " << name;
+      oss << "Error loading file: " << TruncateForError(name);
       ThrowError(isolate, oss.view());
     }
     return nullptr;
@@ -5966,6 +5970,16 @@ MaybeLocal<String> Shell::ReadFile(Isolate* isolate, const char* name,
   int size = static_cast<int>(full_file_size);
   char* chars = static_cast<char*>(file->memory());
   return CreateStringFromExternalData(isolate, std::string_view(chars, size));
+}
+
+// Reads a file into a std::string.
+std::optional<std::string> Shell::ReadFileToString(const char* name) {
+  std::unique_ptr<base::OS::MemoryMappedFile> file(
+      base::OS::MemoryMappedFile::open(
+          name, base::OS::MemoryMappedFile::FileMode::kReadOnly));
+  if (!file) return std::nullopt;
+  if (file->size() == 0) return std::string();
+  return std::string(static_cast<const char*>(file->memory()), file->size());
 }
 
 void Shell::WriteChars(const char* name, uint8_t* buffer, size_t buffer_size) {
@@ -6252,21 +6266,24 @@ bool AddBundleModule(Isolate* isolate, const std::string& name,
   return false;
 }
 
-bool TryExecuteBundle(Isolate* isolate, const std::string& content,
-                      Local<String> file_name, bool* out_success) {
+constexpr char kBundleMarkerPrefix[] = "// JS_BUNDLE_";
+constexpr char kBundleScriptMarker[] = "// JS_BUNDLE_SCRIPT";
+
+// One part of a bundle: the marker line (without the line break) and the
+// content up to the next marker.
+struct BundlePart {
+  std::string header;
+  std::string content;
+};
+
+// Splits a bundle into its parts. Returns false if the content is not a bundle.
+bool SplitBundle(const std::string& content, std::vector<BundlePart>* parts) {
   // Find the first // JS_BUNDLE_ comment. It's either
   // "// JS_BUNDLE_SCRIPT", "// JS_BUNDLE_MODULE:filename.mjs", or "//
   // JS_BUNDLE_MODULE_ENTRYPOINT". Then find either the end of the file, or the
   // next // JS_BUNDLE_ comment. Between those locations, we have our file (or
   // module).
-
-  // We first gather all scripts and modules, and then execute the scripts and
-  // the module entrypoints in order.
-
-  std::string script_marker = "// JS_BUNDLE_SCRIPT";
-  std::string module_marker_prefix = "// JS_BUNDLE_MODULE:";
-  std::string entrypoint_marker_prefix = "// JS_BUNDLE_MODULE_ENTRYPOINT";
-  std::string marker_prefix = "// JS_BUNDLE_";
+  std::string marker_prefix = kBundleMarkerPrefix;
 
   size_t pos = 0;
   // Skip whitespace and comments before the first marker.
@@ -6300,13 +6317,6 @@ bool TryExecuteBundle(Isolate* isolate, const std::string& content,
 
   if (pos >= content.length()) return false;
 
-  struct ExecutionItem {
-    enum Type { kScript, kModuleEntrypoint };
-    Type type;
-    std::string content_or_name;
-  };
-  std::vector<ExecutionItem> execution_order;
-
   while (pos < content.length()) {
     // We expect a marker at pos.
     if (content.compare(pos, marker_prefix.length(), marker_prefix) != 0) {
@@ -6329,8 +6339,33 @@ bool TryExecuteBundle(Isolate* isolate, const std::string& content,
     size_t part_end =
         (next_marker == std::string::npos) ? content.length() : next_marker;
 
-    std::string part_content = content.substr(pos, part_end - pos);
+    parts->push_back({std::move(header), content.substr(pos, part_end - pos)});
     pos = part_end;
+  }
+  return true;
+}
+
+bool TryExecuteBundle(Isolate* isolate, const std::string& content,
+                      Local<String> file_name, bool* out_success) {
+  // We first gather all scripts and modules, and then execute the scripts and
+  // the module entrypoints in order.
+  std::vector<BundlePart> parts;
+  if (!SplitBundle(content, &parts)) return false;
+
+  std::string script_marker = kBundleScriptMarker;
+  std::string module_marker_prefix = "// JS_BUNDLE_MODULE:";
+  std::string entrypoint_marker_prefix = "// JS_BUNDLE_MODULE_ENTRYPOINT";
+
+  struct ExecutionItem {
+    enum Type { kScript, kModuleEntrypoint };
+    Type type;
+    std::string content_or_name;
+  };
+  std::vector<ExecutionItem> execution_order;
+
+  for (const BundlePart& part : parts) {
+    const std::string& header = part.header;
+    const std::string& part_content = part.content;
 
     if (header == script_marker) {
       execution_order.push_back({ExecutionItem::kScript, part_content});
@@ -6383,6 +6418,49 @@ bool TryExecuteBundle(Isolate* isolate, const std::string& content,
   }
 
   return true;  // Bundle handled successfully (even if execution failed)
+}
+
+bool SourceGroup::ReadBundleReprlScripts(std::vector<std::string>* scripts) {
+  const char* file_name = nullptr;
+  for (int i = begin_offset_; i < end_offset_; ++i) {
+    const char* arg = argv_[i];
+    if (arg == nullptr) continue;
+    if (strcmp(arg, "-e") == 0 || strcmp(arg, "--module") == 0 ||
+        strcmp(arg, "--json") == 0) {
+      printf("Error: --bundle-reprl does not support %s\n", arg);
+      return false;
+    }
+    // Ignore other options. They have been parsed already.
+    if (arg[0] == '-') continue;
+    if (file_name != nullptr) {
+      printf("Error: --bundle-reprl needs exactly one bundle file\n");
+      return false;
+    }
+    file_name = arg;
+  }
+  if (file_name == nullptr) {
+    printf("Error: --bundle-reprl needs exactly one bundle file\n");
+    return false;
+  }
+  std::optional<std::string> content = Shell::ReadFileToString(file_name);
+  if (!content) {
+    printf("Error reading '%s'\n", file_name);
+    return false;
+  }
+  std::vector<BundlePart> parts;
+  if (!SplitBundle(*content, &parts)) {
+    printf("Error: '%s' is not a bundle\n", file_name);
+    return false;
+  }
+  for (BundlePart& part : parts) {
+    if (part.header != kBundleScriptMarker) {
+      printf("Error: --bundle-reprl supports only %s parts, not: %s\n",
+             kBundleScriptMarker, part.header.c_str());
+      return false;
+    }
+    scripts->push_back(std::move(part.content));
+  }
+  return true;
 }
 
 bool SourceGroup::Execute(Isolate* isolate) {
@@ -7377,6 +7455,8 @@ bool Shell::SetOptions(int argc, char* argv[]) {
       options.max_serializer_memory = atoi(flag_value) * i::MB;
     } else if (FlagMatches("--bundle", &argv[i])) {
       options.bundle = true;
+    } else if (FlagMatches("--bundle-reprl", &argv[i])) {
+      options.bundle_reprl = true;
 #if defined(V8_FUZZILLI) || defined(V8_REDLINE)
     } else if (FlagMatches("--fuzzilli-enable-builtins-coverage", &argv[i])) {
       options.fuzzilli_enable_builtins_coverage = true;
@@ -7573,6 +7653,10 @@ bool Shell::SetOptions(int argc, char* argv[]) {
       options.num_isolates++;
     }
   }
+  if (options.bundle_reprl && options.num_isolates > 1) {
+    printf("Error: --bundle-reprl does not support --isolate\n");
+    return false;
+  }
   options.isolate_sources = new SourceGroup[options.num_isolates];
   internal::g_num_isolates_for_testing = options.num_isolates;
   SourceGroup* current = options.isolate_sources;
@@ -7634,7 +7718,8 @@ void JoinAllWorkerAndIsolateThreads(Isolate* isolate) {
 
 }  // namespace
 
-int Shell::RunMain(v8::Isolate* isolate, bool last_run) {
+int Shell::RunMain(v8::Isolate* isolate, bool last_run,
+                   std::optional<std::string_view> reprl_script) {
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
 
   for (int i = 1; i < options.num_isolates; ++i) {
@@ -7647,7 +7732,7 @@ int Shell::RunMain(v8::Isolate* isolate, bool last_run) {
   // returns in some situations:
   const bool keep_context_alive =
       last_run && (use_interactive_shell() || i::v8_flags.stress_snapshot);
-  bool success = RunMainIsolate(isolate, keep_context_alive);
+  bool success = RunMainIsolate(isolate, keep_context_alive, reprl_script);
   CollectGarbage(isolate);
 
   // Park the main thread here to prevent deadlocks in shared GCs when
@@ -7712,7 +7797,44 @@ int Shell::RunMain(v8::Isolate* isolate, bool last_run) {
   return (success == Shell::options.expected_to_throw ? 1 : 0);
 }
 
-bool Shell::RunMainIsolate(v8::Isolate* isolate, bool keep_context_alive) {
+// Runs each script part of a bundle in the same way as the REPRL loop of a
+// fuzzer runs one testcase: reset the isolate state, then run the part in a new
+// context. Thus a crash that occurs only after the earlier testcases of a REPRL
+// session can be reproduced from one file. Returns the result of the last part.
+int Shell::RunBundleReprl(v8::Isolate* isolate) {
+  std::vector<std::string> scripts;
+  bool read_ok = options.isolate_sources[0].ReadBundleReprlScripts(&scripts);
+  // Do not start the interactive shell, also when the bundle cannot be read.
+  set_script_executed();
+  if (!read_ok) return 1;
+  int result = 0;
+  for (const std::string& script : scripts) {
+    ResetIsolateStateForReprl(isolate);
+    result = RunMain(isolate, /*last_run=*/true, script);
+  }
+  return result;
+}
+
+// Runs one script part of a --bundle-reprl bundle in the same way as the REPRL
+// branch of SourceGroup::Execute runs one testcase.
+bool Shell::ExecuteReprlScript(Isolate* isolate, std::string_view script) {
+  HandleScope handle_scope(isolate);
+  if (script.size() > size_t{String::kMaxLength}) {
+    printf("Error: bundle part too large (%zu bytes)\n", script.size());
+    return false;
+  }
+  Local<String> file_name = String::NewFromUtf8Literal(isolate, "fuzzcode.js");
+  Local<String> source =
+      String::NewFromUtf8(isolate, script.data(), NewStringType::kNormal,
+                          static_cast<int>(script.size()))
+          .ToLocalChecked();
+  set_script_executed();
+  return ExecuteSource(isolate, Source::FromString(source), file_name,
+                       kReportExceptions);
+}
+
+bool Shell::RunMainIsolate(v8::Isolate* isolate, bool keep_context_alive,
+                           std::optional<std::string_view> reprl_script) {
   if (options.lcov_file) {
     debug::Coverage::SelectMode(isolate, debug::CoverageMode::kBlockCount);
   }
@@ -7742,7 +7864,11 @@ bool Shell::RunMainIsolate(v8::Isolate* isolate, bool keep_context_alive) {
     // context and SourceGroup::Execute may execute a non-nestable task, e.g. a
     // stackless GC.
     global_context.Get(isolate)->Enter();
-    if (!options.isolate_sources[0].Execute(isolate)) success = false;
+    if (reprl_script.has_value()) {
+      if (!ExecuteReprlScript(isolate, *reprl_script)) success = false;
+    } else {
+      if (!options.isolate_sources[0].Execute(isolate)) success = false;
+    }
     global_context.Get(isolate)->Exit();
   }
   if (!FinishExecuting(isolate, global_context)) success = false;
@@ -8708,6 +8834,8 @@ int Shell::Main(int argc, char* argv[]) {
         result = RunMain(isolate, /*last_run=*/true);
         options.compile_options.Overwrite(
             v8::ScriptCompiler::kNoCompileOptions);
+      } else if (options.bundle_reprl && !fuzzilli_reprl) {
+        result = RunBundleReprl(isolate);
       } else {
         result = RunMain(isolate, /*last_run=*/true);
       }

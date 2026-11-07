@@ -916,7 +916,9 @@ static void VisitGeneralStore(
 
   if (write_barrier_kind != kNoWriteBarrier &&
       !v8_flags.disable_write_barriers) {
-    DCHECK(CanBeTaggedOrCompressedPointer(rep));
+    DCHECK(CanBeTaggedOrCompressedPointer(rep) ||
+           (write_barrier_kind == kSkippedWriteBarrier &&
+            rep == MachineRepresentation::kTaggedSigned));
     // Uncompressed stores should not happen if we need a write barrier.
     CHECK((store.ts_stored_rep() !=
            MemoryRepresentation::AnyUncompressedTagged()) &&
@@ -939,6 +941,8 @@ static void VisitGeneralStore(
 
     if (write_barrier_kind == kSkippedWriteBarrier) {
       code = kArchStoreSkippedWriteBarrier;
+      code |=
+          CheckSmiField::encode(rep == MachineRepresentation::kTaggedSigned);
     } else {
       RecordWriteMode record_write_mode =
           WriteBarrierKindToRecordWriteMode(write_barrier_kind);
@@ -3405,7 +3409,8 @@ InstructionSelector::SupportedMachineOperatorFlags() {
       MachineOperatorBuilder::kWord32Popcnt |
       MachineOperatorBuilder::kInt32AbsWithOverflow |
       MachineOperatorBuilder::kInt64AbsWithOverflow |
-      MachineOperatorBuilder::kWord64Popcnt;
+      MachineOperatorBuilder::kWord64Popcnt |
+      MachineOperatorBuilder::kFloat64MinMax;
   if (CpuFeatures::IsSupported(MISC_INSTR_EXT4)) {
     flags |= MachineOperatorBuilder::kWord64Ctz;
   }

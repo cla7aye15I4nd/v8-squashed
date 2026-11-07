@@ -79,9 +79,6 @@ MaglevReducer<BaseT>::LazyDeoptFrameScope::LazyDeoptFrameScope(
                              : reducer->zone()->CloneVector(parameters),
           context, maybe_js_target}),
       parent_(reducer->current_lazy_deopt_scope_) {
-  if constexpr (ReducerBaseWithDeoptFrameScopeHooks<BaseT>) {
-    reducer->base_->OnBeginDeoptFrameScope();
-  }
   if (!parameters.empty()) {
     if (InlinedAllocation* receiver =
             parameters[0]->TryCast<InlinedAllocation>()) {
@@ -104,9 +101,6 @@ MaglevReducer<BaseT>::LazyDeoptFrameScope::LazyDeoptFrameScope(
       data_(DeoptFrame::ConstructInvokeStubFrameData{unit, position, receiver,
                                                      context}),
       parent_(reducer->current_lazy_deopt_scope_) {
-  if constexpr (ReducerBaseWithDeoptFrameScopeHooks<BaseT>) {
-    reducer->base_->OnBeginDeoptFrameScope();
-  }
   reducer->current_lazy_deopt_scope_ = this;
 }
 
@@ -130,9 +124,6 @@ MaglevReducer<BaseT>::EagerDeoptFrameScope::EagerDeoptFrameScope(
                              : reducer->zone()->CloneVector(parameters),
           context, maybe_js_target}),
       parent_(reducer->current_lazy_deopt_scope_) {
-  if constexpr (ReducerBaseWithDeoptFrameScopeHooks<BaseT>) {
-    reducer->base_->OnBeginDeoptFrameScope();
-  }
   if (!parameters.empty()) {
     if (InlinedAllocation* receiver =
             parameters[0]->TryCast<InlinedAllocation>()) {
@@ -595,12 +586,6 @@ ReduceResult MaglevReducer<BaseT>::BuildLoadFixedDoubleArrayElement(
   // cannot end up with an empty type for it.
   DCHECK(!IsEmptyNodeType(GetType(elements)));
   RETURN_IF_ABORT(AbortIfInvalidFixedArrayIndex<FixedDoubleArray>(index));
-  if constexpr (ReducerBaseWithAllocationTracking<BaseT>) {
-    if (auto constant = TryGetInt32Constant(index)) {
-      RETURN_IF_DONE(base_->TryBuildLoadFixedDoubleArrayElementFromAllocation(
-          elements, constant.value()));
-    }
-  }
   return AddNewNode<LoadFixedDoubleArrayElement>({elements, index});
 }
 
@@ -615,11 +600,6 @@ ReduceResult MaglevReducer<BaseT>::BuildStoreTaggedField(
   // test/mjsunit/maglev/regress-538884561-2.js.
   ABORT_IF_EMPTY_TYPE(value);
 
-  if constexpr (ReducerBaseWithAllocationTracking<BaseT>) {
-    if (!IsInitializing(store_mode)) {
-      base_->TryBuildStoreTaggedFieldToAllocation(object, value, offset);
-    }
-  }
   if (CanElideWriteBarrier(object, value)) {
     return AddNewNode<StoreTaggedFieldNoWriteBarrier>(
         {object, value}, offset, store_mode, property_key, maybe_assigned);
@@ -644,11 +624,6 @@ ReduceResult MaglevReducer<BaseT>::BuildStoreTaggedFieldNoWriteBarrier(
   ABORT_IF_EMPTY_TYPE(value);
 
   DCHECK(CanElideWriteBarrier(object, value));
-  if constexpr (ReducerBaseWithAllocationTracking<BaseT>) {
-    if (!IsInitializing(store_mode)) {
-      base_->TryBuildStoreTaggedFieldToAllocation(object, value, offset);
-    }
-  }
   return AddNewNode<StoreTaggedFieldNoWriteBarrier>({object, value}, offset,
                                                     store_mode, property_key);
 }
@@ -6174,8 +6149,6 @@ VirtualObject* MaglevReducer<BaseT>::CreateJSGeneratorObject(
             GetInt32Constant(JSGeneratorObject::kGeneratorExecuting));
   vobj->set(offsetof(JSGeneratorObject, parameters_and_registers_),
             register_file);
-  vobj->set(offsetof(JSGeneratorObject, yielded_value_),
-            GetRootConstant(RootIndex::kUndefinedValue));
   if (is_async) {
     vobj->set(offsetof(JSAsyncGeneratorObject, queue_),
               GetRootConstant(RootIndex::kUndefinedValue));
@@ -6195,7 +6168,7 @@ VirtualObject* MaglevReducer<BaseT>::CreateJSAsyncFunctionObject(
       &VirtualJSAsyncFunctionObjectShape::kObjectLayout;
 
   constexpr int slot_count = sizeof(JSAsyncFunctionObject) / kTaggedSize;
-  static_assert(slot_count == 14,
+  static_assert(slot_count == 13,
                 "If the number of slots in JSAsyncFunctionObject changes, then "
                 "the additional slots need to be initialized below");
 
@@ -6221,8 +6194,6 @@ VirtualObject* MaglevReducer<BaseT>::CreateJSAsyncFunctionObject(
   vobj->set(offsetof(JSAsyncFunctionObject, await_resolve_closure_),
             GetRootConstant(RootIndex::kUndefinedValue));
   vobj->set(offsetof(JSAsyncFunctionObject, await_reject_closure_),
-            GetRootConstant(RootIndex::kUndefinedValue));
-  vobj->set(offsetof(JSAsyncFunctionObject, yielded_value_),
             GetRootConstant(RootIndex::kUndefinedValue));
 
   return vobj;
@@ -6582,8 +6553,6 @@ MaybeReduceResult MaglevReducer<BaseT>::TryReduceRegExpPrototypeTest(
       last_index, BuildLoadTaggedField(receiver, JSRegExp::kLastIndexOffset));
   // RegExpPrototypeTestFast requires lastIndex to be a positive Smi.
   RETURN_IF_ABORT(BuildCheckSmi(last_index));
-  // Virtual object tracking might return an Int32Constant, which cannot be
-  // untagged.
   ValueNode* last_index_int32;
   GET_VALUE_OR_ABORT(last_index_int32, GetInt32(last_index));
   RETURN_IF_ABORT(TryBuildCheckInt32Condition(
@@ -7144,13 +7113,38 @@ ReduceResult SubgraphBase<DerivedT, BaseT>::TrimPredecessorsAndBind(
                   ? 0
                   : label->merge_state_->predecessors_so_far());
   }
-  DCHECK_LE(predecessors_so_far, label->predecessor_count_);
+  CHECK_LE(predecessors_so_far, label->predecessor_count_);
   reducer_->set_current_block(nullptr);
   ReducePredecessorCount(label,
                          label->predecessor_count_ - predecessors_so_far);
   if (predecessors_so_far == 0) return ReduceResult::DoneWithAbort();
   static_cast<DerivedT*>(this)->Bind(label);
   return ReduceResult::Done();
+}
+
+template <typename DerivedT, typename BaseT>
+template <typename FFast, typename FSlow>
+ReduceResult SubgraphBase<DerivedT, BaseT>::WithFallback(
+    std::initializer_list<Variable*> vars, FFast&& fast_path_fn,
+    FSlow&& fallback_fn, int max_fallback_predecessors) {
+  Label fallback(this, max_fallback_predecessors);
+  Label done(this, 2, vars);
+
+  MaybeReduceResult fast_result = fast_path_fn(&fallback);
+  CHECK(fast_result.IsDone());
+  DCHECK_EQ(fast_result.IsDoneWithAbort(),
+            reducer_->current_block() == nullptr);
+  GotoOrTrim(&done);
+
+  if (!TrimPredecessorsAndBind(&fallback).IsDoneWithAbort()) {
+    MaybeReduceResult fallback_result = fallback_fn();
+    CHECK(fallback_result.IsDone());
+    DCHECK_EQ(fallback_result.IsDoneWithAbort(),
+              reducer_->current_block() == nullptr);
+  }
+  GotoOrTrim(&done);
+
+  return TrimPredecessorsAndBind(&done);
 }
 
 inline bool IsSmallFunction(int bytecode_length,
