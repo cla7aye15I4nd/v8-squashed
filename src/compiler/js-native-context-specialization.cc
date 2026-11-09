@@ -3256,6 +3256,14 @@ JSNativeContextSpecialization::BuildPropertyStore(
               AccessBuilder::ForJSObjectPropertiesOrHashKnownPointer()),
           storage, effect, control);
     }
+    // AccessMode::kStoreInLiteral (from DefineNamedOwnPropertyInLiteral and
+    // DefineKeyedOwnPropertyInLiteral) may store to an existing
+    // IsFastDataConstant() field without deoptimizing because the receiver is a
+    // freshly created, unescaped literal object: representation and FieldType
+    // checks are still emitted below, Double fields have a fresh HeapNumber box
+    // per literal instance, and LoadElimination::ReduceStoreField kills any
+    // previously recorded kConst value on the literal when is_store_in_literal
+    // is true.
     if (access_info.IsFastDataConstant() &&
         access_mode != AccessMode::kStoreInLiteral &&
         !access_info.HasTransitionMap()) {
@@ -4125,8 +4133,11 @@ JSNativeContextSpecialization::
         simplified()->CheckIf(DeoptimizeReason::kArrayBufferWasDetached), check,
         effect, control);
 
-    // Retain the {buffer} instead of {receiver} to reduce live ranges.
-    buffer_or_receiver = buffer;
+    // Retain the {buffer} instead of {receiver} to reduce live ranges, unless
+    // {receiver} is a constant JSTypedArray (which must stay retained too).
+    if (!typed_array.has_value()) {
+      buffer_or_receiver = buffer;
+    }
   }
 
   enum Situation { kBoundsCheckDone, kHandleOOB_SmiAndRangeCheckComputed };

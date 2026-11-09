@@ -60,6 +60,9 @@ struct FuzzerStats {
   std::atomic<uint64_t> crashes_amplified{0};  // reproduced by the amplify step
   std::atomic<uint64_t> amplify_processes{
       0};  // plain d8 runs of the amplify step
+  // State-dependent crashes whose NAME.bundle.js crashed in a plain d8 run.
+  std::atomic<uint64_t> crashes_bundled{0};
+  std::atomic<uint64_t> bundle_processes{0};  // plain d8 runs of the bundles
   std::atomic<uint64_t> crash_replay_executions{0};  // spent on history replays
   std::atomic<uint64_t> minimizer_tests{0};
   std::atomic<uint64_t> minimizer_time_us{0};
@@ -115,6 +118,20 @@ class Fuzzer {
   std::string StatusLine() const;
   // The per-component tables (mutators, reducers, scheduler, generators).
   std::string ComponentTables(bool include_generators) const;
+
+  // Target-guided `d8` flag state for change-based fuzzing.
+  void SetTargetsForTest(std::vector<std::pair<uint32_t, double>> targets) {
+    targets_ = std::move(targets);
+  }
+  void RecordTargetFlags(const std::vector<std::string>& args, double score);
+  void RecordTargetChild(bool hit);
+  std::vector<std::string> DrawD8Flags(Random& rng);
+  uint64_t target_children_completed() const {
+    return target_children_completed_.load(std::memory_order_acquire);
+  }
+  uint64_t target_children_hit() const {
+    return target_children_hit_.load(std::memory_order_acquire);
+  }
 
  private:
   friend class Worker;
@@ -182,11 +199,11 @@ class Fuzzer {
     std::vector<std::string> args;
     double score = 0;
   };
-  void RecordTargetFlags(const std::vector<std::string>& args, double score);
-  std::vector<std::string> DrawD8Flags(Random& rng);
   std::mutex target_flags_mutex_;
   std::vector<TargetFlagEntry> target_flags_;
   std::atomic<bool> has_target_flags_{false};
+  std::atomic<uint64_t> target_children_completed_{0};
+  std::atomic<uint64_t> target_children_hit_{0};
   std::unique_ptr<Corpus> corpus_;
   std::unique_ptr<MutatorSet> mutators_;
   std::unique_ptr<GeneratorSet> generators_;

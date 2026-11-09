@@ -988,8 +988,7 @@ class Internals {
   // The resource field of an external string references a cppgc object
   // (ExternalStringResourceWrapper) which stores the resource pointer at this
   // offset.
-  static const int kExternalStringResourceWrapperResourceOffset =
-      kApiSystemPointerSize;
+  static const int kExternalStringResourceWrapperResourceOffset = 0;
 
   static const int kOddballKindOffset = 4 * kApiTaggedSize + kApiDoubleSize;
   static const int kJSObjectHeaderSize = 3 * kApiTaggedSize;
@@ -1109,8 +1108,10 @@ class Internals {
       kContinuationPreservedEmbedderDataOffset + kApiSystemPointerSize;
   static const int kCurrentMicrotaskNativeContextOffset =
       kCurrentMicrotaskQueueOffset + kApiSystemPointerSize;
-  static const int kIsolateRootsOffset =
+  static const int kAllocationSiteCacheOffset =
       kCurrentMicrotaskNativeContextOffset + kApiSystemPointerSize;
+  static const int kIsolateRootsOffset =
+      kAllocationSiteCacheOffset + kApiSystemPointerSize;
 
 #if V8_TARGET_ARCH_PPC64
   static constexpr int kFrameCPSlotCount = 1;

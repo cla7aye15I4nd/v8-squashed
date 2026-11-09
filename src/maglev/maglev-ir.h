@@ -2800,9 +2800,11 @@ class ValueNode : public Node {
   ValueNode* UnwrapIdentities();
   const ValueNode* UnwrapIdentities() const;
 
+  ValueNode* UnwrapIdentitiesAndReturnedValues();
+
   // Like UnwrapIdentities, but also unwraps phis with a single input (which are
-  // not exception phis, resumable loop phis, or former-loop hole phis), since
-  // the optimizer replaces those with their input.
+  // not exception phis or resumable loop phis), since the optimizer replaces
+  // those with their input.
   // TODO(dmercadier): Remove this if https://crrev.com/c/7117478 ever lands.
   ValueNode* UnwrapIdentitiesAndPhis();
 
@@ -2888,6 +2890,14 @@ inline ValueNode* ValueNode::UnwrapIdentities() {
 inline const ValueNode* ValueNode::UnwrapIdentities() const {
   const ValueNode* node = this;
   while (node->Is<Identity>()) node = node->input(0).node();
+  return node;
+}
+
+inline ValueNode* ValueNode::UnwrapIdentitiesAndReturnedValues() {
+  ValueNode* node = this;
+  while (node->Is<Identity>() || node->Is<ReturnedValue>()) {
+    node = node->input(0).node();
+  }
   return node;
 }
 
@@ -5342,7 +5352,6 @@ class RootConstant : public FixedInputValueNodeT<0, RootConstant> {
   }
 
   bool ToBoolean(LocalIsolate* local_isolate) const;
-  bool IsAnyHole() const;
 
   RootIndex index() const { return index_; }
 

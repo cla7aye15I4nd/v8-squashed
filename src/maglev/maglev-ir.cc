@@ -252,20 +252,9 @@ std::ostream& operator<<(std::ostream& os, const StringEqualInputMode mode) {
 bool Phi::is_loop_phi() const { return merge_state()->is_loop(); }
 
 namespace {
-bool IsAnyHoleConstant(const ValueNode* node) {
-  if (const RootConstant* root = node->TryCast<RootConstant>()) {
-    return root->IsAnyHole();
-  }
-  if (const HeapConstant* heap = node->TryCast<HeapConstant>()) {
-    return heap->IsAnyHole();
-  }
-  return false;
-}
-
 template <typename UnwrapFunction>
 ValueNode* UnwrapSinglePhis(ValueNode* node, UnwrapFunction&& unwrap) {
   ValueNode* prev = nullptr;
-  ValueNode* last_was_loop_phi = nullptr;
   while (prev != node) {
     prev = node;
     node = unwrap(node);
@@ -274,23 +263,11 @@ ValueNode* UnwrapSinglePhis(ValueNode* node, UnwrapFunction&& unwrap) {
       // defined within the loop itself.
       if (phi->input_count() == 1 && !phi->is_exception_phi() &&
           !(phi->is_loop_phi() && phi->merge_state()->is_resumable_loop())) {
-        if (phi->merge_state()->was_loop()) {
-          last_was_loop_phi = phi;
-        }
         // This is a Phi with a single input ==> replacing with the input
         // itself.
         node = phi->input_node(0);
       }
     }
-  }
-  // Constant-folding for nodes like BranchIfToBooleanTrue, ToBoolean, and Call
-  // DCHECKs that constant inputs are not holes. In runtime-unreachable code
-  // (after a Throw*IfHole that could not fold while the loop backedge was
-  // alive), these nodes can have as input a loop phi that later lost its
-  // backedge input and became Phi(Hole). Keep the phi instead of unwrapping it
-  // into a hole constant.
-  if (last_was_loop_phi != nullptr && IsAnyHoleConstant(node)) {
-    return last_was_loop_phi;
   }
   return node;
 }
@@ -523,17 +500,6 @@ void DeoptInfo::InitializeInputLocations(Zone* zone, size_t count) {
     new (&input_locations_[i]) InputLocation();
   }
   input_location_count_ = count;
-}
-
-bool RootConstant::IsAnyHole() const {
-  switch (index_) {
-#define CASE(Type, Value, CamelName) case RootIndex::k##CamelName:
-    HOLE_LIST(CASE)
-#undef CASE
-    return true;
-    default:
-      return false;
-  }
 }
 
 bool RootConstant::ToBoolean(LocalIsolate* local_isolate) const {
@@ -909,16 +875,16 @@ Tribool ValueNode::IsHole(RootIndex hole_index) const {
   }
   if (const Phi* phi = TryCast<Phi>()) {
     if (!phi->is_loop_phi() && !phi->is_exception_phi()) {
-      bool all_true = phi->input_count() > 0;
-      bool all_false = true;
+      bool can_be_the_hole = false;
       for (ConstInput input : phi->inputs()) {
-        Tribool is_hole = input.node()->IsHole(hole_index);
-        all_true = all_true && (is_hole == Tribool::kTrue);
-        all_false = all_false && (is_hole == Tribool::kFalse);
-        if (!all_true && !all_false) break;
+        if (input.node()->IsHole(hole_index) != Tribool::kFalse) {
+          can_be_the_hole = true;
+          break;
+        }
       }
-      if (all_true) return Tribool::kTrue;
-      if (all_false) return Tribool::kFalse;
+      if (!can_be_the_hole) {
+        return Tribool::kFalse;
+      }
     }
   }
   return Tribool::kMaybe;
@@ -8356,10 +8322,11 @@ void RetainConstantTypedArrayBuffer(MaglevAssembler* masm,
                                     compiler::JSTypedArrayRef typed_array) {
   // The constant typed array comes from a constant-folded source (property
   // cell, const field, ...) which holds it strongly, and the code depends on
-  // that source not changing. So the buffer behind the embedded data pointer
-  // cannot die while this code is valid. Embed the buffer anyway as defense in
-  // depth: with this weak reference, the code is deoptimized when the buffer
-  // dies.
+  // that source not changing. So the typed array and the buffer behind the
+  // embedded data pointer cannot die while this code is valid. Embed both
+  // anyway as defense in depth: with these weak references, the code is
+  // deoptimized when the typed array or its buffer dies.
+  masm->code_gen_state()->Retain(typed_array.object());
   masm->code_gen_state()->Retain(
       typed_array.buffer(masm->compilation_info()->broker()).object());
 }

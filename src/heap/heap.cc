@@ -15,6 +15,7 @@
 #include <unordered_set>
 
 #include "absl/functional/overload.h"
+#include "include/cppgc/internal/base-page-handle.h"
 #include "include/v8-callbacks.h"
 #include "include/v8-cppgc.h"
 #include "include/v8-locker.h"
@@ -92,7 +93,6 @@
 #include "src/heap/minor-mark-sweep.h"
 #include "src/heap/mutable-page-inl.h"
 #include "src/heap/new-spaces.h"
-#include "src/heap/normal-page.h"
 #include "src/heap/object-lock.h"
 #include "src/heap/object-stats.h"
 #include "src/heap/paged-spaces-inl.h"
@@ -297,9 +297,10 @@ Heap::Heap()
                                        : AllocationType::kOld),
       marking_state_(isolate_),
       non_atomic_marking_state_(isolate_),
-      tracing_track_(perfetto::NamedTrack::FromPointer(
-                         "v8::Heap", this, perfetto::ThreadTrack::Current())
-                         .disable_sibling_merge()),
+      tracing_track_(std::make_unique<perfetto::NamedTrack>(
+          perfetto::NamedTrack::FromPointer("v8::Heap", this,
+                                            perfetto::ThreadTrack::Current())
+              .disable_sibling_merge())),
       gc_tracing_category_enabled_(TRACE_EVENT_API_GET_CATEGORY_GROUP_ENABLED(
           TRACE_DISABLED_BY_DEFAULT("v8.gc"))),
       gc_extra_tracing_category_enabled_(
@@ -310,7 +311,8 @@ Heap::Heap()
     // Because the track may not get any events of its own it must manually emit
     // the track descriptor. This is done conditionally to avoid crashing in
     // unit tests where tracing isn't initialized.
-    TrackEvent::SetTrackDescriptor(tracing_track_, tracing_track_.Serialize());
+    TrackEvent::SetTrackDescriptor(*tracing_track_,
+                                   tracing_track_->Serialize());
   }
 #endif
 
@@ -961,6 +963,12 @@ void Heap::GarbageCollectionPrologue(
 
 void Heap::GarbageCollectionPrologueInSafepoint(GarbageCollector collector) {
   TRACE_GC(tracer(), GCTracer::Scope::HEAP_PROLOGUE_SAFEPOINT);
+#ifdef VERIFY_HEAP
+  if (v8_flags.verify_heap) {
+    isolate_->allocation_site_cache()->Verify();
+  }
+#endif  // VERIFY_HEAP
+  isolate_->allocation_site_cache()->Clear();
   gc_count_ = GCEpoch(gc_count_.value() + 1);
   new_space_allocation_counter_ = NewSpaceAllocationCounter();
   // We provide a fallback for the case when the page pool timeout is disabled.
@@ -2688,62 +2696,6 @@ void Heap::ProcessNativeContexts(WeakObjectRetainer* retainer) {
       VisitWeakList<Context>(this, native_contexts_list(), retainer);
   // Update the head of the list of contexts.
   set_native_contexts_list(head);
-}
-
-Tagged<AllocationMemento> Heap::FindAllocationMemento(Tagged<JSArray> object) {
-  DCHECK(LocalHeap::Current()->is_main_thread());
-  if (!HeapLayout::InYoungGeneration(object) ||
-      HeapLayout::InAnyLargeSpace(object)) {
-    return {};
-  }
-
-  Address object_address = object.address();
-  int object_size = object->map()->instance_size();
-  Address memento_address =
-      object_address + ALIGN_TO_ALLOCATION_ALIGNMENT(object_size);
-  Address last_memento_word_address =
-      memento_address + sizeof(AllocationMemento) - kTaggedSize;
-  // NormalPage::OnSamePage and SbxCast<NormalPage> run before reading any
-  // memory past `object`, acting as an out-of-sandbox guard against large pages
-  // even if in-sandbox chunk flags are corrupted.
-  if (!NormalPage::OnSamePage(object_address, last_memento_word_address)) {
-    return {};
-  }
-
-  // SweepingDone() and IsAddressBelowAgeMark() guard against concurrent
-  // sweeping (MinorMS / sticky mark bits) and pinned/quarantined pages
-  // (semi-space) where memory following `object` may be swept or overwritten.
-  MemoryChunk* object_chunk = MemoryChunk::FromAddress(object_address);
-  NormalPage* object_page = SbxCast<NormalPage>(object_chunk->Metadata());
-  if (!object_page->SweepingDone()) {
-    return {};
-  }
-
-  if (!v8_flags.minor_ms &&
-      semi_space_new_space()->IsAddressBelowAgeMark(object_address)) {
-    return {};
-  }
-
-  // If the candidate falls within the current new space LAB, it must lie
-  // entirely below NewSpaceTop(); otherwise it is in unallocated LAB memory
-  // (or straddling NewSpaceTop()). Checking this before reading the candidate
-  // map word also avoids reading uninitialized LAB memory under MSan.
-  Address top = NewSpaceTop();
-  if (memento_address < NewSpaceLimit() &&
-      memento_address +
-              ALIGN_TO_ALLOCATION_ALIGNMENT(sizeof(AllocationMemento)) >
-          top) {
-    DCHECK_EQ(memento_address, top);
-    return {};
-  }
-
-  Tagged<HeapObject> candidate = HeapObject::FromAddress(memento_address);
-  ObjectSlot candidate_map_slot = candidate->map_slot();
-  if (!candidate_map_slot.Relaxed_ContainsMapValue(
-          ReadOnlyRoots(this).allocation_memento_map().ptr())) {
-    return {};
-  }
-  return Cast<AllocationMemento>(candidate);
 }
 
 void Heap::ProcessDirtyJSFinalizationRegistries(WeakObjectRetainer* retainer) {
@@ -5031,8 +4983,7 @@ void Heap::ConfigureHeap(const v8::ResourceConstraints& constraints,
   // We rely on being able to allocate new arrays in paged spaces.
   DCHECK(kMaxRegularHeapObjectSize >=
          (JSArray::kHeaderSize +
-          FixedArray::SizeFor(JSArray::kInitialMaxFastElementArray) +
-          ALIGN_TO_ALLOCATION_ALIGNMENT(sizeof(AllocationMemento))));
+          FixedArray::SizeFor(JSArray::kInitialMaxFastElementArray)));
 
   code_range_size_ = constraints.code_range_size_in_bytes();
 
@@ -6190,6 +6141,13 @@ void Heap::AttachCppHeap(v8::CppHeap* cpp_heap) {
   cpp_heap_ = cpp_heap;
 }
 
+// static
+Isolate* Heap::IsolateForCppHeapFinalizers(const void* object) {
+  const CppHeap& cpp_heap = static_cast<const CppHeap&>(
+      cppgc::internal::BasePageHandle::FromPayload(object)->heap_handle());
+  return cpp_heap.isolate();
+}
+
 std::optional<StackState> Heap::overridden_stack_state() const {
   if (!embedder_stack_state_origin_) return {};
   return embedder_stack_state_;
@@ -6386,7 +6344,7 @@ void Heap::TearDown() {
 
 #if defined(V8_USE_PERFETTO)
   if (perfetto::Tracing::IsInitialized()) {
-    TrackEvent::EraseTrackDescriptor(tracing_track_);
+    TrackEvent::EraseTrackDescriptor(*tracing_track_);
   }
 #endif
 }
@@ -7713,11 +7671,22 @@ void Heap::NotifyInputHandlingEnded(LeaveHeapState context) {
   }
 }
 
+Heap::GCHintState::GCHintState(const double max_time_ms, const char* track_name,
+                               const char* track_tag,
+                               const perfetto::NamedTrack& parent_track)
+    : max_time_ms_(max_time_ms),
+      track_(std::make_unique<perfetto::NamedTrack>(
+          perfetto::StaticString(track_name), 0, parent_track)),
+      tag_(track_tag) {}
+
+Heap::GCHintState::~GCHintState() = default;
+
 void Heap::GCHintState::NotifyStarted(Heap* heap) {
   if (IsInitialized()) {
-    TRACE_EVENT_END(TRACE_DISABLED_BY_DEFAULT("v8.gc"), track_);
+    TRACE_EVENT_END(TRACE_DISABLED_BY_DEFAULT("v8.gc"), *track_);
   }
-  TRACE_EVENT_BEGIN(TRACE_DISABLED_BY_DEFAULT("v8.gc"), tag_, track_);
+  TRACE_EVENT_BEGIN(TRACE_DISABLED_BY_DEFAULT("v8.gc"),
+                    perfetto::StaticString(tag_), *track_);
   double now_ms = heap->MonotonicallyIncreasingTimeInMs();
   DCHECK_NE(now_ms, kInactive);
   start_time_ms_.store(now_ms, std::memory_order_relaxed);
@@ -7725,7 +7694,7 @@ void Heap::GCHintState::NotifyStarted(Heap* heap) {
 
 void Heap::GCHintState::NotifyEnded(Heap* heap) {
   start_time_ms_.store(kInactive, std::memory_order_relaxed);
-  TRACE_EVENT_END(TRACE_DISABLED_BY_DEFAULT("v8.gc"), track_);
+  TRACE_EVENT_END(TRACE_DISABLED_BY_DEFAULT("v8.gc"), *track_);
 }
 
 int Heap::NextScriptId() {
