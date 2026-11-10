@@ -411,7 +411,7 @@ DEFINE_BOOL(icu_timezone_data, true, "get information about timezones from ICU")
 DEFINE_STRING(icu_datetime_compat_lang, "*",
               "limits ICU date time compat changes to the given language")
 DEFINE_BOOL(
-    intl_date_time_pattern_generator_cache_eviction, false,
+    intl_date_time_pattern_generator_cache_eviction, true,
     "enable 9-entry cache eviction in DateTimePatternGeneratorCache")
 DEFINE_BOOL(use_icu4x_normalizer, false, "use ICU4X normalizer")
 #ifdef V8_ENABLE_ECMA402_ICU4X
@@ -3499,6 +3499,10 @@ DEFINE_BOOL(regexp_masked_dispatch, true,
             "value")
 DEFINE_BOOL(regexp_quick_check, true,
             "generate quickcheck code when optimizing")
+DEFINE_BOOL(regexp_static_frequencies, false,
+            "tune Boyer-Moore lookahead with a static character frequency "
+            "table instead of sampling the first subject string, so that "
+            "compiled code does not depend on the subject")
 DEFINE_BOOL(regexp_interpret_all, false, "interpret all regexp code")
 #ifdef V8_TARGET_BIG_ENDIAN
 #define REGEXP_PEEPHOLE_OPTIMIZATION_BOOL false

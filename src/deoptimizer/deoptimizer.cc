@@ -1907,6 +1907,9 @@ void Deoptimizer::DoComputeOutputFrames() {
         function_->SetTieringInProgress(isolate_, false);
         function_->SetInterruptBudget(isolate_, BudgetModification::kReset,
                                       CodeKind::INTERPRETED_FUNCTION);
+        function_->feedback_vector()->set_invocation_count_before_stable(
+            FeedbackVector::kInvocationCountBeforeStableDeoptSentinel,
+            kRelaxedStore);
 
         isolate()->counters()->deopts()->Increment();
       } else {
@@ -3197,13 +3200,14 @@ void Deoptimizer::MaterializeHeapObjects() {
       static_cast<Address>(stack_fp_));
 }
 
-void Deoptimizer::ProcessDeoptReason(DeoptimizeReason reason) {
+void Deoptimizer::ProcessDeoptReason(DeoptimizeReason reason,
+                                     DirectHandle<Code> optimized_code) {
   bool feedback_updated = translated_state_.DoUpdateFeedback(reason);
   if (verbose_tracing_enabled() && feedback_updated) {
     FILE* file = trace_scope()->file();
     PrintF(file, "Feedback updated from deoptimization at ");
     OFStream outstr(file);
-    GetDeoptInfo().position.Print(outstr, compiled_code_);
+    GetDeoptInfo().position.Print(outstr, *optimized_code);
     PrintF(file, ", %s\n",
            DeoptimizeReasonToString(GetDeoptInfo().deopt_reason));
   }

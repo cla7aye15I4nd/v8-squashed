@@ -510,6 +510,7 @@ class AnalyzerPrePass {
   V(StoreFixedArrayElementNoWriteBarrier)   \
   V(StoreFixedArrayElementWithWriteBarrier) \
   V(StoreFixedDoubleArrayElement)           \
+  V(InitializeFixedHoleyDoubleArrayElement) \
   V(StoreInt32)                             \
   V(StoreFloat64)                           \
   V(AssertEscapeAnalysisElided)             \
@@ -731,6 +732,14 @@ class CandidateAnalyzer {
   ProcessResult Process(StoreFixedDoubleArrayElement* node,
                         const ProcessingState&) {
     return ProcessFixedArrayStore<FixedDoubleArray>(node);
+  }
+
+  ProcessResult Process(InitializeFixedHoleyDoubleArrayElement* node,
+                        const ProcessingState&) {
+    TRACE("Process " << PRINT_NODE(node));
+    ProcessFieldStore(node, node->ObjectInput().node(), node->offset(),
+                      node->ValueInput().node());
+    return ProcessResult::kContinue;
   }
 
   ProcessResult Process(StoreFloat64* node, const ProcessingState&) {
@@ -1720,6 +1729,11 @@ class Elider {
     return RemoveIfElidedBase(node->ElementsInput().node(), node);
   }
 
+  ProcessResult Process(InitializeFixedHoleyDoubleArrayElement* node,
+                        const ProcessingState&) {
+    return RemoveIfElidedBase(node->ObjectInput().node(), node);
+  }
+
   ProcessResult Process(StoreInt32* node, const ProcessingState&) {
     return RemoveIfElidedBase(node->ObjectInput().node(), node);
   }
@@ -1809,7 +1823,7 @@ class Elider {
             UNREACHABLE();
         }
         node->OverwriteWithIdentityTo(dummy_cst);
-        return ProcessResult::kContinue;
+        return ProcessResult::kRevisit;
       }
       DCHECK(keys_mappings().contains(addr));
       Key key = keys_mappings().at(addr);
@@ -1828,7 +1842,7 @@ class Elider {
         node->OverwriteWith(
             Opcode::kDeadValue,
             OpProperties::ForValueRepresentation(node->value_representation()));
-        return ProcessResult::kContinue;
+        return ProcessResult::kRevisit;
       }
 
       if (!IsStillInTheGraph(replacement)) {
@@ -1846,6 +1860,7 @@ class Elider {
       TRACE("> overwriting with Identity");
       node->template OverwriteWith<Identity>();
       node->change_input(0, replacement);
+      return ProcessResult::kRevisit;
     }
 
     return ProcessResult::kContinue;
@@ -1895,31 +1910,25 @@ class Elider {
     InlinedAllocation* right_alloc =
         data_.TryGetCandidateInlinedAllocation(node->RightInput().node());
 
+    if (!left_alloc && !right_alloc) {
+      return ProcessResult::kContinue;
+    }
+
     // TODO(dmercadier): when folding this branch, we should also mark the
     // non-taken side as Unreachable (eg, by calling RemovePredecessorFollowing
     // and set_may_have_unreachable_blocks).
-    if (left_alloc) {
-      if (right_alloc) {
-        // Both left and right inputs were elided, checking if they are the same
-        // object or not.
-        BasicBlock* target =
-            left_alloc == right_alloc ? node->if_true() : node->if_false();
-        node->OverwriteWith<Jump>();
-        node->Cast<Jump>()->set_target(target);
-      } else {
-        // Left was elided but right wasn't ==> they can't be the same object.
-        BasicBlock* target = node->if_false();
-        node->OverwriteWith<Jump>();
-        node->Cast<Jump>()->set_target(target);
-      }
-    } else if (right_alloc) {
-      // Right was elided but left wasn't ==> they can't be the same object.
-      BasicBlock* target = node->if_false();
-      node->OverwriteWith<Jump>();
-      node->Cast<Jump>()->set_target(target);
+    BasicBlock* target;
+    if (left_alloc && right_alloc) {
+      // Both left and right inputs were elided, checking if they are the same
+      // object or not.
+      target = left_alloc == right_alloc ? node->if_true() : node->if_false();
+    } else {
+      // Only one input was elided ==> they can't be the same object.
+      target = node->if_false();
     }
-
-    return ProcessResult::kContinue;
+    node->OverwriteWith<Jump>();
+    node->Cast<Jump>()->set_target(target);
+    return ProcessResult::kRevisit;
   }
 
   ProcessResult Process(Phi* phi, const ProcessingState&) {

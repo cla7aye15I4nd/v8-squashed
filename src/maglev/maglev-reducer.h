@@ -90,6 +90,14 @@ inline bool IsSupported(CpuOperation op) {
   UNREACHABLE();
 }
 
+enum class BranchResult {
+  kDefault,
+  kAlwaysTrue,
+  kAlwaysFalse,
+  // Bailed out before evaluating the condition.
+  kAbort,
+};
+
 class V8_NODISCARD MaybeReduceResult {
  public:
   enum Kind {
@@ -171,6 +179,15 @@ class V8_NODISCARD ReduceResult : public MaybeReduceResult {
   // NOLINTNEXTLINE
   ReduceResult(Node* node) : MaybeReduceResult(node) {}
 
+  // NOLINTNEXTLINE
+  ReduceResult(BranchResult branch_result)
+      : MaybeReduceResult(branch_result == BranchResult::kAbort
+                              ? kDoneWithAbort
+                              : kDoneWithoutPayload) {
+    DCHECK(branch_result == BranchResult::kDefault ||
+           branch_result == BranchResult::kAbort);
+  }
+
   explicit ReduceResult(const MaybeReduceResult& other)
       : MaybeReduceResult(other.GetPayload()) {
     CHECK(!IsFail());
@@ -204,6 +221,12 @@ inline ReduceResult MaybeReduceResult::Checked() { return ReduceResult(*this); }
     if ((result).IsDoneWithAbort()) {       \
       return ReduceResult::DoneWithAbort(); \
     }                                       \
+  } while (false)
+
+#define CHECK_NO_ABORT(result)        \
+  do {                                \
+    MaybeReduceResult res = (result); \
+    CHECK(res.IsDoneWithoutAbort());  \
   } while (false)
 
 #define RETURN_IF_NOT_DONE_WITHOUT_ABORT(result) \
@@ -360,14 +383,6 @@ concept ReducerBaseWithAllocationTracking = requires(BaseT* b) {
 };
 
 enum class UseReprHintRecording { kRecord, kDoNotRecord };
-
-enum class BranchResult {
-  kDefault,
-  kAlwaysTrue,
-  kAlwaysFalse,
-  // Bailed out before evaluating the condition.
-  kAbort,
-};
 
 enum class BranchType { kBranchIfTrue, kBranchIfFalse };
 enum class BranchSpecializationMode { kDefault, kAlwaysBoolean };
@@ -1015,6 +1030,13 @@ class MaglevReducer {
                                        IterationKind kind);
   VirtualObject* CreateJSConstructor(compiler::JSFunctionRef constructor);
   VirtualObject* CreateFixedArray(base::Vector<ValueNode* const> values);
+  // Picks VirtualHoleyFixedDoubleArrayShape iff any value is a HoleyFloat64
+  // (i.e. a hole or undefined constant), VirtualFixedDoubleArrayShape
+  // otherwise.
+  VirtualObject* CreateFixedDoubleArray(base::Vector<ValueNode* const> values);
+  // Shape must be VirtualFixedDoubleArrayShape when values cannot contain
+  // holes, or VirtualHoleyFixedDoubleArrayShape otherwise.
+  template <typename Shape>
   VirtualObject* CreateFixedDoubleArray(base::Vector<ValueNode* const> values);
   VirtualObject* CreateContext(compiler::MapRef map, int length,
                                compiler::ScopeInfoRef scope_info,
@@ -1418,6 +1440,11 @@ class MaglevReducer {
 
     BranchResult FromBool(bool value) const {
       return value ? BranchResult::kAlwaysTrue : BranchResult::kAlwaysFalse;
+    }
+
+    BranchResult BuildAbort(AbortReason reason) const {
+      CHECK(sub_->BuildAbort(reason).IsDoneWithAbort());
+      return this->Abort();
     }
 
     template <typename ControlNodeT, typename... Args>
@@ -2025,6 +2052,10 @@ class SubgraphBase {
   WithFallback(std::initializer_list<Variable*> vars, FFast&& fast_path_fn,
                FSlow&& fallback_fn,
                int max_fallback_predecessors = kMaxFallbackPredecessors);
+
+  ReduceResult BuildAbort(AbortReason reason) {
+    return reducer_->BuildAbort(reason);
+  }
 
  protected:
   SubgraphBase(MaglevReducer<BaseT>* reducer, MaglevCompilationUnit* dummy_unit)

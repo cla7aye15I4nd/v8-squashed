@@ -732,6 +732,7 @@ inline void MaglevAssembler::Move(DoubleRegister dst, Float64 n) {
       dst, base::Double(base::bit_cast<uint64_t, Float64>(n)));
 }
 inline void MaglevAssembler::Move(Register dst, Handle<HeapObject> obj) {
+  if (TryLoadRoot(dst, obj)) return;
   MacroAssembler::Move(dst, obj);
 }
 
@@ -1393,7 +1394,7 @@ inline void MaglevAssembler::CompareByteAndJumpIf(MemOperand left, int8_t right,
                                                   Label* target,
                                                   Label::Distance distance) {
   MaglevAssembler::TemporaryRegisterScope temps(this);
-  Register scratch2 = r0;
+  Register scratch2 = temps.AcquireScratch();
   LoadS8(scratch, left);
   mov(scratch2, Operand(right));
   extsb(scratch2, scratch2);
@@ -1422,7 +1423,7 @@ inline void MaglevAssembler::CompareTaggedAndJumpIf(Register reg,
                                                     Label* target,
                                                     Label::Distance distance) {
   MaglevAssembler::TemporaryRegisterScope temps(this);
-  Register scratch = r0;
+  Register scratch = temps.AcquireScratch();
   MacroAssembler::Move(scratch, obj,
                        COMPRESS_POINTERS_BOOL
                            ? RelocInfo::COMPRESSED_EMBEDDED_OBJECT
@@ -1572,10 +1573,12 @@ inline void MaglevAssembler::Pop(Register dst) { pop(dst); }
 
 inline void MaglevAssembler::AssertStackSizeCorrect() {
   if (v8_flags.slow_debug_code) {
-    AddS64(r0, sp,
+    TemporaryRegisterScope temps(this);
+    Register scratch = temps.AcquireScratch();
+    AddS64(scratch, sp,
            Operand(code_gen_state()->stack_slots() * kSystemPointerSize +
                    StandardFrameConstants::kFixedFrameSizeFromFp));
-    CmpU64(r0, fp);
+    CmpU64(scratch, fp);
     Assert(eq, AbortReason::kStackAccessBelowStackPointer);
   }
 }
@@ -1588,7 +1591,7 @@ inline Condition MaglevAssembler::FunctionEntryStackCheck(
 
   Register stack_cmp_reg = sp;
   if (stack_check_offset > kStackLimitSlackForDeoptimizationInBytes) {
-    stack_cmp_reg = r0;
+    stack_cmp_reg = temps.AcquireScratch();
     AddS64(stack_cmp_reg, sp, Operand(-stack_check_offset));
   }
   CmpU64(stack_cmp_reg, interrupt_stack_limit);

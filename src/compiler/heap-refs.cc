@@ -737,8 +737,11 @@ void JSFunctionData::Cache(JSHeapBroker* broker) {
   // guaranteed to see an initialized JSFunction object, and after
   // initialization fields remain in a valid state.
 
+  // `context` can be updated in-place with a newly allocated Context by
+  // `Compiler::GetFunctionFromEval` using `kReleaseStore`, so it needs
+  // `kAcquireLoad` to synchronize with the new Context's initialization.
   ContextRef context =
-      MakeRefAssumeMemoryFence(broker, function->context(kRelaxedLoad));
+      MakeRefAssumeMemoryFence(broker, function->context(kAcquireLoad));
   context_ = context.data();
 
   SharedFunctionInfoRef shared =
@@ -2723,12 +2726,24 @@ OptionalMapRef JSObjectRef::GetObjectCreateMap(JSHeapBroker* broker) const {
   if (!IsPrototypeInfo(*maybe_proto_info)) return {};
 
   Tagged<MaybeObject> maybe_object_create_map =
-      Cast<PrototypeInfo>(maybe_proto_info)
-          ->ObjectCreateMap(*native_context.object(), kAcquireLoad);
+      Cast<PrototypeInfo>(maybe_proto_info)->ObjectCreateMap(kAcquireLoad);
   if (!maybe_object_create_map.IsWeak()) return {};
 
-  return MapRef(broker->GetOrCreateData(
+  MapRef object_create_map(broker->GetOrCreateData(
       maybe_object_create_map.GetHeapObjectAssumeWeak(), kAssumeMemoryFence));
+  // A JSGlobalProxy might have navigated concurrently on the main thread and
+  // populated PrototypeInfo with a map from a different native context.
+  if (!object_create_map.BelongsToSameNativeContextAs(broker, native_context)) {
+    return {};
+  }
+  if (map_ref.IsJSGlobalProxyMap()) {
+    // Subscribe to map changes on the global proxy so that if it detaches or
+    // navigates to another context, the optimized code is deoptimized and stops
+    // using the pre-navigation ObjectCreateMap.
+    if (!map_ref.is_stable()) return {};
+    broker->dependencies()->DependOnStableMap(map_ref);
+  }
+  return object_create_map;
 }
 
 bool JSObjectRef::IsArrayOrObjectPrototype(JSHeapBroker* broker) const {
