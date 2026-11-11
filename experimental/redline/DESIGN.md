@@ -343,6 +343,88 @@ The def-use graph only proposes a cut. The oracle decides, because globals, prot
 - Each test has a short timeout from the run time of the program (`probe_timeout_*`), because a reduction can make an endless loop.
   For the same reason, `expressions` replaces a loop condition only with `0`.
 - The result must pass the oracle again in one of `verify_attempts` runs. If it does not, Redline keeps the original program.
+- The crash event and the crash report record the stop reason of a minimization (`min_stop`): `fixed_point`, `budget` or `rounds`.
+  `skipped` tells that the minimizer did not run, and `stopped` tells that the session stopped during the minimization.
+
+**Crashes.** For a crash that reproduces alone, the minimizer reduces one tree of the prelude and the program.
+Redline parses the prelude, a new line and the program into this tree.
+The tree prints to a script that is equivalent to the script of the target, but not always the same text.
+The tests run the printed script without the prelude in front.
+Thus the minimizer also removes the prelude statements that the crash does not need.
+A crash uses all reducers, `dataflow` first: `dataflow`, `statements`, `unwrap`, `lists`, `expressions`, `truncate` (`Minimizer::CrashOrder`).
+`crash_minimizer.reducers` sets another list, and an empty list gives this order. `stages.minimize.reducers` does not apply to crashes.
+With one test, `dataflow` can remove a group of prelude statements that the program does not use.
+
+- Before the minimization, the printed tree must crash with the same signature in one of `verify_attempts` runs.
+- The minimizer reduces the program alone, behind the exact prelude, if one of these conditions is true:
+  - The prelude is empty.
+  - The prelude or the program does not parse.
+  - The prelude continues into the program, for example `var a = f` and `(1);`.
+  - The printed tree does not crash with the same signature.
+
+  Then Redline writes no `NAME.repro.js`. The `min_tree` value of the report and of the crash event gives the reason.
+- The minimized script goes to `NAME.repro.js`, after two comment lines: the signature and the d8 command. The d8 command has absolute paths. d8 runs this file without the prelude.
+- Then Redline removes the d8 flags that `NAME.repro.js` does not need. It removes chunks of halving size from the flags of the target, down to single flags.
+  A list of flags passes if the script crashes with the signature in each of `crash_flag_runs` fresh plain d8 processes.
+  `--allow-natives-syntax` stays if the script calls a runtime function with `%`. A flag that the script needs to parse stays, because the script cannot crash without it.
+  `--single-threaded` and `--random-seed` always stay, because they make a plain d8 run more deterministic. `--stress-runs` also always stays.
+  The search stops after `crash_flag_processes` processes or `crash_flag_budget_sec`, and 0 for one of them turns it off.
+  The report gives the result in `repro_flags`, and the d8 command of `NAME.repro.js` uses it.
+  The search does not run if a flag has its value in a separate word.
+- `NAME.js` keeps its meaning: the program alone, without the prelude statements. Redline uses the minimized program for `NAME.js` only if it also crashes with the same signature behind the full prelude (`min_program_verified`).
+- The node counts of `minimized:`, `min_nodes_before` and `min_nodes_after` are the counts of the program alone, as in `NAME.js`.
+  `min_script_nodes` and `min_prelude_statements` give the nodes of the whole tree and its top-level prelude statements.
+  If the last check rejects a result, the count after the minimization is equal to the count before.
+- A crash that has only `NAME.repro.js` keeps its minimize slot. Thus `signatures.txt` counts it as minimized, while its report says `minimized: no`.
+
+**Amplified crashes.** An amplified crash does not reproduce alone, but the amplify step found d8 flags that reproduce it in plain d8 processes (5.8).
+The minimizer reduces one tree of the prelude and the program. If the amplify step changed the program, the tree has the changed program.
+A test writes the printed tree to a file and runs it in fresh plain d8 processes with the amplified flags.
+These are the flags of the target without `--random-seed` and `--stress-runs`, then the flags of the amplify step with its `--stress-runs`.
+The test passes if one of k processes crashes with the same signature.
+k is the smallest number of processes that all miss the crash with a probability of 5% or less.
+Redline uses the crash rate (hits + 1) / (processes + 2) of the amplify step, and k is between 1 and 10.
+For example, k is 2 for a rate of 5/5 and 3 for a rate of 4/5.
+Each process has the time limit of the amplify step (`run_timeout_sec`), not the short timeout of the tests in the target.
+
+- `crash_amplified_budget_sec` is the time limit of the tests of the minimizer. 0 turns the minimization off.
+  The start check and the last check do not stop at this time limit. Thus a minimization that used up its time can still give a result.
+- Before the minimization, the printed tree must pass the test in one of `verify_attempts` tries. The result must pass it again.
+- The result goes to `NAME.repro.js`. `NAME.js` keeps the original program, and the report says `minimized: no`.
+- The flag search uses the same test. `crash_flag_runs` does not apply.
+- The rate check: a test that needs 1 hit of k processes can accept a script that crashes less often than the amplified program.
+  Thus, after the flag search, Redline runs `NAME.repro.js` in the number of plain d8 processes that the amplify step plans, without an early stop.
+  `NAME.repro.js` stays only after a complete count that reaches the bar of the amplify step (`min_hits` of `processes`).
+  If the count is below the bar and the flag search removed flags, Redline also counts all flags of the test. Flags that failed a complete count never stay.
+  If a count stops early, for example at a stop request, Redline writes no `NAME.repro.js`.
+  The report and the crash event give the result in `repro_rate` and `repro_rate_note`.
+  A good script can also miss the bar. For a script with a true crash rate of 0.8, 5 runs give less than 4 crashes with a probability of about 26%.
+- The report and the crash event give the test in `min_oracle`, for example `1 of 2 plain d8 runs with the amplified flags`.
+- `min_tree` is `prelude and program`, `program, without a prelude`, or `not minimized:` and the reason.
+- One amplified crash can take this time: `crash_amplified_budget_sec`, the last check, `crash_flag_budget_sec` and one more test of the flag search, and two rate checks.
+  The last check runs at most `verify_attempts` times k processes. A rate check runs the processes of the amplify step. Each process takes at most `run_timeout_sec`.
+- After a stop request, a worker can wait for the plain d8 process that runs, up to its time limit.
+
+**Bundles.** A state-dependent crash has `NAME.bundle.js`: one part for each needed history program, then the crash part (5.8).
+If the bundle crashed in a plain d8 run and the crash has no `NAME.repro.js`, Redline minimizes the bundle.
+A test writes a candidate bundle to a file and runs it with `--bundle-reprl` in k fresh plain d8 processes.
+The test passes if one process crashes with the same signature. k comes from `bundle_rate`, as for an amplified crash.
+
+1. The minimizer removes the history parts that the crash does not need. The crash part stays last.
+2. It reduces the crash part with the crash reducers, and it removes history parts again.
+   A part has the prelude and the program, so `dataflow` also removes the prelude statements that the part does not need.
+   Each part runs in a new context of the same d8 process. Thus the tests decide if a part needs the state of an earlier part.
+   A reduced history part can crash itself. Then the bundle still crashes with the signature.
+3. It reduces each history part, and it removes history parts again.
+
+- `crash_bundle_min_budget_sec` is the time limit of the tests of the steps. 0 turns the minimization off.
+  The last check and the rate check stop only at a stop request.
+- The result must be smaller, and it must pass the test again in one of `verify_attempts` tries.
+- The rate check runs the result in `bundle_runs` plain d8 processes, without an early stop. The result must crash in at least `bundle_hits` of them, as the original bundle did.
+- Then Redline writes the result to `NAME.bundle.min.js`. `NAME.bundle.js` stays the original bundle.
+- The report and the crash event give the file in `bundle_min`, its rate in `bundle_min_rate` and the result in `bundle_min_note`. A minimized bundle keeps the minimize slot, as `NAME.repro.js` does.
+- One bundle minimization can take this time: `crash_bundle_min_budget_sec` and one more test, the last check, and the rate check.
+  The last check runs at most `verify_attempts` times k processes. The rate check runs `bundle_runs` processes. Each process takes at most the timeout of the target for each part, plus 10 s.
 
 ### 5.7 Publish
 
@@ -367,8 +449,9 @@ A crash can come from a result, from an imported file or from an instrumented pr
    Redline runs the bundle in up to `crash_bundle_runs` plain d8 processes and writes how many crashed with the same signature (`bundle_rate`).
 5. **Amplify.** If the crash does not reproduce alone, the amplify step searches for d8 flags that make it reproduce.
    This also applies after a successful replay, because an earlier program can turn on a feature that a d8 flag can also turn on.
-6. **Minimize.** Redline minimizes a crash that reproduces alone, against its signature.
-7. **Save.** Redline writes the program, the report and, if they exist, the original program, the history and the bundle to `OUT/crashes/`.
+6. **Minimize.** Redline minimizes a crash that reproduces alone, against its signature, together with the prelude (5.6).
+   It also minimizes an amplified crash, with the amplified flags in plain d8 processes, and the bundle of a state-dependent crash (5.6).
+7. **Save.** Redline writes the program, the report and, if they exist, the original program, the reproducer (`NAME.repro.js`), the history and the bundle to `OUT/crashes/`.
 
 History replay and the amplify step run only for crashes that Redline saves.
 
@@ -553,6 +636,7 @@ A worker owns its target, its coverage map, its random generator, its isolate fo
 | Group crashes by signature, with a budget per signature. | The work per bug stays bounded. |
 | Replay the history of a crash, and search for amplifying flags. | Some crashes depend on earlier programs or on timing. |
 | Put the prelude in front of each execution, and never store it. | Corpus files stay clean, and imported tests run without `mjsunit.js`. |
+| Minimize a crash together with the prelude. | The reproducer needs no prelude, and it keeps only the prelude statements that the crash needs. |
 | Run all workers in one process, with one corpus and one coverage map. | The workers need no protocol to exchange programs. |
 | Keep the pipeline fixed, and make the decisions pluggable. | The loop stays easy to read, and a decision can change without a change to the loop. |
 | Build the target with `v8_redline=true`, which links a copy of `src/fuzzilli` (`d8/`). | Redline can change its coverage runtime and its builtin without changes to Fuzzilli. |

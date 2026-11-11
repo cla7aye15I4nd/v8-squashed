@@ -828,8 +828,9 @@ void CheckD8ArgLayers(Checker* checker) {
   TunableRegistry::Instance().Reset();
 }
 
-// The "init" and "accept" blocks and stages.minimize.reducers: values land
-// in their fields, mistakes are reported.
+// The "init" and "accept" blocks, stages.minimize.reducers and
+// crash_minimizer.reducers: the values go to their fields, and the loader
+// reports the mistakes.
 void CheckStrategyBlocks(Checker* checker) {
   auto load = [](const std::string& text, FuzzConfig* config) -> std::string {
     JsonValue json;
@@ -840,7 +841,11 @@ void CheckStrategyBlocks(Checker* checker) {
     if (!FuzzConfig::LoadJsonForTest(json, config, &error)) {
       return error;
     }
-    return FuzzConfig::ValidateReducers(config->minimizer_reducers, &error)
+    return FuzzConfig::ValidateReducers(config->minimizer_reducers,
+                                        "stages.minimize.reducers", &error) &&
+                   FuzzConfig::ValidateReducers(
+                       config->crash_minimizer_reducers,
+                       "crash_minimizer.reducers", &error)
                ? ""
                : error;
   };
@@ -855,7 +860,8 @@ void CheckStrategyBlocks(Checker* checker) {
               config.imports == std::vector<std::string>{"a.js", "dir"} &&
               config.import_root == "/r" && config.import_all &&
               config.minimizer_reducers ==
-                  std::vector<std::string>{"truncate", "statements"};
+                  std::vector<std::string>{"truncate", "statements"} &&
+              config.crash_minimizer_reducers.empty();
     checker->Check("init, accept, reducers: the blocks set their fields", ok,
                    error);
     error =
@@ -866,6 +872,92 @@ void CheckStrategyBlocks(Checker* checker) {
     checker->Check(
         "init: generate clears the imports and sets the program count", ok,
         error);
+  }
+  {
+    // The crash minimizer has its own reducer order. The dump gives the
+    // default order when the configuration gives none.
+    FuzzConfig config;
+    std::string error = load(
+        R"({"crash_minimizer": {"max_rounds": 7, "reducers": ["unwrap", "dataflow"]}})",
+        &config);
+    JsonValue dumped;
+    std::string parse_error;
+    FuzzConfig defaults;
+    const bool dumped_ok =
+        load("{}", &defaults).empty() &&
+        JsonValue::Parse(defaults.ToJson(), &dumped, &parse_error);
+    const JsonValue& order = dumped.Get("crash_minimizer").Get("reducers");
+    std::vector<std::string> dumped_order;
+    if (order.is_array()) {
+      for (const JsonValue& name : order.as_array()) {
+        dumped_order.push_back(name.as_string());
+      }
+    }
+    const bool ok = error.empty() && config.crash_minimizer.max_rounds == 7 &&
+                    config.crash_minimizer_reducers ==
+                        std::vector<std::string>{"unwrap", "dataflow"} &&
+                    config.minimizer_reducers.empty() && dumped_ok &&
+                    dumped_order == std::vector<std::string>(
+                                        Minimizer::CrashOrder().begin(),
+                                        Minimizer::CrashOrder().end());
+    checker->Check(
+        "crash_minimizer: the block sets the reducers, the dump gives the "
+        "default order",
+        ok, error.empty() ? parse_error : error);
+    // The dump of the order that is not the default loads back to the same
+    // order. An empty list gives the default order, as for
+    // stages.minimize.reducers.
+    FuzzConfig again;
+    std::string again_error = load(config.ToJson(), &again);
+    FuzzConfig empty;
+    if (again_error.empty()) {
+      again_error = load(R"({"crash_minimizer": {"reducers": []}})", &empty);
+    }
+    checker->Check(
+        "crash_minimizer: the dumped reducers load back, an empty list gives "
+        "the default order",
+        again_error.empty() && again.crash_minimizer.max_rounds == 7 &&
+            again.crash_minimizer_reducers ==
+                std::vector<std::string>{"unwrap", "dataflow"} &&
+            empty.crash_minimizer_reducers.empty(),
+        again_error);
+  }
+  {
+    // The keys of the flag search. Values out of range become the nearest
+    // valid values. Values that are not the default load back from the dump.
+    FuzzConfig low, high, again;
+    std::string error = load(
+        R"({"crash_flag_runs": 3, "crash_flag_processes": 2, "crash_flag_budget_sec": 0})",
+        &low);
+    if (error.empty()) {
+      error = load(
+          R"({"crash_flag_runs": 0, "crash_flag_processes": -5, "crash_flag_budget_sec": 20, "crash_amplified_budget_sec": -1, "crash_bundle_min_budget_sec": -1})",
+          &high);
+    }
+    if (error.empty()) {
+      error = load(high.ToJson(), &again);
+    }
+    checker->Check(
+        "crash flags: the keys of the flag search",
+        error.empty() && low.crash_flag_runs == 3 &&
+            low.crash_flag_processes == 3 && low.crash_flag_budget_sec == 0 &&
+            high.crash_flag_runs == 1 && high.crash_flag_processes == 0 &&
+            again.crash_flag_runs == 1 && again.crash_flag_processes == 0 &&
+            again.crash_flag_budget_sec == 20 &&
+            high.crash_amplified_budget_sec == 0 &&
+            again.crash_amplified_budget_sec == 0 &&
+            low.crash_amplified_budget_sec == 300 &&
+            high.crash_bundle_min_budget_sec == 0 &&
+            again.crash_bundle_min_budget_sec == 0,
+        StringPrintf("%s runs %d/%d, processes %d/%d, budget %g/%g, "
+                     "amplified budget %g/%g/%g, bundle budget %g",
+                     error.c_str(), low.crash_flag_runs, high.crash_flag_runs,
+                     low.crash_flag_processes, high.crash_flag_processes,
+                     low.crash_flag_budget_sec, again.crash_flag_budget_sec,
+                     low.crash_amplified_budget_sec,
+                     high.crash_amplified_budget_sec,
+                     again.crash_amplified_budget_sec,
+                     again.crash_bundle_min_budget_sec));
   }
   struct Case {
     const char* name;
@@ -885,7 +977,13 @@ void CheckStrategyBlocks(Checker* checker) {
        R"({"accept": {"strategy": "rarity"}})", "unknown accept strategy"},
       {"minimize: unknown reducer is an error",
        R"({"stages": {"minimize": {"reducers": ["statements", "shrink"]}}})",
-       "unknown reducer \"shrink\""},
+       "unknown reducer \"shrink\" in stages.minimize.reducers"},
+      {"crash_minimizer: unknown reducer is an error",
+       R"({"crash_minimizer": {"reducers": ["dataflow", "shrink"]}})",
+       "unknown reducer \"shrink\" in crash_minimizer.reducers"},
+      {"crash_minimizer: reducers that are not a list are an error",
+       R"({"crash_minimizer": {"reducers": "dataflow"}})",
+       "crash_minimizer.reducers must be a list of reducer names"},
   };
   for (const Case& c : cases) {
     FuzzConfig config;

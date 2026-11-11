@@ -63,6 +63,11 @@ struct FuzzerStats {
   // State-dependent crashes whose NAME.bundle.js crashed in a plain d8 run.
   std::atomic<uint64_t> crashes_bundled{0};
   std::atomic<uint64_t> bundle_processes{0};  // plain d8 runs of the bundles
+  // Plain d8 runs that searched the d8 flags of NAME.repro.js.
+  std::atomic<uint64_t> flag_processes{0};
+  // Plain d8 runs of the minimizers and of the rate checks for amplified
+  // crashes and bundles.
+  std::atomic<uint64_t> crash_min_processes{0};
   std::atomic<uint64_t> crash_replay_executions{0};  // spent on history replays
   std::atomic<uint64_t> minimizer_tests{0};
   std::atomic<uint64_t> minimizer_time_us{0};
@@ -113,6 +118,11 @@ class Fuzzer {
                               const MinimizationOracle& oracle,
                               SyntaxChecker* checker,
                               const MinimizerOptions& options) const;
+  // Minimizes a crash with the reducer order of crash_minimizer.reducers.
+  MinimizationResult MinimizeCrash(fast::Tree* tree,
+                                   const MinimizationOracle& oracle,
+                                   SyntaxChecker* checker,
+                                   const MinimizerOptions& options) const;
 
   // One line summarizing the session so far.
   std::string StatusLine() const;
@@ -132,6 +142,12 @@ class Fuzzer {
   uint64_t target_children_hit() const {
     return target_children_hit_.load(std::memory_order_acquire);
   }
+  // For the selftest: one crash of `signature` through the crash
+  // bookkeeping (RegisterCrash, then RecordCrashOutcome). The minimization
+  // succeeds if the crash gets a minimize slot and `minimization_succeeds`
+  // is true. Returns true if the crash got a minimize slot.
+  bool RecordCrashForTest(uint64_t source_hash, const CrashSignature& signature,
+                          bool minimization_succeeds);
 
  private:
   friend class Worker;
@@ -211,6 +227,9 @@ class Fuzzer {
   // The configured reducer order (stages.minimize.reducers); empty: the
   // default order.
   std::vector<Reducer*> minimizer_reducers_;
+  // The reducer order of the crash minimizer (crash_minimizer.reducers, or
+  // Minimizer::CrashOrder()).
+  std::vector<Reducer*> crash_reducers_;
   const Environment* env_ = nullptr;
   std::unique_ptr<Environment> discovered_env_;  // owns env_ when introspected
   Mutator* codegen_mutator_ = nullptr;
@@ -246,9 +265,11 @@ class Fuzzer {
                               const CrashSignature& signature);
   // True if the amplify step may run for this signature now (reserves it).
   bool ClaimAmplify(const CrashSignature& signature);
-  void RecordCrashOutcome(const CrashSignature& signature, bool saved,
-                          bool minimized, bool reproduced,
-                          const std::string& path);
+  // Records the result of a crash that RegisterCrash decided. Call it once
+  // for each call of RegisterCrash, with the same signature and decision.
+  void RecordCrashOutcome(const CrashSignature& signature,
+                          const CrashDecision& decision, bool minimized,
+                          bool reproduced, const std::string& path);
   // Rewrites DIR/crashes/signatures.txt.
   void WriteSignatureSummary();
   std::mutex crash_mutex_;

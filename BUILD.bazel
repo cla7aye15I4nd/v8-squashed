@@ -289,6 +289,11 @@ v8_flag(
 )
 
 v8_flag(
+    name = "v8_add_descriptor_array_lookup_table",
+    default = True,
+)
+
+v8_flag(
     name = "v8_enable_descriptor_array_lookup_table",
     default = False,
 )
@@ -589,6 +594,7 @@ v8_config(
         "v8_x64_16byte_stack_alignment": "V8_X64_16BYTE_STACK_ALIGNMENT",
         "v8_support_la57": "V8_SUPPORT_LA57",
         "v8_enable_ecma402_icu4x": "V8_ENABLE_ECMA402_ICU4X",
+        "v8_add_descriptor_array_lookup_table": "V8_ADD_DESCRIPTOR_ARRAY_LOOKUP_TABLE",
         "v8_enable_descriptor_array_lookup_table": "V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE",
     },
     defines = [
@@ -2156,8 +2162,6 @@ filegroup(
         "src/objects/all-objects.h",
         "src/objects/allocation-site.h",
         "src/objects/allocation-site-inl.h",
-        "src/objects/allocation-site-scopes.h",
-        "src/objects/allocation-site-scopes-inl.h",
         "src/objects/api-callbacks.h",
         "src/objects/api-callbacks-inl.h",
         "src/objects/arguments.h",

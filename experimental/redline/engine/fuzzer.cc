@@ -8,6 +8,7 @@
 #include <bit>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <iterator>
@@ -19,9 +20,12 @@
 #include "experimental/redline/base/v8_runtime.h"
 #include "experimental/redline/core/environment.h"
 #include "experimental/redline/engine/d8_flags.h"
+#include "experimental/redline/engine/flag_minimizer.h"
 #include "experimental/redline/engine/importer.h"
+#include "experimental/redline/engine/prelude.h"
 #include "experimental/redline/exec/process_run.h"
 #include "experimental/redline/exec/runner.h"
+#include "experimental/redline/fast/parser.h"
 #include "experimental/redline/fast/printer.h"
 #include "experimental/redline/mutators/explore.h"
 
@@ -89,6 +93,18 @@ std::string Truncate(const std::string& text, size_t limit) {
     return text;
   }
   return text.substr(0, limit) + "\n... (truncated)\n";
+}
+
+// `path` as an absolute path without symbolic links, or `path` if it does
+// not exist.
+std::string AbsolutePath(const std::string& path) {
+  char* resolved = realpath(path.c_str(), nullptr);
+  if (resolved == nullptr) {
+    return path;
+  }
+  std::string result(resolved);
+  free(resolved);
+  return result;
 }
 
 }  // namespace
@@ -213,20 +229,38 @@ class Worker {
   // bookkeeping. Returns false on an infrastructure failure.
   bool Execute(const std::string& source, Execution* execution,
                uint64_t timeout_us = 0) {
+    const bool ok = config().prelude.empty()
+                        ? RunScript(source, execution, timeout_us)
+                        : RunScript(ScriptFor(source), execution, timeout_us);
+    if (ok) {
+      RememberExecution(source);
+    }
+    return ok;
+  }
+
+  // Runs `script` as it is, without the prelude. The crash minimizer uses it
+  // for the tree of the prelude and the program. The history holds only
+  // programs for Execute(), so it starts again after the script.
+  bool ExecuteScript(const std::string& script, Execution* execution,
+                     uint64_t timeout_us = 0) {
+    const bool ok = RunScript(script, execution, timeout_us);
+    if (ok) {
+      ForgetHistory();
+    }
+    return ok;
+  }
+
+  // Runs `script` in the target and counts the execution. Returns false on
+  // an infrastructure failure.
+  bool RunScript(const std::string& script, Execution* execution,
+                 uint64_t timeout_us) {
     if (timeout_us == 0) {
       timeout_us = config().target.timeout_us;
     }
     std::string error;
-    bool ok;
-    if (config().prelude.empty()) {
-      ok = runner_->RunWithoutEvaluation(source, timeout_us, execution, &error);
-    } else {
-      ok = runner_->RunWithoutEvaluation(ScriptFor(source), timeout_us,
-                                         execution, &error);
-    }
-    if (!ok) {
+    if (!runner_->RunWithoutEvaluation(script, timeout_us, execution, &error)) {
       stats().infrastructure_failures++;
-      history_.clear();
+      ForgetHistory();
       if (++consecutive_failures_ >= 10) {
         fuzzer_->Fail(StringPrintf("worker %d: target keeps failing: %s", id_,
                                    error.c_str()));
@@ -241,7 +275,6 @@ class Worker {
     child_execs_++;
     stats().executions++;
     stats().exec_time_us += execution->exec_time_us;
-    RememberExecution(source);
     if (execution->succeeded()) {
       ObserveTargetCoverage();
     }
@@ -327,8 +360,7 @@ class Worker {
       return;
     }
     if (runner_->child().execs_since_spawn() <= 1) {
-      history_.clear();
-      history_bytes_ = 0;
+      ForgetHistory();
     }
     history_.push_back(source);
     history_bytes_ += source.size();
@@ -337,6 +369,10 @@ class Worker {
       history_bytes_ -= history_.front().size();
       history_.pop_front();
     }
+  }
+  void ForgetHistory() {
+    history_.clear();
+    history_bytes_ = 0;
   }
   static constexpr size_t kHistoryBytes = static_cast<size_t>(8) * 1024 * 1024;
 
@@ -1296,8 +1332,46 @@ class Worker {
     size_t history_needed = 0;     // shortest history suffix that reproduces it
     size_t history_available = 0;
     uint64_t replay_executions = 0;
-    bool minimized = false;
+    bool minimized = false;  // NAME.js has the minimized program
+    // The minimization. Its node counts are those of the program alone, as
+    // in NAME.js (also when the minimizer reduced the tree of the prelude
+    // and the program). They do not change if the check rejected the result.
     MinimizationResult minimization;
+    // What the minimizer reduced: "prelude and program" (one tree), or
+    // "program alone" and the reason. Empty if the minimizer did not run.
+    std::string min_tree;
+    // How a test of an amplified crash runs: "1 of K plain d8 runs with the
+    // amplified flags". Empty if the tests run in the target of the worker.
+    std::string min_oracle;
+    // For the tree of the prelude and the program: its top-level prelude
+    // statements and its nodes, before and after the minimization. For an
+    // amplified crash, the prelude of the tree can be empty.
+    bool prelude_in_tree = false;
+    size_t prelude_statements_before = 0;
+    size_t prelude_statements_after = 0;
+    size_t script_nodes_before = 0;
+    size_t script_nodes_after = 0;
+    // The minimized script, which reproduces the crash without the prelude
+    // (the text of NAME.repro.js after its header). Empty if there is none.
+    std::string repro;
+    // The program part of `repro` also crashed with the signature behind
+    // the full prelude. Then NAME.js has this program.
+    bool program_verified = false;
+    std::string repro_path;  // empty if Redline did not write NAME.repro.js
+    size_t repro_bytes = 0;
+    // The d8 flags of NAME.repro.js: all flags of the test, or the flags
+    // that the flag minimization kept. `repro_flags_note` tells which. The
+    // flags of the test are the flags of the target, or the amplified flags.
+    std::vector<std::string> repro_flags;
+    std::string repro_flags_note;
+    int repro_flag_tests = 0;      // flag lists that the search tried
+    int repro_flag_processes = 0;  // plain d8 processes of the search
+    // The rate check of NAME.repro.js of an amplified crash. The fields are
+    // the plain d8 runs, the runs that crashed with the signature, and the
+    // result in words (empty: no check).
+    int repro_rate_runs = 0;
+    int repro_rate_hits = 0;
+    std::string repro_rate_note;
     bool amplify_ran = false;  // the amplify step ran (5.8)
     AmplifyResult amplify;
     // The one-file reproducer of a state-dependent crash (NAME.bundle.js).
@@ -1305,6 +1379,14 @@ class Worker {
     std::string bundle_note;  // why there is no bundle, or why the runs stopped
     int bundle_runs = 0;      // plain d8 runs of the bundle
     int bundle_hits = 0;      // ... that crashed with the same signature
+    // The minimization of the bundle: the result in one line, or why it did
+    // not give a smaller bundle. Empty if it did not run.
+    std::string bundle_min_note;
+    // NAME.bundle.min.js, the minimized bundle (empty if there is none), and
+    // its plain d8 runs and the runs that crashed with the signature.
+    std::string bundle_min_path;
+    int bundle_min_runs = 0;
+    int bundle_min_hits = 0;
     bool reproducible() const { return reproduced > 0; }
   };
 
@@ -1338,14 +1420,127 @@ class Worker {
     if (info.bundle_path.empty()) {
       return "bundle: no\nbundle_note: " + info.bundle_note + "\n";
     }
-    return StringPrintf("bundle: %s\nbundle_rate: %d/%d\nbundle_note: %s\n",
-                        BaseName(info.bundle_path).c_str(), info.bundle_hits,
-                        info.bundle_runs, info.bundle_note.c_str());
+    std::string lines =
+        StringPrintf("bundle: %s\nbundle_rate: %d/%d\nbundle_note: %s\n",
+                     BaseName(info.bundle_path).c_str(), info.bundle_hits,
+                     info.bundle_runs, info.bundle_note.c_str());
+    if (!info.bundle_min_path.empty()) {
+      lines += "bundle_min: " + BaseName(info.bundle_min_path) + "\n";
+    }
+    if (info.bundle_min_runs > 0) {
+      lines += StringPrintf("bundle_min_rate: %d/%d\n", info.bundle_min_hits,
+                            info.bundle_min_runs);
+    }
+    if (!info.bundle_min_note.empty()) {
+      lines += "bundle_min_note: " + info.bundle_min_note + "\n";
+    }
+    return lines;
+  }
+
+  // The minimization lines of the crash report (read by the uploader).
+  // `repro` names NAME.repro.js, the minimized script that reproduces the
+  // crash without the prelude.
+  static std::string MinimizationReportLines(const CrashInfo& info) {
+    std::string lines = StringPrintf(
+        "min_time_ms: %.0f\nmin_budget_exhausted: %s\nmin_stop: %s\n",
+        static_cast<double>(info.minimization.time_us) / 1000.0,
+        info.minimization.budget_exhausted ? "yes" : "no",
+        MinimizationStopName(info.minimization.stop));
+    if (!info.min_tree.empty()) {
+      lines += "min_tree: " + info.min_tree + "\n";
+    }
+    if (!info.min_oracle.empty()) {
+      lines += "min_oracle: " + info.min_oracle + "\n";
+    }
+    if (info.prelude_in_tree) {
+      lines += StringPrintf(
+          "min_prelude_statements: %zu -> %zu\nmin_script_nodes: %zu -> %zu\n",
+          info.prelude_statements_before, info.prelude_statements_after,
+          info.script_nodes_before, info.script_nodes_after);
+    }
+    if (!info.repro_path.empty()) {
+      // Only the program of a reproducible crash runs behind the full
+      // prelude again.
+      if (info.reproducible()) {
+        lines += StringPrintf("min_program_verified: %s\n",
+                              info.program_verified ? "yes" : "no");
+      }
+      lines += StringPrintf(
+          "repro: %s\nrepro_bytes: %zu\nrepro_flags: %s\nrepro_flags_note: "
+          "%s\n",
+          BaseName(info.repro_path).c_str(), info.repro_bytes,
+          JoinArgs(info.repro_flags).c_str(), info.repro_flags_note.c_str());
+    }
+    if (!info.repro_rate_note.empty()) {
+      lines += StringPrintf("repro_rate: %d/%d\nrepro_rate_note: %s\n",
+                            info.repro_rate_hits, info.repro_rate_runs,
+                            info.repro_rate_note.c_str());
+    }
+    return lines;
+  }
+
+  // `args`, separated by spaces.
+  static std::string JoinArgs(const std::vector<std::string>& args) {
+    std::string text;
+    for (const std::string& arg : args) {
+      text += (text.empty() ? "" : " ") + arg;
+    }
+    return text;
+  }
+
+  // The text of NAME.repro.js at `path`: the two header lines with `flags`
+  // in the d8 command, then the minimized script.
+  std::string ReproText(const CrashInfo& info,
+                        const std::vector<std::string>& flags,
+                        const std::string& path) const {
+    std::string signature = info.signature.text;
+    std::replace(signature.begin(), signature.end(), '\n', ' ');
+    TargetOptions target = CurrentTarget();
+    target.executable = AbsolutePath(target.executable);
+    target.args = flags;
+    return StringPrintf("// signature: %s\n// run: %s %s/%s\n",
+                        signature.c_str(), target.CommandLine().c_str(),
+                        AbsolutePath(config().out_dir + "/crashes").c_str(),
+                        BaseName(path).c_str()) +
+           info.repro;
+  }
+
+  // Writes BASE.repro.js for a minimized crash: two comment lines (the
+  // signature and the d8 command that runs the file), then the minimized
+  // script. The script has the prelude statements that the crash needs, so
+  // d8 runs the file without the prelude. The d8 command has the flags of
+  // `repro_flags` and absolute paths, so it works in each directory.
+  void WriteRepro(const std::string& base, CrashInfo* info) {
+    if (info->repro.empty()) {
+      return;
+    }
+    const std::string path = base + ".repro.js";
+    const std::string text = ReproText(*info, info->repro_flags, path);
+    std::string error;
+    if (!WriteStringToFile(path, text, &error)) {
+      REDLINE_WARN(kLog, "%s", error.c_str());
+      return;
+    }
+    info->repro_path = path;
+    info->repro_bytes = text.size();
   }
 
   // The time that a plain d8 process needs to start and to stop, in addition
-  // to the time of its scripts.
-  static constexpr uint64_t kBundleStartupUs = 10'000'000;
+  // to the time of its scripts (the bundle runs and the flag search).
+  static constexpr uint64_t kPlainStartupUs = 10'000'000;
+
+  // The header of NAME.bundle.js at `path`, for a bundle of `programs`
+  // history programs and the crash program.
+  std::string BundleHeader(size_t programs, const std::string& path,
+                           const CrashInfo& info) const {
+    std::string signature = info.signature.text;
+    std::replace(signature.begin(), signature.end(), '\n', ' ');
+    return StringPrintf(
+        "// redline state-dependent crash: %zu program(s), then the crash "
+        "program\n// signature: %s\n// run: %s --bundle-reprl %s\n",
+        programs, signature.c_str(), CurrentTarget().CommandLine().c_str(),
+        BaseName(path).c_str());
+  }
 
   // Writes BASE.bundle.js for a state-dependent crash: one part for each
   // program of `history`, then one part for `source`. `d8 --bundle-reprl`
@@ -1364,15 +1559,9 @@ class Worker {
     scripts.push_back(ScriptFor(source));
     const TargetOptions target = CurrentTarget();
     const std::string path = base + ".bundle.js";
-    std::string signature = info->signature.text;
-    std::replace(signature.begin(), signature.end(), '\n', ' ');
-    const std::string header = StringPrintf(
-        "// redline state-dependent crash: %zu program(s), then the crash "
-        "program\n// signature: %s\n// run: %s --bundle-reprl %s\n",
-        history.size(), signature.c_str(), target.CommandLine().c_str(),
-        BaseName(path).c_str());
     std::string bundle;
-    if (!MakeReprlBundle(header, scripts, &bundle)) {
+    if (!MakeReprlBundle(BundleHeader(history.size(), path, *info), scripts,
+                         &bundle)) {
       info->bundle_note = "a program contains the bundle marker";
       return;
     }
@@ -1387,7 +1576,7 @@ class Worker {
     args.push_back(path);
     const auto env = target.PlainEnvironment();
     const uint64_t timeout_us =
-        config().target.timeout_us * scripts.size() + kBundleStartupUs;
+        config().target.timeout_us * scripts.size() + kPlainStartupUs;
     const uint64_t budget_us =
         static_cast<uint64_t>(config().crash_history_budget_sec * 1e6);
     const Stopwatch clock;
@@ -1467,6 +1656,651 @@ class Worker {
     }
     stats().harvested_crashes++;
     ProcessCrash(source, *program, execution, lineage);
+  }
+
+  // Minimizes a crash that reproduces alone, against its signature
+  // (DESIGN.md 5.6). The minimizer reduces one tree of the prelude and the
+  // program, which prints to a script that is equivalent to the script of
+  // the target. Thus it also removes the prelude statements that the crash
+  // does not need. The minimizer reduces the program alone, behind the
+  // prelude, in four cases. The prelude is empty. The prelude or the program
+  // does not parse. The prelude continues into the program. The printed tree
+  // does not crash with the signature. Sets the minimization fields of
+  // `info`. Returns the program for NAME.js.
+  std::string MinimizeReproducibleCrash(const std::string& source,
+                                        const Program& program,
+                                        uint64_t exec_time_us,
+                                        CrashInfo* info) {
+    const CrashSignature& wanted = info->signature;
+    auto same_crash = [&](const Execution& execution) {
+      return execution.crashed() &&
+             CrashSignature::FromExecution(execution) == wanted;
+    };
+    // A text of the one tree runs as it is. A program runs behind the
+    // prelude.
+    auto run = [&](const std::string& text, bool is_script,
+                   Execution* execution, uint64_t timeout_us) {
+      return is_script ? ExecuteScript(text, execution, timeout_us)
+                       : Execute(text, execution, timeout_us);
+    };
+    // True if the text crashes with the signature in one of
+    // verify_attempts runs. The target is not deterministic.
+    auto verified = [&](const std::string& text, bool is_script) {
+      for (int attempt = 0; attempt < config().verify_attempts && !stopping();
+           attempt++) {
+        Execution e;
+        if (!run(text, is_script, &e, 0)) {
+          return false;
+        }
+        stats().rerun_executions++;
+        if (same_crash(e)) {
+          return true;
+        }
+      }
+      return false;
+    };
+    std::unique_ptr<ScriptTree> script;
+    info->min_tree = "program alone: the prelude is empty";
+    if (!config().prelude.empty()) {
+      std::string error;
+      script = ScriptTree::Parse(config().prelude, source, &error);
+      if (script == nullptr) {
+        // The report has one line for the reason.
+        std::replace(error.begin(), error.end(), '\n', ' ');
+        info->min_tree = "program alone: " + error;
+      } else if (!verified(fast::Print(script->tree()->root()),
+                           /*is_script=*/true)) {
+        info->min_tree =
+            "program alone: the printed script of the prelude and the "
+            "program did not crash with the signature";
+        script.reset();
+      } else {
+        info->min_tree = "prelude and program";
+      }
+    }
+    std::unique_ptr<fast::Tree> program_tree;
+    fast::Tree* work;
+    size_t program_nodes_before = 0;
+    if (script != nullptr) {
+      work = script->tree();
+      program_nodes_before = script->ProgramNodes();
+      info->prelude_in_tree = true;
+      info->prelude_statements_before = script->prelude_statements();
+    } else {
+      if (!config().prelude.empty()) {
+        REDLINE_LOG(kLog, "worker %d: the crash minimizer reduces the %s", id_,
+                    info->min_tree.c_str());
+      }
+      program_tree = program.CopyTree();
+      work = program_tree.get();
+    }
+    const bool whole_script = script != nullptr;
+    const uint64_t probe_timeout_us = ProbeTimeout(exec_time_us);
+    MinimizationOracle oracle = [&](const std::string& candidate) {
+      if (stopping()) {
+        return false;
+      }
+      Execution e;
+      return run(candidate, whole_script, &e, probe_timeout_us) &&
+             same_crash(e);
+    };
+    info->minimization = fuzzer_->MinimizeCrash(
+        work, oracle, probe_checker(),
+        config().crash_minimizer.ForProgram(exec_time_us));
+    if (stopping()) {
+      // The oracle refused every test after the stop request.
+      info->minimization.stop = MinimizationStop::kStopped;
+    }
+    stats().minimizer_tests += static_cast<uint64_t>(info->minimization.tests);
+    stats().minimizer_time_us += info->minimization.time_us;
+    // Keep the node counts of the program alone, as in NAME.js. Until the
+    // check below accepts the result, the counts after are the counts before.
+    if (script != nullptr) {
+      info->script_nodes_before = info->minimization.nodes_before;
+      info->script_nodes_after = info->script_nodes_before;
+      info->minimization.nodes_before = program_nodes_before;
+      info->prelude_statements_after = info->prelude_statements_before;
+    }
+    const size_t nodes_after = script != nullptr
+                                   ? script->ProgramNodes()
+                                   : info->minimization.nodes_after;
+    info->minimization.nodes_after = info->minimization.nodes_before;
+    if (info->minimization.accepted == 0) {
+      return source;
+    }
+    const std::string candidate = fast::Print(work->root());
+    if (!verified(candidate, whole_script)) {
+      stats().minimizer_rejected++;
+      return source;
+    }
+    if (script == nullptr) {
+      info->minimization.nodes_after = nodes_after;
+      info->minimized = true;
+      return candidate;
+    }
+    info->script_nodes_after = fast::CountNodes(work->root());
+    info->prelude_statements_after = script->PreludeStatementsNow();
+    info->repro = candidate;
+    // MinimizeReproFlags can remove flags later.
+    info->repro_flags = CurrentTarget().args;
+    info->repro_flags_note = "all flags of the test, no search";
+    // NAME.js keeps the program alone, which runs behind the full prelude.
+    const std::string reduced = script->PrintProgram();
+    info->program_verified = verified(reduced, /*is_script=*/false);
+    if (!info->program_verified) {
+      return source;
+    }
+    info->minimization.nodes_after = nodes_after;
+    info->minimized = true;
+    return reduced;
+  }
+
+  // How plain d8 processes test the script of NAME.repro.js.
+  struct PlainTest {
+    std::vector<std::string> flags;  // the flags before the flag search
+    int runs = 1;                    // the processes of one test
+    int needed = 1;                  // ... that must crash with the signature
+    uint64_t timeout_us = 0;         // the time limit of one process
+  };
+
+  // The time limit of one plain d8 process of an amplified crash, if the
+  // amplify step did not give one.
+  static constexpr uint64_t kAmplifiedRunTimeoutUs = 30'000'000;
+
+  // The plain test of NAME.repro.js. For an amplified crash: the amplified
+  // flags (AmplifiedFlags), AmplifiedRuns() processes, and one of them must
+  // crash. For a crash that reproduces alone: the flags of the target,
+  // crash_flag_runs processes, and all of them must crash.
+  PlainTest ReproTest(const CrashInfo& info) const {
+    PlainTest test;
+    if (!info.reproducible() && info.amplify.amplified) {
+      test.flags = AmplifiedFlags(CurrentTarget().args, info.amplify.args);
+      test.runs = AmplifiedRuns(info.amplify.hits, info.amplify.processes);
+      test.needed = 1;
+      test.timeout_us = info.amplify.run_timeout_us > 0
+                            ? info.amplify.run_timeout_us
+                            : kAmplifiedRunTimeoutUs;
+      return test;
+    }
+    test.flags = CurrentTarget().args;
+    test.runs = config().crash_flag_runs;
+    test.needed = test.runs;
+    test.timeout_us = config().target.timeout_us + kPlainStartupUs;
+    return test;
+  }
+
+  // Removes the d8 flags that NAME.repro.js at BASE.repro.js does not need
+  // (DESIGN.md 5.6). A list of flags passes if the script passes the plain
+  // test of ReproTest(). The test file has the text of NAME.repro.js, so
+  // that the lines of the script are the same. If the script does not pass
+  // with all flags of the test, NAME.repro.js keeps all flags.
+  void MinimizeReproFlags(const std::string& base, CrashInfo* info) {
+    if (config().crash_flag_processes <= 0 ||
+        config().crash_flag_budget_sec <= 0) {
+      info->repro_flags_note = "all flags of the test, the search is off";
+      return;
+    }
+    const PlainTest test = ReproTest(*info);
+    // The search removes single words. A flag with its value in the next
+    // word would lose its value.
+    for (const std::string& arg : test.flags) {
+      if (!arg.starts_with("-")) {
+        info->repro_flags_note =
+            "all flags of the test: a flag has its value in a separate word";
+        return;
+      }
+    }
+    // The suffix is not .js, so that `replay` of the crashes directory does
+    // not run this temporary file.
+    const std::string path = base + ".repro.tmp";
+    std::string error;
+    if (!WriteStringToFile(
+            path, ReproText(*info, test.flags, base + ".repro.js"), &error)) {
+      std::remove(path.c_str());
+      info->repro_flags_note = "all flags of the test: " + error;
+      return;
+    }
+    const Stopwatch clock;
+    PlainCrashRunner runner(CurrentTarget(), info->signature, test.timeout_us);
+    runner.set_stop([this] { return stopping(); });
+    auto crashes = [&](const std::vector<std::string>& flags) {
+      std::vector<std::string> args = flags;
+      args.push_back(path);
+      return runner.Crashes(args, test.runs, test.needed);
+    };
+    // The check with all flags of the test counts as the first test.
+    if (!crashes(test.flags)) {
+      info->repro_flag_tests = 1;
+      info->repro_flags_note =
+          !runner.error().empty()
+              ? "all flags of the test: cannot start d8: " + runner.error()
+          : stopping()
+              ? "all flags of the test, the session stopped"
+              : StringPrintf(
+                    "all flags of the test: %d of %d plain d8 runs "
+                    "crashed with the signature, %d needed",
+                    runner.last_hits(), runner.last_runs(), test.needed);
+    } else {
+      // KeepReproFlag keeps --allow-natives-syntax for a % call, the flags
+      // that make the run more deterministic, and --stress-runs. Other
+      // flags that the script needs to parse stay too, because the script
+      // cannot crash without them.
+      const bool natives = HasNativeCall(info->repro);
+      const uint64_t budget_us =
+          static_cast<uint64_t>(config().crash_flag_budget_sec * 1e6);
+      const FlagMinimization result = MinimizeFlags(
+          test.flags,
+          [natives](const std::string& flag) {
+            return KeepReproFlag(flag, natives);
+          },
+          crashes,
+          [&] {
+            return stopping() || !runner.error().empty() ||
+                   runner.processes() + test.runs >
+                       config().crash_flag_processes ||
+                   clock.ElapsedUs() > budget_us;
+          });
+      info->repro_flags = result.flags;
+      info->repro_flag_tests = result.tests + 1;
+      const char* end = !result.budget_exhausted  ? ""
+                        : stopping()              ? ", the session stopped"
+                        : !runner.error().empty() ? ", cannot start d8"
+                                                  : ", budget used up";
+      info->repro_flags_note =
+          StringPrintf("%zu -> %zu flags in %d tests, %d processes, %.0f s%s",
+                       test.flags.size(), result.flags.size(),
+                       info->repro_flag_tests, runner.processes(),
+                       static_cast<double>(clock.ElapsedUs()) / 1e6, end);
+    }
+    info->repro_flag_processes = runner.processes();
+    stats().flag_processes += static_cast<uint64_t>(runner.processes());
+    std::remove(path.c_str());
+  }
+
+  // Minimizes an amplified crash (DESIGN.md 5.6). Such a crash does not
+  // reproduce alone. It reproduces in plain d8 processes with the flags of
+  // the amplify step. The minimizer reduces one tree of the prelude and the
+  // program. The program is the program of the amplify step, if the step
+  // changed it, or else `source`. A test runs the printed tree in the plain
+  // processes of ReproTest(), and passes if one of them crashes with the
+  // signature. The start check, the minimization and the last check share
+  // the time limit crash_amplified_budget_sec. The result goes to
+  // NAME.repro.js only. NAME.js keeps the original program.
+  void MinimizeAmplifiedCrash(uint64_t hash, const std::string& source,
+                              const Program& program, CrashInfo* info) {
+    // NAME.js keeps the original program, so the counts of the program do
+    // not change.
+    info->minimization.nodes_before = program.node_count();
+    info->minimization.nodes_after = program.node_count();
+    const uint64_t budget_us =
+        static_cast<uint64_t>(config().crash_amplified_budget_sec * 1e6);
+    if (budget_us == 0) {
+      info->min_tree = "not minimized: crash_amplified_budget_sec is 0";
+      return;
+    }
+    // AmplifiedFlags removes single words. A flag with its value in the next
+    // word would lose its value.
+    for (const std::string& arg : CurrentTarget().args) {
+      if (!arg.starts_with("-")) {
+        info->min_tree =
+            "not minimized: a flag has its value in a separate word";
+        return;
+      }
+    }
+    const std::string& text =
+        info->amplify.program.empty() ? source : info->amplify.program;
+    std::string error;
+    std::unique_ptr<ScriptTree> script =
+        ScriptTree::Parse(config().prelude, text, &error);
+    if (script == nullptr) {
+      // The report has one line for the reason.
+      std::replace(error.begin(), error.end(), '\n', ' ');
+      info->min_tree = "not minimized: " + error;
+      return;
+    }
+    const Stopwatch clock;
+    const PlainTest test = ReproTest(*info);
+    info->min_oracle = StringPrintf(
+        "1 of %d plain d8 runs with the amplified flags", test.runs);
+    // The suffix is not .js, so that `replay` of the crashes directory does
+    // not run this temporary file.
+    const std::string path = StringPrintf(
+        "%s/crashes/amplified_%016llx.tmp", config().out_dir.c_str(),
+        static_cast<unsigned long long>(hash));
+    PlainCrashRunner runner(CurrentTarget(), info->signature, test.timeout_us);
+    runner.set_stop([this] { return stopping(); });
+    std::string write_error;
+    // One test, without the time limit.
+    auto passes = [&](const std::string& candidate) {
+      write_error.clear();
+      if (stopping()) {
+        return false;
+      }
+      if (!WriteStringToFile(path, candidate, &write_error)) {
+        std::remove(path.c_str());
+        return false;
+      }
+      std::vector<std::string> args = test.flags;
+      args.push_back(path);
+      return runner.Crashes(args, test.runs, test.needed);
+    };
+    // The tests of the minimizer stop at the time limit.
+    MinimizationOracle oracle = [&](const std::string& candidate) {
+      return clock.ElapsedUs() <= budget_us && passes(candidate);
+    };
+    // True if the text passes the test in one of verify_attempts tries. The
+    // start check and the last check do not stop at the time limit. Thus a
+    // minimization that used up its time can still give a result.
+    auto verified = [&](const std::string& candidate) {
+      for (int attempt = 0; attempt < config().verify_attempts && !stopping();
+           attempt++) {
+        if (passes(candidate)) {
+          return true;
+        }
+      }
+      return false;
+    };
+    // Why a check failed: a stop, a test file that Redline cannot write, the
+    // time limit, or no crash.
+    auto reason = [&]() -> std::string {
+      if (stopping()) {
+        return "the session stopped";
+      }
+      if (!write_error.empty()) {
+        return "cannot write the test file: " + write_error;
+      }
+      if (!runner.error().empty()) {
+        return "cannot start d8: " + runner.error();
+      }
+      return "";
+    };
+    if (!verified(fast::Print(script->tree()->root()))) {
+      const std::string why = reason();
+      info->min_tree =
+          "not minimized: " +
+          (why.empty() ? "the printed script did not crash with the amplified "
+                         "flags"
+                       : why);
+    } else {
+      info->min_tree = config().prelude.empty() ? "program, without a prelude"
+                                                : "prelude and program";
+      info->prelude_in_tree = true;
+      info->prelude_statements_before = script->prelude_statements();
+      MinimizerOptions options = config().crash_minimizer;
+      options.max_time_ms = std::max<uint64_t>(
+          1, (budget_us - std::min(budget_us, clock.ElapsedUs())) / 1000);
+      info->minimization = fuzzer_->MinimizeCrash(script->tree(), oracle,
+                                                  probe_checker(), options);
+      if (stopping()) {
+        // The oracle refused every test after the stop request.
+        info->minimization.stop = MinimizationStop::kStopped;
+      }
+      stats().minimizer_tests +=
+          static_cast<uint64_t>(info->minimization.tests);
+      stats().minimizer_time_us += info->minimization.time_us;
+      // Until the check below accepts the result, the counts after are the
+      // counts before.
+      info->script_nodes_before = info->minimization.nodes_before;
+      info->script_nodes_after = info->script_nodes_before;
+      info->prelude_statements_after = info->prelude_statements_before;
+      info->minimization.nodes_before = program.node_count();
+      info->minimization.nodes_after = program.node_count();
+      if (info->minimization.accepted > 0) {
+        const std::string candidate = fast::Print(script->tree()->root());
+        if (verified(candidate)) {
+          info->script_nodes_after = fast::CountNodes(script->tree()->root());
+          info->prelude_statements_after = script->PreludeStatementsNow();
+          info->repro = candidate;
+          // MinimizeReproFlags can remove flags later.
+          info->repro_flags = test.flags;
+          info->repro_flags_note = "all flags of the test, no search";
+        } else {
+          stats().minimizer_rejected++;
+          const std::string why = reason();
+          info->min_tree += ", the last check failed";
+          if (!why.empty()) {
+            info->min_tree += ": " + why;
+          }
+        }
+      }
+    }
+    stats().crash_min_processes += static_cast<uint64_t>(runner.processes());
+    std::remove(path.c_str());
+  }
+
+  // The rate check of NAME.repro.js of an amplified crash (DESIGN.md 5.6).
+  // A 1-of-k test can accept a script that crashes less often than the
+  // amplified program. Thus Redline runs the text of NAME.repro.js with
+  // repro_flags in as many plain d8 processes as the amplify step planned,
+  // without an early stop. If the count is complete and below the bar, and
+  // the flag search removed flags, Redline also counts all flags of the
+  // test. DecideAmplifiedRate decides with these counts.
+  void CheckAmplifiedRepro(const std::string& base, CrashInfo* info) {
+    const PlainTest test = ReproTest(*info);
+    const int planned = std::max(1, info->amplify.planned_processes);
+    const int bar = std::clamp(info->amplify.min_hits, 1, planned);
+    // The suffix is not .js, so that `replay` of the crashes directory does
+    // not run this temporary file.
+    const std::string path = base + ".rate.tmp";
+    PlainCrashRunner runner(CurrentTarget(), info->signature, test.timeout_us);
+    runner.set_stop([this] { return stopping(); });
+    // The count of the script with `flags`. A write error gives no runs.
+    auto count = [&](const std::vector<std::string>& flags) {
+      RateCount result;
+      std::string error;
+      if (!WriteStringToFile(path, ReproText(*info, flags, base + ".repro.js"),
+                             &error)) {
+        std::remove(path.c_str());
+        return result;
+      }
+      std::vector<std::string> args = flags;
+      args.push_back(path);
+      result.hits = runner.Count(args, planned);
+      result.runs = runner.last_runs();
+      return result;
+    };
+    const RateCount kept = count(info->repro_flags);
+    RateCount all;
+    const bool count_all = kept.runs == planned && kept.hits < bar &&
+                           info->repro_flags != test.flags;
+    if (count_all) {
+      all = count(test.flags);
+    }
+    const RateDecision decision =
+        DecideAmplifiedRate(bar, planned, kept, count_all ? &all : nullptr);
+    if (decision.all_flags) {
+      info->repro_flags = test.flags;
+      info->repro_flags_note += ", the rate check restored all flags";
+    }
+    if (!decision.keep) {
+      info->repro.clear();
+      // No NAME.repro.js, so the report gives no results of its tree.
+      info->script_nodes_after = info->script_nodes_before;
+      info->prelude_statements_after = info->prelude_statements_before;
+    }
+    info->repro_rate_runs = decision.rate.runs;
+    info->repro_rate_hits = decision.rate.hits;
+    info->repro_rate_note = decision.note;
+    stats().crash_min_processes += static_cast<uint64_t>(runner.processes());
+    std::remove(path.c_str());
+  }
+
+  // Minimizes NAME.bundle.js of a state-dependent crash (DESIGN.md 5.6). A
+  // test writes a candidate bundle to a file and runs it with --bundle-reprl
+  // in k plain d8 processes. The test passes if one of them crashes with the
+  // signature. k comes from the bundle runs, as for an amplified crash
+  // (AmplifiedRuns). MinimizeBundleParts runs the steps, and the tests stop
+  // at crash_bundle_min_budget_sec. The last check and the rate check stop
+  // only at a stop request. The result goes to NAME.bundle.min.js only if it
+  // crashes in at least bundle_hits of bundle_runs plain d8 runs.
+  // NAME.bundle.js stays the original bundle.
+  void MinimizeBundle(const std::vector<std::string>& history,
+                      const std::string& source, CrashInfo* info) {
+    const uint64_t budget_us =
+        static_cast<uint64_t>(config().crash_bundle_min_budget_sec * 1e6);
+    if (budget_us == 0) {
+      info->bundle_min_note = "not minimized: crash_bundle_min_budget_sec is 0";
+      return;
+    }
+    const Stopwatch clock;
+    // One part for each history program, then the crash part. Each part is
+    // a script: the prelude and the program.
+    std::vector<std::string> parts;
+    for (const std::string& program : history) {
+      parts.push_back(ScriptFor(program));
+    }
+    parts.push_back(ScriptFor(source));
+    const std::vector<std::string> parts_before = parts;
+    std::string bundle_before;
+    if (!MakeReprlBundle(BundleHeader(history.size(), info->bundle_path, *info),
+                         parts, &bundle_before)) {
+      info->bundle_min_note =
+          "not minimized: a part contains the bundle marker";
+      return;
+    }
+    const TargetOptions target = CurrentTarget();
+    const int runs = AmplifiedRuns(info->bundle_hits, info->bundle_runs);
+    // NAME.bundle.min.js, and the temporary file of the tests. The suffix is
+    // not .js, so that `replay` of the crashes directory does not run it.
+    const std::string min_path =
+        info->bundle_path.substr(0, info->bundle_path.size() - 3) + ".min.js";
+    const std::string path = min_path + ".tmp";
+    // The tests of the steps stop at the time limit. The last check and the
+    // rate check stop only at a stop request.
+    bool steps = true;
+    auto exhausted = [&] {
+      return stopping() || (steps && clock.ElapsedUs() > budget_us);
+    };
+    PlainCrashRunner runner(
+        target, info->signature,
+        config().target.timeout_us * parts.size() + kPlainStartupUs);
+    runner.set_stop(exhausted);
+    int tests = 0;
+    std::string write_error;
+    // Writes `candidate` with `header` to `file`. False on an error.
+    auto write = [&](const std::vector<std::string>& candidate,
+                     const std::string& header, const std::string& file) {
+      std::string bundle;
+      write_error.clear();
+      if (!MakeReprlBundle(header, candidate, &bundle)) {
+        write_error = "a part contains the bundle marker";
+        return false;
+      }
+      if (!WriteStringToFile(file, bundle, &write_error)) {
+        std::remove(file.c_str());
+        return false;
+      }
+      return true;
+    };
+    auto crashes = [&](const std::vector<std::string>& candidate) {
+      if (exhausted() || !write(candidate, "", path)) {
+        return false;
+      }
+      tests++;
+      std::vector<std::string> args = target.args;
+      args.push_back("--bundle-reprl");
+      args.push_back(path);
+      return runner.Crashes(args, runs, 1);
+    };
+    // True if the bundle passes the test in one of verify_attempts tries.
+    auto verified = [&](const std::vector<std::string>& candidate) {
+      for (int attempt = 0; attempt < config().verify_attempts && !stopping();
+           attempt++) {
+        if (crashes(candidate)) {
+          return true;
+        }
+      }
+      return false;
+    };
+    // Reduces part `i` with the crash reducers. The part is a script, so the
+    // tests use its printed tree as it is. A reduced history part can crash
+    // itself. Then the bundle still crashes with the signature.
+    auto reduce = [&](std::vector<std::string>* all, size_t i) {
+      std::unique_ptr<fast::Tree> tree =
+          fast::Parser::ParseScript((*all)[i], fast::ParseOptions(), nullptr);
+      if (tree == nullptr) {
+        return;
+      }
+      MinimizationOracle oracle = [&](const std::string& candidate) {
+        std::vector<std::string> changed = *all;
+        changed[i] = candidate;
+        return crashes(changed);
+      };
+      MinimizerOptions options = config().crash_minimizer;
+      options.max_time_ms = std::max<uint64_t>(
+          1, (budget_us - std::min(budget_us, clock.ElapsedUs())) / 1000);
+      const MinimizationResult result =
+          fuzzer_->MinimizeCrash(tree.get(), oracle, probe_checker(), options);
+      if (result.accepted > 0) {
+        (*all)[i] = fast::Print(tree->root());
+      }
+    };
+    std::string note;
+    if (!verified(parts)) {
+      note = stopping() ? "not minimized: the session stopped"
+             : !write_error.empty()
+                 ? "not minimized: cannot write the test file: " + write_error
+                 : "not minimized: the bundle did not crash again";
+    } else {
+      parts = MinimizeBundleParts(parts, crashes, reduce, exhausted);
+      steps = false;
+      std::string bundle_after;
+      MakeReprlBundle(BundleHeader(parts.size() - 1, min_path, *info), parts,
+                      &bundle_after);
+      if (parts == parts_before ||
+          bundle_after.size() >= bundle_before.size()) {
+        note = "not minimized: no smaller bundle crashed";
+      } else if (!verified(parts)) {
+        note = stopping() ? "not minimized: the session stopped"
+                          : "not minimized: the smaller bundle did not crash "
+                            "again";
+      } else if (!write(parts, BundleHeader(parts.size() - 1, min_path, *info),
+                        path)) {
+        note = "not minimized: cannot write the bundle: " + write_error;
+      } else {
+        // The rate check: the original bundle crashed in bundle_hits of
+        // bundle_runs runs, and the minimized bundle must crash as often.
+        std::vector<std::string> args = target.args;
+        args.push_back("--bundle-reprl");
+        args.push_back(path);
+        info->bundle_min_hits = runner.Count(args, info->bundle_runs);
+        info->bundle_min_runs = runner.last_runs();
+        if (info->bundle_min_runs < info->bundle_runs) {
+          note = StringPrintf(
+              "not minimized: the rate check stopped after %d of %d runs",
+              info->bundle_min_runs, info->bundle_runs);
+        } else if (info->bundle_min_hits < info->bundle_hits) {
+          note = StringPrintf(
+              "not minimized: the smaller bundle crashed in %d of %d runs, "
+              "less than NAME.bundle.js",
+              info->bundle_min_hits, info->bundle_min_runs);
+        } else if (std::rename(path.c_str(), min_path.c_str()) != 0) {
+          note = "not minimized: cannot rename the bundle";
+        } else {
+          info->bundle_min_path = min_path;
+          note = StringPrintf("%zu -> %zu parts, %zu -> %zu bytes",
+                              parts_before.size(), parts.size(),
+                              bundle_before.size(), bundle_after.size());
+          if (parts.size() == 1) {
+            note += ", the crash part crashes alone in plain d8";
+          }
+        }
+      }
+    }
+    steps = false;
+    info->bundle_min_note =
+        note + StringPrintf(
+                   ", %d tests, %d processes, %.0f s, 1 of %d plain "
+                   "d8 runs per test%s",
+                   tests, runner.processes(),
+                   static_cast<double>(clock.ElapsedUs()) / 1e6, runs,
+                   !stopping() && clock.ElapsedUs() > budget_us
+                       ? ", budget used up"
+                       : "");
+    stats().minimizer_tests += static_cast<uint64_t>(tests);
+    stats().minimizer_time_us += clock.ElapsedUs();
+    stats().crash_min_processes += static_cast<uint64_t>(runner.processes());
+    std::remove(path.c_str());
   }
 
   void ProcessCrash(const std::string& source, const Program& program,
@@ -1615,60 +2449,48 @@ class Worker {
 
     // 3. Minimization, against the same signature so that the reduction
     //    cannot wander off into a different bug. Crashes are rare, so they
-    //    get their own, larger budget.
+    //    get their own, larger budget and all reducers.
     std::string final_source = source;
     if (info.reproducible() && config().minimize_crashes && decision.minimize &&
         !stopping()) {
-      std::unique_ptr<fast::Tree> work = program.CopyTree();
-      const uint64_t probe_timeout_us = ProbeTimeout(exec_time_us);
-      const CrashSignature& wanted = info.signature;
-      MinimizationOracle oracle = [&](const std::string& candidate) {
-        if (stopping()) {
-          return false;
-        }
-        Execution e;
-        if (!Execute(candidate, &e, probe_timeout_us) || !e.crashed()) {
-          return false;
-        }
-        return CrashSignature::FromExecution(e) == wanted;
-      };
-      const MinimizerOptions budget =
-          config().crash_minimizer.ForProgram(exec_time_us);
-      info.minimization =
-          fuzzer_->Minimize(work.get(), oracle, probe_checker(), budget);
-      stats().minimizer_tests += static_cast<uint64_t>(info.minimization.tests);
-      stats().minimizer_time_us += info.minimization.time_us;
-      if (info.minimization.accepted > 0) {
-        std::string candidate = fast::Print(work->root());
-        for (int attempt = 0; attempt < config().verify_attempts && !stopping();
-             attempt++) {
-          Execution e;
-          if (!Execute(candidate, &e)) {
-            break;
-          }
-          stats().rerun_executions++;
-          if (!e.crashed() || CrashSignature::FromExecution(e) != wanted) {
-            continue;
-          }
-          final_source = candidate;
-          info.minimized = true;
-          break;
-        }
-        if (!info.minimized) {
-          stats().minimizer_rejected++;
-        }
-      }
+      final_source =
+          MinimizeReproducibleCrash(source, program, exec_time_us, &info);
+    } else if (!info.reproducible() && info.amplify.amplified &&
+               config().minimize_crashes && decision.minimize && !stopping()) {
+      MinimizeAmplifiedCrash(hash, source, program, &info);
+    }
+    // 3a. The d8 flags of NAME.repro.js: remove the flags that the crash
+    //     does not need.
+    if (!info.repro.empty() && !stopping()) {
+      MinimizeReproFlags(CrashBase(execution.signal, hash), &info);
+    }
+    // 3b. The NAME.repro.js of an amplified crash must crash as often as
+    //     the amplify step requires. After a stop request, the check does
+    //     not run its processes, and Redline writes no NAME.repro.js.
+    if (!info.repro.empty() && !info.reproducible()) {
+      CheckAmplifiedRepro(CrashBase(execution.signal, hash), &info);
+    }
+    // 3c. A state-dependent crash without NAME.repro.js: minimize its
+    //     bundle, if the bundle crashed in a plain d8 run.
+    if (info.state_dependent && info.repro.empty() && info.bundle_hits > 0 &&
+        config().minimize_crashes && decision.minimize && !stopping()) {
+      MinimizeBundle(history, source, &info);
     }
 
     // 4. Store.
     std::string path;
     if (decision.save) {
+      WriteRepro(CrashBase(execution.signal, hash), &info);
       path = SaveCrash(source, final_source, execution, lineage, info, unique,
                        hash, history);
     }
-    fuzzer_->RecordCrashOutcome(info.signature, decision.save, info.minimized,
-                                info.reproducible() || info.state_dependent,
-                                path);
+    // A minimization that gave only NAME.repro.js or a minimized bundle also
+    // used the slot. Then signatures.txt counts the crash as minimized, while
+    // its report says `minimized: no` (NAME.js has the original program).
+    fuzzer_->RecordCrashOutcome(
+        info.signature, decision,
+        info.minimized || !info.repro.empty() || !info.bundle_min_path.empty(),
+        info.reproducible() || info.state_dependent, path);
 
     JsonObject event;
     event.Add("event", "crash")
@@ -1697,6 +2519,42 @@ class Worker {
               static_cast<uint64_t>(info.minimization.nodes_before));
     event.Add("min_nodes_after",
               static_cast<uint64_t>(info.minimization.nodes_after));
+    event.Add("min_time_ms",
+              static_cast<double>(info.minimization.time_us) / 1000.0);
+    event.Add("min_budget_exhausted", info.minimization.budget_exhausted);
+    event.Add("min_stop", MinimizationStopName(info.minimization.stop));
+    if (!info.min_tree.empty()) {
+      event.Add("min_tree", info.min_tree);
+    }
+    if (!info.min_oracle.empty()) {
+      event.Add("min_oracle", info.min_oracle);
+    }
+    if (!info.repro_rate_note.empty()) {
+      event.Add("repro_rate", StringPrintf("%d/%d", info.repro_rate_hits,
+                                           info.repro_rate_runs));
+      event.Add("repro_rate_note", info.repro_rate_note);
+    }
+    if (info.prelude_in_tree) {
+      event.Add("min_prelude_statements_before",
+                static_cast<uint64_t>(info.prelude_statements_before));
+      event.Add("min_prelude_statements_after",
+                static_cast<uint64_t>(info.prelude_statements_after));
+      event.Add("min_script_nodes_before",
+                static_cast<uint64_t>(info.script_nodes_before));
+      event.Add("min_script_nodes_after",
+                static_cast<uint64_t>(info.script_nodes_after));
+    }
+    if (!info.repro_path.empty()) {
+      if (info.reproducible()) {
+        event.Add("min_program_verified", info.program_verified);
+      }
+      event.Add("repro", info.repro_path)
+          .Add("repro_bytes", static_cast<uint64_t>(info.repro_bytes));
+      event.Add("repro_flags", JoinArgs(info.repro_flags))
+          .Add("repro_flags_note", info.repro_flags_note);
+      event.Add("repro_flag_tests", info.repro_flag_tests)
+          .Add("repro_flag_processes", info.repro_flag_processes);
+    }
     event.Add("amplify", info.amplify_ran
                              ? (info.amplify.amplified ? "yes" : "no")
                              : "skipped");
@@ -1704,6 +2562,12 @@ class Worker {
       event.Add("bundle", info.bundle_path)
           .Add("bundle_runs", info.bundle_runs)
           .Add("bundle_hits", info.bundle_hits);
+      if (!info.bundle_min_note.empty()) {
+        event.Add("bundle_min", info.bundle_min_path)
+            .Add("bundle_min_note", info.bundle_min_note);
+        event.Add("bundle_min_rate", StringPrintf("%d/%d", info.bundle_min_hits,
+                                                  info.bundle_min_runs));
+      }
     }
     if (info.amplify_ran) {
       event.Add("amplified_args", info.amplify.args);
@@ -1803,7 +2667,7 @@ class Worker {
         "crash\n"
         "history_replayed: %s\nstate_dependent: %s\nhistory_needed: %zu of "
         "%zu\n"
-        "minimized: %s (%d tests, %zu -> %zu nodes)\nd8_random_args: %s\n"
+        "minimized: %s (%d tests, %zu -> %zu nodes)\n%sd8_random_args: %s\n"
         "%s%s\n--- stderr "
         "---\n%s\n--- stdout ---\n%s\n"
         "--- fuzzout ---\n%s\n",
@@ -1814,7 +2678,7 @@ class Worker {
         info.history_needed, info.history_available,
         info.minimized ? "yes" : "no", info.minimization.tests,
         info.minimization.nodes_before, info.minimization.nodes_after,
-        RandomArgsText().c_str(),
+        MinimizationReportLines(info).c_str(), RandomArgsText().c_str(),
         AmplifyReportLines(info, amplified_program).c_str(),
         BundleReportLines(info).c_str(),
         Truncate(execution.stderr_output, kMaxSavedOutput).c_str(),
@@ -1920,6 +2784,16 @@ bool Fuzzer::Initialize(std::string* error) {
   for (const std::string& name : config_.minimizer_reducers) {
     minimizer_reducers_.push_back(
         minimizer_->Find(name));  // names validated by FuzzConfig::Load
+  }
+  if (config_.crash_minimizer_reducers.empty()) {
+    for (std::string_view name : Minimizer::CrashOrder()) {
+      crash_reducers_.push_back(minimizer_->Find(name));
+    }
+  } else {
+    // FuzzConfig::Load checked the names.
+    for (const std::string& name : config_.crash_minimizer_reducers) {
+      crash_reducers_.push_back(minimizer_->Find(name));
+    }
   }
   env_ = &Environment::Default();
   std::unique_ptr<Selector<Mutator>> mutator_selector =
@@ -2287,8 +3161,10 @@ Fuzzer::CrashDecision Fuzzer::RegisterCrash(uint64_t source_hash,
       decision.new_source && info.saved < config_.max_crashes_per_signature;
   decision.minimize =
       decision.save && info.minimized < config_.minimize_crashes_per_signature;
-  // Reserve the slots now so that concurrent crashes of the same signature
-  // do not all get saved/minimized; RecordCrashOutcome corrects the counts.
+  // Reserve the slots now, so that concurrent crashes of the same signature
+  // do not all get saved and minimized. RecordCrashOutcome gives back the
+  // minimize slot of a crash that Redline did not minimize. A save slot
+  // stays reserved.
   if (decision.save) {
     info.saved++;
   }
@@ -2298,24 +3174,35 @@ Fuzzer::CrashDecision Fuzzer::RegisterCrash(uint64_t source_hash,
   return decision;
 }
 
-void Fuzzer::RecordCrashOutcome(const CrashSignature& signature, bool saved,
-                                bool minimized, bool reproduced,
-                                const std::string& path) {
+void Fuzzer::RecordCrashOutcome(const CrashSignature& signature,
+                                const CrashDecision& decision, bool minimized,
+                                bool reproduced, const std::string& path) {
   std::scoped_lock<std::mutex> lock(crash_mutex_);
   SignatureInfo& info = crash_signatures_[signature.hash];
-  // RegisterCrash reserved a save slot and a minimize slot; give back the
-  // minimize slot if the minimization did not happen or failed, so the
-  // next crash of this signature gets a chance.
-  if (saved && !minimized && info.minimized > 0) {
+  // RecordCrashOutcome gives back the minimize slot of this crash if
+  // RegisterCrash reserved it and the minimization did not happen or failed.
+  // Then the next crash of this signature can use it. A crash without a slot
+  // gives back nothing.
+  if (decision.minimize && !minimized && info.minimized > 0) {
     info.minimized--;
   }
   if (reproduced) {
     info.reproduced++;
   }
-  if (saved && info.first_path.empty()) {
+  if (decision.save && info.first_path.empty()) {
     info.first_path = path;
   }
   WriteSignatureSummary();
+}
+
+bool Fuzzer::RecordCrashForTest(uint64_t source_hash,
+                                const CrashSignature& signature,
+                                bool minimization_succeeds) {
+  const CrashDecision decision = RegisterCrash(source_hash, signature);
+  RecordCrashOutcome(signature, decision,
+                     decision.minimize && minimization_succeeds,
+                     /*reproduced=*/true, "");
+  return decision.minimize;
 }
 
 // Called with crash_mutex_ held.
@@ -2481,6 +3368,8 @@ void Fuzzer::WriteStatsEvent() {
   event.Add("amplify_processes", stats_.amplify_processes.load());
   event.Add("crashes_bundled", stats_.crashes_bundled.load());
   event.Add("bundle_processes", stats_.bundle_processes.load());
+  event.Add("flag_processes", stats_.flag_processes.load());
+  event.Add("crash_min_processes", stats_.crash_min_processes.load());
   event.Add("crash_replay_executions", stats_.crash_replay_executions.load());
   event.Add("imports_total", stats_.imports_total.load());
   event.Add("imports_added", stats_.imports_added.load());
@@ -2561,6 +3450,13 @@ MinimizationResult Fuzzer::Minimize(fast::Tree* tree,
     return minimizer_->Minimize(tree, oracle, checker, options);
   }
   return minimizer_->MinimizeWith(minimizer_reducers_, tree, oracle, checker,
+                                  options);
+}
+
+MinimizationResult Fuzzer::MinimizeCrash(
+    fast::Tree* tree, const MinimizationOracle& oracle, SyntaxChecker* checker,
+    const MinimizerOptions& options) const {
+  return minimizer_->MinimizeWith(crash_reducers_, tree, oracle, checker,
                                   options);
 }
 
