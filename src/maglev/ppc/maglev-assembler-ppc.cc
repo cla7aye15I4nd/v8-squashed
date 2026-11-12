@@ -360,6 +360,22 @@ void MaglevAssembler::StringCharCodeOrCodePointAt(
     TemporaryRegisterScope temps(this);
     Register offset = temps.AcquireScratch();
 
+    if (mode == BuiltinStringPrototypeCharCodeOrCodePointAt::kCodePointAt) {
+      Register scratch = temps.AcquireScratch();
+      Label unwrap_sliced;
+      AndU32(scratch, instance_type, Operand(kOneByteStringTag), SetRC);
+      bne(&unwrap_sliced);
+      // Unwrapping a two-byte SlicedString loses its end bound; if {index} is
+      // the last code unit of the slice, fall back to the runtime before
+      // unwrapping.
+      LoadU32(instance_type,
+              FieldMemOperand(string, offsetof(String, length_)));
+      AddS32(offset, index, Operand(1));
+      CmpU32(offset, instance_type);
+      bge(deferred_runtime_call);
+      bind(&unwrap_sliced);
+    }
+
     LoadAndUntagTaggedSignedField(offset, string,
                                   offsetof(SlicedString, offset_));
     LoadTaggedField(string, string, offsetof(SlicedString, parent_));
@@ -604,9 +620,10 @@ void MaglevAssembler::TryChangeFloat64ToIndex(Register result,
 
 void MaglevAssembler::Move(ExternalReference dst, int32_t imm) {
   TemporaryRegisterScope temps(this);
-  Register scratch = temps.AcquireScratch();
-  Move(r0, imm);
-  StoreU64(r0, ExternalReferenceAsOperand(dst, scratch));
+  Register scratch_imm = temps.AcquireScratch();
+  Register scratch_dst = temps.AcquireScratch();
+  Move(scratch_imm, imm);
+  StoreU64(scratch_imm, ExternalReferenceAsOperand(dst, scratch_dst));
 }
 
 }  // namespace maglev

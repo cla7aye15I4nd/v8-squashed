@@ -219,10 +219,17 @@ NodeT* MaglevReducer<BaseT>::AddUnbufferedNewNodeNoInputConversion(
 template <typename BaseT>
 template <typename ControlNodeT, typename... Args>
 ReduceResult MaglevReducer<BaseT>::AddNewControlNode(
-    std::initializer_list<ValueNode*> inputs, Args&&... args) {
+    std::initializer_list<ValueNode*> raw_inputs, Args&&... args) {
+  static_assert(IsFixedInputNode<ControlNodeT>());
+  DCHECK_EQ(raw_inputs.size(), ControlNodeT::kInputCount);
+  // Convert inputs before creating the control node, since ControlNodeT's
+  // constructor links its BasicBlockRefs into jump_targets_ and bailing out
+  // after that would leave dangling refs.
+  std::array<ValueNode*, ControlNodeT::kInputCount> inputs;
+  RETURN_IF_ABORT(ConvertNodeInputs<ControlNodeT>(raw_inputs, inputs));
   ControlNodeT* control_node = NodeBase::New<ControlNodeT>(
       zone(), inputs.size(), std::forward<Args>(args)...);
-  RETURN_IF_ABORT(SetNodeInputs(control_node, inputs));
+  SetNodeInputsNoConversion(control_node, inputs);
   AttachEagerDeoptInfo(control_node);
   AttachDeoptCheckpoint(control_node);
   AttachLazyDeoptInfo(control_node);
@@ -372,6 +379,25 @@ ReduceResult MaglevReducer<BaseT>::ConvertInputTo(
            repr == ValueRepresentation::kFloat64);
     return input;
   }
+}
+
+template <typename BaseT>
+template <typename NodeT, typename InputsT>
+ReduceResult MaglevReducer<BaseT>::ConvertNodeInputs(
+    InputsT raw_inputs, std::array<ValueNode*, NodeT::kInputCount>& inputs) {
+  // Nodes with zero input count don't have kInputRepresentations defined.
+  if constexpr (NodeT::kInputCount > 0) {
+    constexpr UseReprHintRecording hint = ShouldRecordUseReprHint<NodeT>();
+    int i = 0;
+    for (ValueNode* raw_input : raw_inputs) {
+      DCHECK_NOT_NULL(raw_input);
+      GET_VALUE_OR_ABORT(
+          inputs[i],
+          ConvertInputTo<hint>(raw_input, NodeT::kInputRepresentations[i]));
+      i++;
+    }
+  }
+  return ReduceResult::Done();
 }
 
 template <typename BaseT>
@@ -2501,11 +2527,11 @@ template <typename BaseT>
 template <bool flip>
 MaybeReduceResult MaglevReducer<BaseT>::TryFoldToBoolean(ValueNode* value) {
   if (IsConstantNode(value->opcode())) {
-    if (value->IsAnyHoleConstant()) {
+    std::optional<bool> cst = FromConstantToBool(local_isolate(), value);
+    if (!cst.has_value()) {
       return BuildAbort(AbortReason::kUnreachable);
     }
-    return GetBooleanConstant(FromConstantToBool(local_isolate(), value) ^
-                              flip);
+    return GetBooleanConstant(*cst ^ flip);
   }
 
   switch (value->value_representation()) {
@@ -3261,9 +3287,11 @@ compiler::OptionalObjectRef MaglevReducer<BaseT>::TryFoldLoadConstantDataField(
     compiler::JSObjectRef holder,
     compiler::PropertyAccessInfo const& access_info) {
   DCHECK(!access_info.field_representation().IsDouble());
-  return holder.GetOwnFastConstantDataProperty(
+  compiler::OptionalObjectRef constant = holder.GetOwnFastConstantDataProperty(
       broker(), access_info.field_representation(), access_info.field_index(),
       broker()->dependencies());
+  CHECK_IMPLIES(constant.has_value(), !constant->IsAnyHole());
+  return constant;
 }
 
 template <typename BaseT>
@@ -4200,10 +4228,11 @@ MaybeReduceResult MaglevReducer<BaseT>::TryFoldFloat64CountLeadingZeros(
 template <typename BaseT>
 MaybeReduceResult MaglevReducer<BaseT>::TryFoldLogicalNot(ValueNode* input) {
   if (IsConstantNode(input->opcode())) {
-    if (input->IsAnyHoleConstant()) {
+    std::optional<bool> cst = FromConstantToBool(local_isolate(), input);
+    if (!cst.has_value()) {
       return BuildAbort(AbortReason::kUnreachable);
     }
-    return GetBooleanConstant(!FromConstantToBool(local_isolate(), input));
+    return GetBooleanConstant(!*cst);
   }
 
   if (auto c = TryGetConstantAlternative(input)) {

@@ -74,8 +74,7 @@ const SKIPPED_DIRECTORIES = [
   // Causes lots of failures.
   'test262',
 
-  // Unavailable debug.Debug.
-  'v8/test/debugger',
+  // Requires the inspector-test harness.
   'v8/test/inspector',
 
   // Unsupported modules.
@@ -175,7 +174,6 @@ const DISALLOWED_FLAGS = [
 
   // Disallowed due to false positives.
   '--check-handle-count',
-  '--enable-inspector',
   '--expose-debug-as',
   '--expose-natives-as',
   '--mock-arraybuffer-allocator',

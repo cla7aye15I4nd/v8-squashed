@@ -2039,6 +2039,27 @@ class AssemblerOpInterface : public Next {
   DECL_SINGLE_REP_UNARY_V(Word32SignExtend16, WordUnary, SignExtend16, Word32)
   DECL_SINGLE_REP_UNARY_V(Word64SignExtend16, WordUnary, SignExtend16, Word64)
 
+  V<Word64> Word64SignExtendLower32(ConstOrV<Word64> input) {
+    return ChangeInt32ToInt64(TruncateWord64ToWord32(input));
+  }
+
+  V<Float32> Float32CopySign(ConstOrV<Float32> lhs, ConstOrV<Float32> rhs) {
+    V<Word32> lhs_without_sign =
+        __ Word32BitwiseAnd(__ BitcastFloat32ToWord32(lhs), 0x7fffffff);
+    V<Word32> rhs_sign =
+        __ Word32BitwiseAnd(__ BitcastFloat32ToWord32(rhs), 0x80000000);
+    return __ BitcastWord32ToFloat32(
+        __ Word32BitwiseOr(lhs_without_sign, rhs_sign));
+  }
+  V<Float64> Float64CopySign(ConstOrV<Float64> lhs, ConstOrV<Float64> rhs) {
+    V<Word64> lhs_without_sign =
+        __ Word64BitwiseAnd(__ BitcastFloat64ToWord64(lhs), 0x7fffffffffffffff);
+    V<Word64> rhs_sign =
+        __ Word64BitwiseAnd(__ BitcastFloat64ToWord64(rhs), 0x8000000000000000);
+    return __ BitcastWord64ToFloat64(
+        __ Word64BitwiseOr(lhs_without_sign, rhs_sign));
+  }
+
   V<turboshaft::Tuple<Word, Word32>> OverflowCheckedUnary(
       V<Word> input, OverflowCheckedUnaryOp::Kind kind,
       WordRepresentation rep) {
@@ -5200,15 +5221,19 @@ class AssemblerOpInterface : public Next {
     return ReduceIfReachableIsNull(input, type);
   }
 
-  V<Object> AssertNotNull(V<Object> object, wasm::ValueType type,
-                          TrapId trap_id) {
+  template <typename T>
+  V<T> AssertNotNull(V<T> object, wasm::ValueType type, TrapId trap_id)
+    requires(is_subtype_v<T, Object>)
+  {
     return ReduceIfReachableAssertNotNull(object, OptionalV<EagerFrameState>{},
                                           type, trap_id);
   }
 
-  V<Object> AssertNotNull(V<Object> object,
-                          OptionalV<EagerFrameState> frame_state,
-                          wasm::ValueType type, TrapId trap_id) {
+  template <typename T>
+  V<T> AssertNotNull(V<T> object, OptionalV<EagerFrameState> frame_state,
+                     wasm::ValueType type, TrapId trap_id)
+    requires(is_subtype_v<T, Object>)
+  {
     return ReduceIfReachableAssertNotNull(object, frame_state, type, trap_id);
   }
 

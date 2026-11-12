@@ -15138,50 +15138,42 @@ MaglevGraphBuilder::BranchResult MaglevGraphBuilder::BuildBranchIfToBooleanTrue(
   // non-ToBoolean path.
   DCHECK(!node->Is<LogicalNot>());
 
-  bool known_to_boolean_value = false;
-  bool direction_is_true = true;
   if (IsConstantNode(node->opcode())) {
-    if (node->IsAnyHoleConstant()) {
+    std::optional<bool> cst = FromConstantToBool(local_isolate(), node);
+    if (!cst.has_value()) {
       return builder.BuildAbort(AbortReason::kUnreachable);
     }
-    known_to_boolean_value = true;
-    direction_is_true = FromConstantToBool(local_isolate(), node);
-  } else {
-    // TODO(victorgomes): Unify this with TestUndetectable?
-    // JSReceivers are true iff they are not marked as undetectable. Check if
-    // all maps have the same detectability, and if yes, the boolean value is
-    // known.
-    if (const NodeInfo* node_info = known_node_aspects().TryGetInfoFor(node)) {
-      if (node_info->type() == NodeType::kNone) {
-        // `node` is dead, it doesn't matter what we return.
-        // TODO(428667907): Ideally we would BuildAbort here.
-        return builder.AlwaysFalse();
+    return builder.FromBool(*cst);
+  }
+  // TODO(victorgomes): Unify this with TestUndetectable?
+  // JSReceivers are true iff they are not marked as undetectable. Check if
+  // all maps have the same detectability, and if yes, the boolean value is
+  // known.
+  if (const NodeInfo* node_info = known_node_aspects().TryGetInfoFor(node)) {
+    if (node_info->type() == NodeType::kNone) {
+      // `node` is dead, it doesn't matter what we return.
+      // TODO(428667907): Ideally we would BuildAbort here.
+      return builder.AlwaysFalse();
+    }
+    if (NodeTypeIs(node_info->type(), NodeType::kJSReceiver) &&
+        node_info->possible_maps_are_known()) {
+      bool all_detectable = true;
+      bool all_undetectable = true;
+      for (compiler::MapRef map : node_info->possible_maps()) {
+        bool is_undetectable = map.is_undetectable();
+        all_detectable &= !is_undetectable;
+        all_undetectable &= is_undetectable;
       }
-      if (NodeTypeIs(node_info->type(), NodeType::kJSReceiver) &&
-          node_info->possible_maps_are_known()) {
-        bool all_detectable = true;
-        bool all_undetectable = true;
-        for (compiler::MapRef map : node_info->possible_maps()) {
-          bool is_undetectable = map.is_undetectable();
-          all_detectable &= !is_undetectable;
-          all_undetectable &= is_undetectable;
-        }
-        if (all_detectable || all_undetectable) {
-          known_to_boolean_value = true;
-          direction_is_true = all_detectable;
-        }
-      }
-    } else if (auto alloc = node->TryCast<InlinedAllocation>()) {
-      if (alloc->object()->has_static_map()) {
-        if (alloc->object()->map()->IsJSReceiverMap()) {
-          known_to_boolean_value = true;
-          direction_is_true = !alloc->object()->map()->is_undetectable();
-        }
+      if (all_detectable || all_undetectable) {
+        return builder.FromBool(all_detectable);
       }
     }
-  }
-  if (known_to_boolean_value) {
-    return builder.FromBool(direction_is_true);
+  } else if (auto alloc = node->TryCast<InlinedAllocation>()) {
+    if (alloc->object()->has_static_map()) {
+      if (alloc->object()->map()->IsJSReceiverMap()) {
+        return builder.FromBool(!alloc->object()->map()->is_undetectable());
+      }
+    }
   }
 
   switch (node->value_representation()) {
@@ -15347,6 +15339,11 @@ ReduceResult MaglevGraphBuilder::VisitSwitchOnSmiNoFeedback() {
 
   if (offsets.size() == 0) return ReduceResult::Done();
 
+  // Convert the input before constructing BasicBlockRefs, so bailing out does
+  // not leave dangling refs in jump_targets_.
+  ValueNode* case_value;
+  GET_VALUE_OR_ABORT(case_value, GetInt32(GetAccumulator()));
+
   int case_value_base = (*offsets.begin()).case_value;
   BasicBlockRef* targets = zone()->AllocateArray<BasicBlockRef>(offsets.size());
   for (interpreter::JumpTableTargetOffset offset : offsets) {
@@ -15354,12 +15351,9 @@ ReduceResult MaglevGraphBuilder::VisitSwitchOnSmiNoFeedback() {
     new (ref) BasicBlockRef(&jump_targets_[offset.target_offset]);
   }
 
-  ValueNode* case_value = GetAccumulator();
-
-  BasicBlock* block;
-  GET_BLOCK_OR_ABORT(block, FinishBlock<Switch>({case_value}, case_value_base,
-                                                targets, offsets.size(),
-                                                &jump_targets_[next_offset()]));
+  BasicBlock* block =
+      FinishBlockNoAbort<Switch>({case_value}, case_value_base, targets,
+                                 offsets.size(), &jump_targets_[next_offset()]);
   for (interpreter::JumpTableTargetOffset offset : offsets) {
     MergeIntoFrameState(block, offset.target_offset);
   }
@@ -15747,23 +15741,23 @@ ReduceResult MaglevGraphBuilder::VisitSwitchOnGeneratorState() {
   MoveNodeBetweenRegisters(iterator_.GetRegisterOperand(0),
                            interpreter::Register::virtual_accumulator());
 
-  // Switch on generator state.
+  // Switch on generator state. Convert the input before constructing
+  // BasicBlockRefs, so bailing out does not leave dangling refs in
+  // jump_targets_.
+  ValueNode* case_value;
+  if (state->is_tagged()) {
+    GET_VALUE_OR_ABORT(case_value, AddNewNode<UnsafeSmiUntag>({state}));
+  } else {
+    GET_VALUE_OR_ABORT(case_value, GetInt32(state));
+  }
   int case_value_base = (*offsets.begin()).case_value;
   BasicBlockRef* targets = zone()->AllocateArray<BasicBlockRef>(offsets.size());
   for (interpreter::JumpTableTargetOffset offset : offsets) {
     BasicBlockRef* ref = &targets[offset.case_value - case_value_base];
     new (ref) BasicBlockRef(&jump_targets_[offset.target_offset]);
   }
-  ValueNode* case_value;
-  if (state->is_tagged()) {
-    GET_VALUE_OR_ABORT(case_value, AddNewNode<UnsafeSmiUntag>({state}));
-  } else {
-    case_value = state;
-  }
-  BasicBlock* generator_prologue_block;
-  GET_BLOCK_OR_ABORT(generator_prologue_block,
-                     FinishBlock<Switch>({case_value}, case_value_base, targets,
-                                         offsets.size()));
+  BasicBlock* generator_prologue_block = FinishBlockNoAbort<Switch>(
+      {case_value}, case_value_base, targets, offsets.size());
   for (interpreter::JumpTableTargetOffset offset : offsets) {
     MergeIntoFrameState(generator_prologue_block, offset.target_offset);
   }
@@ -16938,6 +16932,7 @@ void MaglevGraphBuilder::ProcessMergePointPredecessors(
   }
   BasicBlockRef* old_jump_targets = jump_targets.Reset();
   while (old_jump_targets != nullptr) {
+    SBXCHECK_GE(predecessor_index, 0);
     BasicBlock* predecessor = merge_state.predecessor_at(predecessor_index);
     CHECK(predecessor);
     ControlNode* control = predecessor->control_node();
