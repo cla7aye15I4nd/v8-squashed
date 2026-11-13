@@ -486,6 +486,7 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
 
   void PushAll(DoubleRegList registers, int stack_slot_size = kDoubleSize) {
     DCHECK_EQ(stack_slot_size, kDoubleSize);
+    if (registers.is_empty()) return;
     int16_t num_to_push = registers.Count();
     int16_t stack_offset = num_to_push * kDoubleSize;
 
@@ -500,6 +501,7 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
 
   void PopAll(DoubleRegList registers, int stack_slot_size = kDoubleSize) {
     DCHECK_EQ(stack_slot_size, kDoubleSize);
+    if (registers.is_empty()) return;
     int16_t stack_offset = 0;
     for (int16_t i = kNumRegisters - 1; i >= 0; i--) {
       if ((registers.bits() & (1 << i)) != 0) {
@@ -1994,6 +1996,8 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
   bool BranchAndLinkShortCheck(int32_t offset, Label* L, Condition cond,
                                Register rs, const Operand& rt);
   void BranchAndLinkLong(Label* L);
+  // An unconditional jump to a label that a conditional branch may not reach.
+  void BranchFar(Label* L);
 #if V8_TARGET_ARCH_RISCV64
   template <typename F_TYPE>
   void RoundHelper(FPURegister dst, FPURegister src, FPURegister fpu_scratch,

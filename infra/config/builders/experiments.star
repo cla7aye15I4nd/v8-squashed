@@ -16,18 +16,23 @@ def experiment_builder(**kwargs):
             notify_emails = notify_owners,
             notified_by = [builder_name],
         )
-    bucket = kwargs.pop("bucket", "ci")
+    bucket = kwargs.pop("bucket", "ci.experimental")
     properties = kwargs.pop("properties", {})
     if "builder_group" not in properties:
         properties["builder_group"] = "client.v8"
     experiments = kwargs.pop("experiments", {})
     experiments["v8.resultdb"] = 100
+
+    # Experimental builders run with a lower priority than the main
+    # CI builders (default 30) to give the main consoles precedence.
+    priority = kwargs.pop("priority", 35)
     return v8_builder(
         bucket = bucket,
         properties = properties,
         experiments = experiments,
         disable_resultdb_exports = True,
         use_siso = SISO.CHROMIUM_TRUSTED,
+        priority = priority,
         **kwargs
     )
 
@@ -67,6 +72,7 @@ in_category(
     experiment_builder(
         name = "V8 Linux64 - sticky mark bits - debug",
         parent_builder = "V8 Linux64 - sticky mark bits - debug builder",
+        parent_bucket = "ci",
         notify_owners = ["bikineev@chromium.org", "omerkatz@chromium.org"],
     ),
     experiment_builder_pair(
@@ -121,6 +127,7 @@ in_category(
     experiment_builder(
         name = "V8 Linux64 - debug - fyi",
         parent_builder = "V8 Linux64 - debug builder",
+        parent_bucket = "ci",
         execution_timeout = 19800,
         notify_owners = ["jgruber@chromium.org"],
         notifies = ["blamelist"],
@@ -136,13 +143,13 @@ in_category(
     experiment_builder(
         name = "V8 Linux64 - fyi",
         parent_builder = "V8 Linux64 - builder",
+        parent_bucket = "ci",
         execution_timeout = 19800,
         notify_owners = ["jgruber@chromium.org"],
         notifies = ["blamelist"],
     ),
     experiment_builder_pair(
         name = "V8 Linux64 - predictable",
-        bucket = "ci",
         triggered_by = ["v8-trigger"],
         dimensions = {"os": "Ubuntu-22.04", "cpu": "x86-64"},
         properties = {"builder_group": "client.v8"},
@@ -157,6 +164,7 @@ in_category(
     experiment_builder(
         name = "V8 Linux64 - dumpling",
         parent_builder = "V8 Linux64 - dumpling - builder",
+        parent_bucket = "ci",
     ),
     experiment_builder_pair(
         name = "V8 Linux - full debug",
@@ -170,7 +178,6 @@ in_category(
     experiment_builder_pair(
         name = "V8 Win64 - drumbrake - debug",
         dimensions = {"os": "Windows-10", "cpu": "x86-64"},
-        priority = 35,
         triggered_by = ["v8-trigger"],
         notify_owners = ["choongwoo.han@microsoft.com", "emromero@microsoft.com", "paolosev@microsoft.com"],
     ),

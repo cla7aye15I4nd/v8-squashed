@@ -67,7 +67,13 @@ void WriteBarrier::MarkingSlow(Tagged<HeapObject> host, HeapObjectSlot slot,
 void WriteBarrier::MarkingSlowFromCode(Tagged<HeapObject> host,
                                        MaybeObjectSlot slot,
                                        Tagged<MaybeObject> value) {
-  Tagged<HeapObject> value_heap_object = value.GetHeapObject();
+  // Although generated code filters out Smis before calling the write barrier,
+  // `MarkingFromCode` and `SharedMarkingFromCode` reload `*slot` from memory,
+  // which may have been concurrently overwritten with a Smi on shared objects.
+  Tagged<HeapObject> value_heap_object;
+  if (!value.GetHeapObject(&value_heap_object)) {
+    return;
+  }
   // This barrier is called from generated code.
   // There must be no stores of InstructionStream values from generated code and
   // all stores of InstructionStream values in C++ must be handled by
@@ -520,7 +526,6 @@ void ForRangeImpl(Heap* heap, MemoryChunk* source_chunk,
     marking_barrier = WriteBarrier::CurrentMarkingBarrier(object);
   }
 
-  MarkCompactCollector* collector = heap->mark_compact_collector();
   MutablePage* source_page_metadata =
       SbxCast<MutablePage>(source_chunk->Metadata());
 
@@ -565,8 +570,8 @@ void ForRangeImpl(Heap* heap, MemoryChunk* source_chunk,
     if (kModeMask & kDoMarking) {
       marking_barrier->MarkValue(object, value_heap_object);
       if (kModeMask & kDoEvacuationSlotRecording) {
-        collector->RecordSlot(source_chunk, HeapObjectSlot(slot),
-                              value_heap_object);
+        MarkCompactCollector::RecordSlot(source_chunk, HeapObjectSlot(slot),
+                                         value_heap_object);
       }
     }
   }
@@ -658,7 +663,7 @@ void WriteBarrier::VerifyDispatchHandleWriteBarrier(Tagged<HeapObject> host,
     VerifySkipWriteBarrier(host, value, mode);
 
     // Now check the barrier for the handle itself
-    if (jdt.InReadOnlySegment(handle)) {
+    if (JSDispatchTable::InReadOnlySegment(handle)) {
       return;
     }
     if (IsMostRecentYoungAllocation(host->address())) {

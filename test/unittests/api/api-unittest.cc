@@ -3399,23 +3399,6 @@ THREADED_TEST(ApiTest, InternalFieldsAlignedPointers) {
                isolate, traced, 0, i::kTagForTesting));
 }
 
-static void CheckAlignedPointerInEmbedderData(LocalContext* env,
-                                              v8::Local<v8::Object> some_obj,
-                                              int index, void* value) {
-  CHECK_EQ(0, static_cast<int>(reinterpret_cast<uintptr_t>(value) & 0x1));
-  START_ALLOW_USE_DEPRECATED()
-  // TODO(b/570436596): Migrate to V2.
-  (*env)->SetAlignedPointerInEmbedderData(index, value, kTestTypeTagA);
-  END_ALLOW_USE_DEPRECATED()
-  i::InvokeMajorGC(i::Isolate::Current());
-  CHECK_EQ(value,
-           (*env)->GetAlignedPointerFromEmbedderData(index, kTestTypeTagA));
-  CHECK_EQ(value, some_obj->GetAlignedPointerFromEmbedderDataInCreationContext(
-                      index, kTestTypeTagA));
-  CHECK_EQ(value, some_obj->GetAlignedPointerFromEmbedderDataInCreationContext(
-                      v8::Isolate::GetCurrent(), index, kTestTypeTagA));
-}
-
 static void CheckAlignedPointerInEmbedderDataV2(LocalContext* env,
                                                 v8::Local<v8::Object> some_obj,
                                                 int index, void* value) {
@@ -3428,51 +3411,6 @@ static void CheckAlignedPointerInEmbedderDataV2(LocalContext* env,
                       index, kTestTypeTagA));
   CHECK_EQ(value, some_obj->GetAlignedPointerFromEmbedderDataInCreationContext(
                       v8::Isolate::GetCurrent(), index, kTestTypeTagA));
-}
-
-static void* AlignedTestPointer(int i) {
-  return reinterpret_cast<void*>(i * 1234);
-}
-
-THREADED_TEST(ApiTest, EmbedderDataAlignedPointers) {
-  LocalContext env;
-  v8::Isolate* isolate = env.isolate();
-  v8::HandleScope scope(isolate);
-
-  v8::Local<v8::Object> obj = v8::Object::New(isolate);
-
-  CheckAlignedPointerInEmbedderData(&env, obj, 0, nullptr);
-  CHECK_LE(1, (*env)->GetNumberOfEmbedderDataFields());
-
-  int* heap_allocated = new int[100];
-  CheckAlignedPointerInEmbedderData(&env, obj, 1, heap_allocated);
-  CHECK_LE(2, (*env)->GetNumberOfEmbedderDataFields());
-  delete[] heap_allocated;
-
-  int stack_allocated[100];
-  CheckAlignedPointerInEmbedderData(&env, obj, 2, stack_allocated);
-  CHECK_LE(3, (*env)->GetNumberOfEmbedderDataFields());
-
-  // The aligned pointer must have the top bits be zero on 64-bit machines (at
-  // least if the sandboxed external pointers are enabled).
-  void* huge = reinterpret_cast<void*>(0x0000fffffffffffe);
-  CheckAlignedPointerInEmbedderData(&env, obj, 3, huge);
-  CHECK_LE(4, (*env)->GetNumberOfEmbedderDataFields());
-
-  // Test growing of the embedder data's backing store.
-  for (int i = 0; i < 100; i++) {
-    START_ALLOW_USE_DEPRECATED()
-    // TODO(b/570436596): Migrate to V2.
-    env->SetAlignedPointerInEmbedderData(i, AlignedTestPointer(i),
-                                         i % V8_EMBEDDER_DATA_TAG_COUNT);
-    END_ALLOW_USE_DEPRECATED()
-  }
-  i::InvokeMajorGC(i::Isolate::Current());
-  for (int i = 0; i < 100; i++) {
-    v8::SealHandleScope no_handle_leak(env.isolate());
-    CHECK_EQ(AlignedTestPointer(i), env->GetAlignedPointerFromEmbedderData(
-                                        i, i % V8_EMBEDDER_DATA_TAG_COUNT));
-  }
 }
 
 THREADED_TEST(ApiTest, EmbedderDataAlignedPointersV2) {
@@ -3495,36 +3433,6 @@ THREADED_TEST(ApiTest, EmbedderDataAlignedPointersV2) {
   // least if the sandboxed external pointers are enabled).
   void* huge = reinterpret_cast<void*>(0x0000fffffffffffe);
   CheckAlignedPointerInEmbedderDataV2(&env, obj, 3, huge);
-}
-
-THREADED_TEST(ApiTest, EmbedderDataAlignedPointersViaDetachedGlobal) {
-  LocalContext env;
-  v8::Isolate* isolate = env.isolate();
-  v8::HandleScope scope(isolate);
-
-  v8::Local<v8::Object> obj = env->Global();
-
-  CheckAlignedPointerInEmbedderData(&env, obj, 0, nullptr);
-  CHECK_LE(1, (*env)->GetNumberOfEmbedderDataFields());
-
-  int stack_allocated[100];
-  CheckAlignedPointerInEmbedderData(&env, obj, 1, stack_allocated);
-  CHECK_LE(2, (*env)->GetNumberOfEmbedderDataFields());
-
-  i::InvokeMajorGC(i::Isolate::Current());
-
-  CHECK_EQ(stack_allocated,
-           obj->GetAlignedPointerFromEmbedderDataInCreationContext(
-               isolate, 1, kTestTypeTagA));
-
-  env->DetachGlobal();
-
-  // In case the global object is detached the embedder data can be read
-  // directly from current native context as long as its global object IS the
-  // detached global object.
-  CHECK_EQ(stack_allocated,
-           obj->GetAlignedPointerFromEmbedderDataInCreationContext(
-               isolate, 1, kTestTypeTagA));
 }
 
 THREADED_TEST(ApiTest, EmbedderDataAlignedPointersViaDetachedGlobalV2) {
@@ -3555,38 +3463,11 @@ THREADED_TEST(ApiTest, EmbedderDataAlignedPointersViaDetachedGlobalV2) {
                isolate, 1, kTestTypeTagA));
 }
 
-static void CheckEmbedderData(LocalContext* env, int index,
-                              v8::Local<Value> data) {
-  START_ALLOW_USE_DEPRECATED()
-  // TODO(b/570436596): Migrate to V3.
-  (*env)->SetEmbedderDataV2(index, data);
-  END_ALLOW_USE_DEPRECATED()
-  CHECK(v8::Local<v8::Value>::Cast((*env)->GetEmbedderDataV2(index))
-            ->StrictEquals(data));
-}
-
 static void CheckEmbedderDataV3(LocalContext* env, int index,
                                 v8::Local<Value> data) {
   (*env)->SetEmbedderDataV3(index, data);
   CHECK(v8::Local<v8::Value>::Cast((*env)->GetEmbedderDataV2(index))
             ->StrictEquals(data));
-}
-
-THREADED_TEST(ApiTest, EmbedderData) {
-  LocalContext env;
-  v8::Isolate* isolate = env.isolate();
-  v8::HandleScope scope(isolate);
-
-  CheckEmbedderData(&env, 3, v8_str("The quick brown fox jumps"));
-  CHECK_LE(4, (*env)->GetNumberOfEmbedderDataFields());
-  CheckEmbedderData(&env, 2, v8_str("over the lazy dog."));
-  CHECK_LE(4, (*env)->GetNumberOfEmbedderDataFields());
-  CheckEmbedderData(&env, 1, v8::Number::New(isolate, 1.2345));
-  CHECK_LE(4, (*env)->GetNumberOfEmbedderDataFields());
-  CheckEmbedderData(&env, 0, v8::Boolean::New(isolate, true));
-  CHECK_LE(4, (*env)->GetNumberOfEmbedderDataFields());
-  CheckEmbedderData(&env, 211, v8::Boolean::New(isolate, true));
-  CHECK_EQ(212, (*env)->GetNumberOfEmbedderDataFields());
 }
 
 THREADED_TEST(ApiTest, EmbedderDataV3) {
@@ -5330,7 +5211,8 @@ THREADED_TEST(ApiTest, CurrentStackTraceHasUniqueIDs) {
 
 // Callback that filters frames
 bool IsScriptFrameAllowed(v8::Isolate* isolate,
-                          v8::Local<v8::String> script_name) {
+                          v8::Local<v8::String> script_name,
+                          bool is_shared_cross_origin) {
   CHECK(!script_name.IsEmpty());
 
   v8::String::Utf8Value script_name_value(isolate, script_name);
@@ -5360,12 +5242,33 @@ void GetCurrentFilteredStackTrace(
   GetCurrentStackTraceImpl(args, true);
 }
 
+void GetCurrentStackTraceWithOriginFilter(
+    const v8::FunctionCallbackInfo<v8::Value>& args) {
+  std::stringstream ss;
+  v8::Message::PrintCurrentStackTrace(
+      args.GetIsolate(), ss,
+      [](v8::Isolate*, v8::Local<v8::String>, bool is_shared_cross_origin) {
+        return is_shared_cross_origin;
+      });
+  args.GetReturnValue().Set(v8_str(ss.str().c_str()));
+}
+
+void GetCurrentStackTraceWithNullFilter(
+    const v8::FunctionCallbackInfo<v8::Value>& args) {
+  std::stringstream ss;
+  v8::Message::PrintCurrentStackTrace(args.GetIsolate(), ss, nullptr);
+  args.GetReturnValue().Set(v8_str(ss.str().c_str()));
+}
+
 THREADED_TEST(ApiTest, MessagePrintCurrentStackTrace) {
   v8::Isolate* isolate = v8::Isolate::GetCurrent();
   v8::HandleScope scope(isolate);
   Local<ObjectTemplate> templ = ObjectTemplate::New(isolate);
   templ->Set(isolate, "getCurrentStackTrace",
              v8::FunctionTemplate::New(isolate, GetCurrentStackTrace));
+  templ->Set(
+      isolate, "getCurrentStackTraceWithNullFilter",
+      v8::FunctionTemplate::New(isolate, GetCurrentStackTraceWithNullFilter));
   LocalContext context(nullptr, templ);
 
   v8::ScriptOrigin origin = v8::ScriptOrigin(v8_str("test"), 0, 0);
@@ -5396,6 +5299,158 @@ THREADED_TEST(ApiTest, MessagePrintCurrentStackTrace) {
       "a (test:8:10)\n"
       "test:10:1");
   CHECK_EQ(stack_trace_string, expected);
+
+  v8::Local<v8::Value> null_filter_stack_trace =
+      v8::Script::Compile(context.local(),
+                          v8_str("getCurrentStackTraceWithNullFilter();"),
+                          &origin)
+          .ToLocalChecked()
+          ->Run(context.local())
+          .ToLocalChecked();
+  CHECK(null_filter_stack_trace->IsString());
+  v8::String::Utf8Value null_filter_stack_trace_value(isolate,
+                                                      null_filter_stack_trace);
+  std::string null_filter_stack_trace_string(*null_filter_stack_trace_value);
+  CHECK(null_filter_stack_trace_string.find("<redacted>") == std::string::npos);
+  CHECK_NE(null_filter_stack_trace_string.find("test:1:1"), std::string::npos);
+}
+
+THREADED_TEST(ApiTest, MessagePrintCurrentStackTraceWithScriptOriginFiltering) {
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  v8::HandleScope scope(isolate);
+  Local<ObjectTemplate> templ = ObjectTemplate::New(isolate);
+  templ->Set(
+      isolate, "getCurrentStackTrace",
+      v8::FunctionTemplate::New(isolate, GetCurrentStackTraceWithOriginFilter));
+  LocalContext context(nullptr, templ);
+
+  for (bool is_shared_cross_origin : {false, true}) {
+    v8::ScriptOrigin origin(v8_str("test.js"), 0, 0, is_shared_cross_origin);
+    for (bool is_eval : {false, true}) {
+      const char* source = is_eval ? "eval('function inner() { return "
+                                     "getCurrentStackTrace(); } inner();')"
+                                   : "function inner() {\n"
+                                     "  return getCurrentStackTrace();\n"
+                                     "}\n"
+                                     "inner();";
+      Local<Value> result =
+          v8::Script::Compile(context.local(), v8_str(source), &origin)
+              .ToLocalChecked()
+              ->Run(context.local())
+              .ToLocalChecked();
+      CHECK(result->IsString());
+      v8::String::Utf8Value result_string(isolate, result);
+      std::string stack(*result_string);
+      if (!is_shared_cross_origin) {
+        CHECK_EQ(stack, is_eval ? "<redacted>\n<redacted>\n<redacted>"
+                                : "<redacted>\n<redacted>");
+      } else if (is_eval) {
+        CHECK_NE(std::string::npos, stack.find("inner"));
+        CHECK_EQ(std::string::npos, stack.find("<redacted>"));
+      } else {
+        CHECK_EQ(stack, "inner (test.js:2:10)\ntest.js:4:1");
+      }
+    }
+  }
+
+  v8::ScriptOrigin unshared_origin(v8_str("unshared.js"));
+  v8::Script::Compile(
+      context.local(),
+      v8_str("function inner() { return getCurrentStackTrace(); }"),
+      &unshared_origin)
+      .ToLocalChecked()
+      ->Run(context.local())
+      .ToLocalChecked();
+  v8::ScriptOrigin shared_origin(v8_str("shared.js"), 0, 0, true);
+  Local<Value> mixed_result = v8::Script::Compile(context.local(),
+                                                  v8_str("function outer() {\n"
+                                                         "  return inner();\n"
+                                                         "}\n"
+                                                         "outer();"),
+                                                  &shared_origin)
+                                  .ToLocalChecked()
+                                  ->Run(context.local())
+                                  .ToLocalChecked();
+  CHECK(mixed_result->IsString());
+  v8::String::Utf8Value mixed_stack(isolate, mixed_result);
+  CHECK_EQ(std::string(*mixed_stack),
+           "<redacted>\nouter (shared.js:2:10)\nshared.js:4:1");
+}
+
+THREADED_TEST(ApiTest, MessagePrintCurrentStackTraceWithBuiltinFrames) {
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  v8::HandleScope scope(isolate);
+  for (bool filter_by_origin : {false, true}) {
+    Local<ObjectTemplate> templ = ObjectTemplate::New(isolate);
+    templ->Set(
+        isolate, "getCurrentStackTrace",
+        v8::FunctionTemplate::New(
+            isolate, filter_by_origin ? GetCurrentStackTraceWithOriginFilter
+                                      : GetCurrentFilteredStackTrace));
+    LocalContext context(nullptr, templ);
+    for (bool is_shared_cross_origin : {false, true}) {
+      v8::ScriptOrigin origin(v8_str("test.js"), 0, 0, is_shared_cross_origin);
+      Local<Value> result =
+          v8::Script::Compile(context.local(),
+                              v8_str("var stack;\n"
+                                     "[0].forEach(function inner() {\n"
+                                     "  stack = getCurrentStackTrace();\n"
+                                     "});\n"
+                                     "stack;"),
+                              &origin)
+              .ToLocalChecked()
+              ->Run(context.local())
+              .ToLocalChecked();
+      CHECK(result->IsString());
+      v8::String::Utf8Value stack(isolate, result);
+      if (!filter_by_origin) {
+        CHECK_EQ(std::string(*stack),
+                 "inner (test.js:3:11)\nArray.forEach (<anonymous>)\n"
+                 "test.js:2:5");
+      } else if (is_shared_cross_origin) {
+        CHECK_EQ(std::string(*stack),
+                 "inner (test.js:3:11)\nArray.forEach (<anonymous>)\n"
+                 "test.js:2:5");
+      } else {
+        CHECK_EQ(std::string(*stack), "<redacted>\n<redacted>\n<redacted>");
+      }
+    }
+  }
+
+  Local<ObjectTemplate> templ = ObjectTemplate::New(isolate);
+  templ->Set(
+      isolate, "getCurrentStackTrace",
+      v8::FunctionTemplate::New(isolate, GetCurrentStackTraceWithOriginFilter));
+  LocalContext context(nullptr, templ);
+  v8::ScriptOrigin unshared_origin(v8_str("unshared.js"));
+  v8::Script::Compile(context.local(),
+                      v8_str("function inner() {\n"
+                             "  var stack;\n"
+                             "  [0].forEach(function callback() {\n"
+                             "    stack = getCurrentStackTrace();\n"
+                             "  });\n"
+                             "  return stack;\n"
+                             "}\n"),
+                      &unshared_origin)
+      .ToLocalChecked()
+      ->Run(context.local())
+      .ToLocalChecked();
+  v8::ScriptOrigin shared_origin(v8_str("shared.js"), 0, 0, true);
+  Local<Value> mixed_result = v8::Script::Compile(context.local(),
+                                                  v8_str("function outer() {\n"
+                                                         "  return inner();\n"
+                                                         "}\n"
+                                                         "outer();"),
+                                                  &shared_origin)
+                                  .ToLocalChecked()
+                                  ->Run(context.local())
+                                  .ToLocalChecked();
+  CHECK(mixed_result->IsString());
+  v8::String::Utf8Value mixed_stack(isolate, mixed_result);
+  const std::string mixed_stack_string(*mixed_stack);
+  CHECK_EQ(0u, mixed_stack_string.find(
+                   "<redacted>\n<redacted>\n<redacted>\nouter (shared.js:"));
+  CHECK_EQ(std::string::npos, mixed_stack_string.find("unshared.js"));
 }
 
 THREADED_TEST(ApiTest, MessagePrintCurrentStackTraceWithFiltering) {
@@ -14485,8 +14540,7 @@ TEST_F(ApiTest, WasmSetJitCodeEventHandler) {
   // Add (unreached) endless recursion to prevent fully inling "f". Otherwise we
   // won't have source positions and will miss the
   // {CODE_END_LINE_INFO_RECORDING} event.
-  TestSignatures sigs;
-  auto& f = r.NewFunction(sigs.i_i(), "f");
+  auto& f = r.NewFunction(TestSignatures::i_i(), "f");
   f.Build({WASM_IF(WASM_I32_EQZ(WASM_LOCAL_GET(0)),
                    WASM_LOCAL_SET(0, WASM_CALL_FUNCTION(f.function_index(),
                                                         WASM_LOCAL_GET(0)))),
@@ -32534,73 +32588,6 @@ TEST_F(ApiTest, ContinuationPreservedEmbedderData_CppHeapExternal) {
                 isolate, v8::CppHeapPointerTagRange(i::kTagForTesting,
                                                     i::kTagForTesting));
     CHECK_EQ(data, cpp_object.Get());
-  }
-
-  isolate->Exit();
-  isolate->Dispose();
-}
-
-TEST_F(ApiTest, EmbedderDataAlignedPointers_CppHeapPointer) {
-  v8::Isolate::CreateParams create_params = CreateTestParams();
-  create_params.cpp_heap =
-      v8::CppHeap::Create(::v8::internal::V8::GetCurrentPlatform(),
-                          v8::CppHeapCreateParams({}))
-          .release();
-  v8::Isolate* isolate = v8::Isolate::New(create_params);
-  isolate->Enter();
-  v8::CppHeap* cpp_heap = isolate->GetCppHeap();
-
-  {
-    v8::HandleScope scope(isolate);
-    LocalContext env(isolate);
-    v8::Local<v8::Object> obj = v8::Object::New(isolate);
-
-    cppgc::Persistent<TestGarbagedCollectedData> cpp_object(
-        cppgc::MakeGarbageCollected<TestGarbagedCollectedData>(
-            cpp_heap->GetAllocationHandle()));
-
-    // Null pointer test.
-    START_ALLOW_USE_DEPRECATED()
-    // TODO(b/570436596): Migrate to V2.
-    (*env)->SetAlignedPointerInEmbedderData(
-        0, static_cast<TestGarbagedCollectedData*>(nullptr), i::kTagForTesting);
-    END_ALLOW_USE_DEPRECATED()
-    CHECK_EQ(
-        nullptr,
-        (*env)->GetAlignedPointerFromEmbedderData<TestGarbagedCollectedData>(
-            isolate, 0, i::kTagForTesting));
-    CHECK_EQ(nullptr, obj->GetAlignedPointerFromEmbedderDataInCreationContext(
-                          isolate, 0, i::kTagForTesting));
-
-    // Valid cppgc object test.
-    START_ALLOW_USE_DEPRECATED()
-    // TODO(b/570436596): Migrate to V2.
-    (*env)->SetAlignedPointerInEmbedderData(1, cpp_object.Get(),
-                                            i::kTagForTesting);
-    END_ALLOW_USE_DEPRECATED()
-    CHECK_EQ(
-        cpp_object.Get(),
-        (*env)->GetAlignedPointerFromEmbedderData<TestGarbagedCollectedData>(
-            isolate, 1, i::kTagForTesting));
-    CHECK_EQ(cpp_object.Get(),
-             obj->GetAlignedPointerFromEmbedderDataInCreationContext(
-                 isolate, 1, i::kTagForTesting));
-
-    // Detached global proxy test.
-    v8::Local<v8::Object> global_obj = env->Global();
-    START_ALLOW_USE_DEPRECATED()
-    // TODO(b/570436596): Migrate to V2.
-    (*env)->SetAlignedPointerInEmbedderData(2, cpp_object.Get(),
-                                            i::kTagForTesting);
-    END_ALLOW_USE_DEPRECATED()
-    CHECK_EQ(cpp_object.Get(),
-             global_obj->GetAlignedPointerFromEmbedderDataInCreationContext(
-                 isolate, 2, i::kTagForTesting));
-
-    env->DetachGlobal();
-    CHECK_EQ(cpp_object.Get(),
-             global_obj->GetAlignedPointerFromEmbedderDataInCreationContext(
-                 isolate, 2, i::kTagForTesting));
   }
 
   isolate->Exit();

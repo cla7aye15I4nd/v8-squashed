@@ -100,6 +100,10 @@
 #include "src/maglev/maglev-concurrent-dispatcher.h"
 #endif  // V8_ENABLE_MAGLEV
 
+#ifdef V8_ENABLE_SPARKPLUG
+#include "src/baseline/baseline-batch-compiler.h"
+#endif  // V8_ENABLE_SPARKPLUG
+
 #ifdef V8_ENABLE_PARTITION_ALLOC
 #include "third_party/partition_alloc/src/partition_alloc/partition_alloc.h"
 #include "third_party/partition_alloc/src/partition_alloc/partition_root.h"
@@ -3711,6 +3715,7 @@ void Shell::ResetIsolateStateForReprl(Isolate* isolate) {
 #ifdef V8_ENABLE_ALLOCATION_TIMEOUT
   i_isolate->heap()->ResetAllocationTimeouts();
 #endif  // V8_ENABLE_ALLOCATION_TIMEOUT
+  i_isolate->heap()->reset_stress_compaction_gc_count();
 #ifdef DEBUG
   if (i::v8_flags.inline_new) {
     i_isolate->heap()->EnableInlineAllocation();
@@ -3721,6 +3726,9 @@ void Shell::ResetIsolateStateForReprl(Isolate* isolate) {
 
   ResetOnProfileEndListener(isolate);
   v8::debug::SetDebugDelegate(isolate, nullptr);
+#ifdef V8_ENABLE_SPARKPLUG
+  i_isolate->baseline_batch_compiler()->FlushForTesting();
+#endif  // V8_ENABLE_SPARKPLUG
 }
 
 void Shell::ProfilerTriggerSample(
@@ -3730,7 +3738,7 @@ void Shell::ProfilerTriggerSample(
   D8Console* console =
       reinterpret_cast<D8Console*>(i_isolate->console_delegate());
   if (console && console->profiler()) {
-    console->profiler()->CollectSample(isolate);
+    v8::CpuProfiler::CollectSample(isolate);
   }
 }
 

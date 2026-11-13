@@ -2681,6 +2681,8 @@ static RegList a_regs = {a0, a1, a2, a3, a4, a5, a6, a7};
 static RegList s_regs = {s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11};
 
 void MacroAssembler::MultiPush(RegList regs) {
+  // Nothing to push would otherwise still adjust sp by zero.
+  if (regs.is_empty()) return;
   int16_t num_to_push = regs.Count();
   int16_t stack_offset = num_to_push * kSystemPointerSize;
 
@@ -2728,6 +2730,7 @@ void MacroAssembler::MultiPush(RegList regs) {
 }
 
 void MacroAssembler::MultiPop(RegList regs) {
+  if (regs.is_empty()) return;
   int16_t stack_offset = 0;
 
 #define TEST_AND_POP_REG(reg)                    \
@@ -2769,6 +2772,7 @@ void MacroAssembler::MultiPop(RegList regs) {
 }
 
 void MacroAssembler::MultiPushFPU(DoubleRegList regs) {
+  if (regs.is_empty()) return;
   int16_t num_to_push = regs.Count();
   int16_t stack_offset = num_to_push * kDoubleSize;
 
@@ -2782,6 +2786,7 @@ void MacroAssembler::MultiPushFPU(DoubleRegList regs) {
 }
 
 void MacroAssembler::MultiPopFPU(DoubleRegList regs) {
+  if (regs.is_empty()) return;
   int16_t stack_offset = 0;
 
   for (int16_t i = 0; i < kNumRegisters; i++) {
@@ -3951,7 +3956,7 @@ void MacroAssembler::BranchTrueF(Register rs, Label* target) {
   if (long_branch) {
     Label skip;
     BranchFalseShortF(rs, &skip);
-    BranchLong(target);
+    BranchFar(target);
     bind(&skip);
   } else {
     BranchTrueShortF(rs, target);
@@ -3964,7 +3969,7 @@ void MacroAssembler::BranchFalseF(Register rs, Label* target) {
   if (long_branch) {
     Label skip;
     BranchTrueShortF(rs, &skip);
-    BranchLong(target);
+    BranchFar(target);
     bind(&skip);
   } else {
     BranchFalseShortF(rs, target);
@@ -4542,18 +4547,10 @@ void MacroAssembler::Branch(int32_t offset, Condition cond, Register rs,
 }
 
 void MacroAssembler::Branch(Label* L) {
-  if (L->is_bound()) {
-    if (is_near(L)) {
-      BranchShort(L);
-    } else {
-      BranchLong(L);
-    }
+  if (L->is_bound() && is_near(L)) {
+    BranchShort(L);
   } else {
-    if (is_trampoline_emitted()) {
-      BranchLong(L);
-    } else {
-      BranchShort(L);
-    }
+    BranchFar(L);
   }
 }
 
@@ -4574,7 +4571,7 @@ void MacroAssembler::Branch(Label* L, Condition cond, Register rs,
     // We either have a branch backward to a position too far away to reach with
     // a short branch - or a branch forward where we are unable to go through
     // the trampoline pool because it has already been emitted.
-    BranchLong(L);
+    BranchFar(L);
     return;
   }
 
@@ -4588,7 +4585,7 @@ void MacroAssembler::Branch(Label* L, Condition cond, Register rs,
   // constant pool entry or constructing a complex immediate.
   Label skip;
   BranchShort(&skip, NegateCondition(cond), rs, rt);
-  BranchLong(L);
+  BranchFar(L);
   bind(&skip);
 }
 
@@ -5496,6 +5493,22 @@ void MacroAssembler::BranchLong(Label* L) {
   }
 }
 
+void MacroAssembler::BranchFar(Label* L) {
+  // A pool emitted here would only move the jump away from the label.
+  BlockPoolsScope block_pools(this);
+  // A jump to a label not yet bound is a jal: before the trampoline pool it
+  // can go through the pool, and after it the assembler emits a far-jump pool
+  // in reach of it. The jal also links to the label's previous use, which
+  // has to be in reach too, and BranchLong's auipc+jr reaches anything.
+  if (!L->is_bound() && !v8_flags.force_long_branches &&
+      (!L->is_linked() ||
+       is_intn(L->pos() - pc_offset(), Assembler::kJumpOffsetBits))) {
+    BranchShort(L);
+  } else {
+    BranchLong(L);
+  }
+}
+
 void MacroAssembler::BranchAndLinkLong(Label* L) {
   // Generate position independent long branch and link.
   BlockPoolsScope block_pools(this);
@@ -5503,7 +5516,8 @@ void MacroAssembler::BranchAndLinkLong(Label* L) {
   imm = branch_long_offset(L);
   if (L->is_bound() && is_intn(imm, Assembler::kJumpOffsetBits) &&
       (imm & 1) == 0) {
-    jal(t6, imm);
+    // This is a call, so write the return address to ra.
+    jal(imm);
     return;
   }
   GenPCRelativeJumpAndLink(t6, imm, block_pools);
@@ -6272,16 +6286,20 @@ void MacroAssembler::AddOverflowWord(Register dst, Register left,
   DCHECK(left != scratch2 && right_reg != scratch2 && dst != scratch2 &&
          overflow != scratch2);
   DCHECK(overflow != left && overflow != right_reg);
+  // The Xor into scratch goes first so that the Xor into overflow and the
+  // And that consumes it are adjacent, a pair cores such as the SpacemiT X100
+  // fuse. That writes scratch before left is read.
+  DCHECK(left != scratch);
   if (dst == left || dst == right_reg) {
     AddWord(scratch2, left, right_reg);
-    Xor(overflow, scratch2, left);
     Xor(scratch, scratch2, right_reg);
+    Xor(overflow, scratch2, left);
     And(overflow, overflow, scratch);
     Mv(dst, scratch2);
   } else {
     AddWord(dst, left, right_reg);
-    Xor(overflow, dst, left);
     Xor(scratch, dst, right_reg);
+    Xor(overflow, dst, left);
     And(overflow, overflow, scratch);
   }
 }
@@ -6303,17 +6321,19 @@ void MacroAssembler::SubOverflowWord(Register dst, Register left,
   DCHECK(left != scratch2 && right_reg != scratch2 && dst != scratch2 &&
          overflow != scratch2);
   DCHECK(overflow != left && overflow != right_reg);
+  // See AddOverflowWord for the order of the Xors.
+  DCHECK(left != scratch);
 
   if (dst == left || dst == right_reg) {
     SubWord(scratch2, left, right_reg);
-    Xor(overflow, left, scratch2);
     Xor(scratch, left, right_reg);
+    Xor(overflow, left, scratch2);
     And(overflow, overflow, scratch);
     Mv(dst, scratch2);
   } else {
     SubWord(dst, left, right_reg);
-    Xor(overflow, left, dst);
     Xor(scratch, left, right_reg);
+    Xor(overflow, left, dst);
     And(overflow, overflow, scratch);
   }
 }
@@ -6334,17 +6354,19 @@ void MacroAssembler::AddOverflow32(Register dst, Register left,
   DCHECK(left != scratch2 && right_reg != scratch2 && dst != scratch2 &&
          overflow != scratch2);
   DCHECK(overflow != left && overflow != right_reg);
+  // See AddOverflowWord for the order of the Xors.
+  DCHECK(left != scratch);
   if (dst == left || dst == right_reg) {
     Add32(scratch2, left, right_reg);
-    Xor(overflow, scratch2, left);
     Xor(scratch, scratch2, right_reg);
+    Xor(overflow, scratch2, left);
     And(overflow, overflow, scratch);
     sext_w(overflow, overflow);
     Mv(dst, scratch2);
   } else {
     Add32(dst, left, right_reg);
-    Xor(overflow, dst, left);
     Xor(scratch, dst, right_reg);
+    Xor(overflow, dst, left);
     And(overflow, overflow, scratch);
     sext_w(overflow, overflow);
   }
@@ -6367,18 +6389,20 @@ void MacroAssembler::SubOverflow32(Register dst, Register left,
   DCHECK(left != scratch2 && right_reg != scratch2 && dst != scratch2 &&
          overflow != scratch2);
   DCHECK(overflow != left && overflow != right_reg);
+  // See AddOverflowWord for the order of the Xors.
+  DCHECK(left != scratch);
 
   if (dst == left || dst == right_reg) {
     Sub32(scratch2, left, right_reg);
-    Xor(overflow, left, scratch2);
     Xor(scratch, left, right_reg);
+    Xor(overflow, left, scratch2);
     And(overflow, overflow, scratch);
     sext_w(overflow, overflow);
     Mv(dst, scratch2);
   } else {
     Sub32(dst, left, right_reg);
-    Xor(overflow, left, dst);
     Xor(scratch, left, right_reg);
+    Xor(overflow, left, dst);
     And(overflow, overflow, scratch);
     sext_w(overflow, overflow);
   }

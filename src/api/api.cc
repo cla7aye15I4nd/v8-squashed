@@ -965,25 +965,17 @@ static_assert(i::Internals::kEmbedderDataSlotCppHeapPointerOffset ==
               i::EmbedderDataSlot::kCppHeapPointerOffset);
 
 static i::DirectHandle<i::EmbedderDataArray> EmbedderDataFor(
-    Context* context, int index, bool can_grow, const char* location) {
+    Context* context, int index, const char* location) {
   auto env = Utils::OpenDirectHandle(context);
   i::Isolate* i_isolate = i::Isolate::Current();
   i::DisallowJavascriptExecutionDebugOnly no_execution(i_isolate);
   i::DisallowExceptionsDebugOnly no_exceptions(i_isolate);
-  bool ok = Utils::ApiCheck(i::IsNativeContext(*env), location,
-                            "Not a native context") &&
-            Utils::ApiCheck(index >= 0, location, "Negative index");
-  if (!ok) return {};
+  Utils::ApiCheck(i::IsNativeContext(*env), location, "Not a native context");
+  Utils::ApiCheck(index >= 0, location, "Negative index");
   // TODO(ishell): remove cast once embedder_data slot has a proper type.
   i::DirectHandle<i::EmbedderDataArray> data(
       i::Cast<i::EmbedderDataArray>(env->embedder_data()), i_isolate);
-  if (index < data->length()) return data;
-  if (!Utils::ApiCheck(can_grow && index < i::kEmbedderDataArrayMaxLength,
-                       location, "Index too large")) {
-    return {};
-  }
-  data = i::EmbedderDataArray::EnsureCapacity(i_isolate, data, index);
-  env->set_embedder_data(*data);
+  Utils::ApiCheck(index < data->length(), location, "Index too large");
   return data;
 }
 
@@ -1002,49 +994,27 @@ uint32_t Context::GetNumberOfEmbedderDataFields() {
 v8::Local<v8::Value> Context::SlowGetEmbedderData(int index) {
   const char* location = "v8::Context::GetEmbedderData()";
   i::DirectHandle<i::EmbedderDataArray> data =
-      EmbedderDataFor(this, index, false, location);
+      EmbedderDataFor(this, index, location);
   if (data.is_null()) return {};
   i::Isolate* i_isolate = i::Isolate::Current();
   return Utils::ToLocal(i::direct_handle(
       i::EmbedderDataSlot(*data, index).load_tagged(), i_isolate));
-}
-
-void Context::SetEmbedderData(int index, v8::Local<Value> value) {
-  const char* location = "v8::Context::SetEmbedderData()";
-  i::DirectHandle<i::EmbedderDataArray> data =
-      EmbedderDataFor(this, index, true, location);
-  if (data.is_null()) return;
-  auto val = Utils::OpenDirectHandle(*value);
-  i::EmbedderDataSlot::store_tagged(*data, index, *val);
-  DCHECK_EQ(*Utils::OpenDirectHandle(*value),
-            *Utils::OpenDirectHandle(*GetEmbedderData(index)));
 }
 
 v8::Local<v8::Data> Context::SlowGetEmbedderDataV2(int index) {
   const char* location = "v8::Context::GetEmbedderDataV2()";
   i::DirectHandle<i::EmbedderDataArray> data =
-      EmbedderDataFor(this, index, false, location);
+      EmbedderDataFor(this, index, location);
   if (data.is_null()) return {};
   i::Isolate* i_isolate = i::Isolate::Current();
   return Utils::ToLocal(i::direct_handle(
       i::EmbedderDataSlot(*data, index).load_tagged(), i_isolate));
 }
 
-void Context::SetEmbedderDataV2(int index, v8::Local<Data> value) {
-  const char* location = "v8::Context::SetEmbedderDataV2()";
-  i::DirectHandle<i::EmbedderDataArray> data =
-      EmbedderDataFor(this, index, true, location);
-  if (data.is_null()) return;
-  auto val = Utils::OpenDirectHandle(*value);
-  i::EmbedderDataSlot::store_tagged(*data, index, *val);
-  DCHECK_EQ(*Utils::OpenDirectHandle(*value),
-            *Utils::OpenDirectHandle(*GetEmbedderDataV2(index)));
-}
-
 void Context::SetEmbedderDataV3(int index, v8::Local<Data> value) {
   const char* location = "v8::Context::SetEmbedderDataV3()";
   i::DirectHandle<i::EmbedderDataArray> data =
-      EmbedderDataFor(this, index, false, location);
+      EmbedderDataFor(this, index, location);
   if (data.is_null()) return;
   auto val = Utils::OpenDirectHandle(*value);
   i::EmbedderDataSlot::store_tagged(*data, index, *val);
@@ -1058,7 +1028,7 @@ void* Context::GetAlignedPointerFromEmbedderData(int index,
   i::Isolate* i_isolate = i::Isolate::Current();
   i::HandleScope handle_scope(i_isolate);
   i::DirectHandle<i::EmbedderDataArray> data =
-      EmbedderDataFor(this, index, false, location);
+      EmbedderDataFor(this, index, location);
   if (data.is_null()) return nullptr;
   void* result;
   Utils::ApiCheck(
@@ -1074,7 +1044,7 @@ void* Context::SlowGetAlignedPointerFromEmbedderData(int index,
   i::Isolate* i_isolate = i::Isolate::Current();
   i::HandleScope handle_scope(i_isolate);
   i::DirectHandle<i::EmbedderDataArray> data =
-      EmbedderDataFor(this, index, false, location);
+      EmbedderDataFor(this, index, location);
   if (data.is_null()) return nullptr;
   void* result;
   Utils::ApiCheck(i::EmbedderDataSlot(*data, index)
@@ -1083,24 +1053,12 @@ void* Context::SlowGetAlignedPointerFromEmbedderData(int index,
   return result;
 }
 
-void Context::SetAlignedPointerInEmbedderData(int index, void* value,
-                                              EmbedderDataTypeTag tag) {
-  const char* location = "v8::Context::SetAlignedPointerInEmbedderData()";
-  i::Isolate* i_isolate = i::Isolate::Current();
-  i::DirectHandle<i::EmbedderDataArray> data =
-      EmbedderDataFor(this, index, true, location);
-  bool ok = i::EmbedderDataSlot::store_aligned_pointer(
-      i_isolate, data, index, value, ToExternalPointerTag(tag));
-  Utils::ApiCheck(ok, location, "Pointer is not aligned");
-  DCHECK_EQ(value, GetAlignedPointerFromEmbedderData(index, tag));
-}
-
 void Context::SetAlignedPointerInEmbedderDataV2(int index, void* value,
                                                 EmbedderDataTypeTag tag) {
   const char* location = "v8::Context::SetAlignedPointerInEmbedderDataV2()";
   i::Isolate* i_isolate = i::Isolate::Current();
   i::DirectHandle<i::EmbedderDataArray> data =
-      EmbedderDataFor(this, index, false, location);
+      EmbedderDataFor(this, index, location);
   if (data.is_null()) return;
   bool ok = i::EmbedderDataSlot::store_aligned_pointer(
       i_isolate, data, index, value, ToExternalPointerTag(tag));
@@ -1108,23 +1066,12 @@ void Context::SetAlignedPointerInEmbedderDataV2(int index, void* value,
   DCHECK_EQ(value, GetAlignedPointerFromEmbedderData(index, tag));
 }
 
-void Context::SetAlignedPointerInEmbedderDataInternal(int index, void* value,
-                                                      CppHeapPointerTag tag) {
-  const char* location = "v8::Context::SetAlignedPointerInEmbedderData()";
-  i::Isolate* i_isolate = i::Isolate::Current();
-  i::DirectHandle<i::EmbedderDataArray> data =
-      EmbedderDataFor(this, index, true, location);
-  bool ok = i::EmbedderDataSlot(*data, index)
-                .store_aligned_pointer(i_isolate, *data, value, tag);
-  Utils::ApiCheck(ok, location, "Pointer is not aligned");
-}
-
 void Context::SetAlignedPointerInEmbedderDataInternalV2(int index, void* value,
                                                         CppHeapPointerTag tag) {
   const char* location = "v8::Context::SetAlignedPointerInEmbedderDataV2()";
   i::Isolate* i_isolate = i::Isolate::Current();
   i::DirectHandle<i::EmbedderDataArray> data =
-      EmbedderDataFor(this, index, false, location);
+      EmbedderDataFor(this, index, location);
   if (data.is_null()) return;
   bool ok = i::EmbedderDataSlot(*data, index)
                 .store_aligned_pointer(i_isolate, *data, value, tag);
@@ -1435,12 +1382,10 @@ void FunctionTemplate::SetCallHandler(
 
 namespace {
 
-template <typename Getter, typename Setter>
-i::DirectHandle<i::AccessorInfo> MakeAccessorInfo(i::Isolate* i_isolate,
-                                                  v8::Local<Name> name,
-                                                  Getter getter, Setter setter,
-                                                  v8::Local<Data> data,
-                                                  bool replace_on_access) {
+i::DirectHandle<i::AccessorInfo> MakeAccessorInfo(
+    i::Isolate* i_isolate, v8::Local<Name> name,
+    AccessorNameGetterCallback getter, AccessorNameSetterCallback setter,
+    v8::Local<Data> data, bool replace_on_access) {
   i::DirectHandle<i::AccessorInfo> obj =
       i_isolate->factory()->NewAccessorInfo();
   obj->set_getter(i_isolate, reinterpret_cast<i::Address>(getter));
@@ -1582,10 +1527,11 @@ i::DirectHandle<i::FunctionTemplateInfo> EnsureConstructor(
   return constructor;
 }
 
-template <typename Getter, typename Setter, typename Data, typename Template>
 void TemplateSetAccessor(Template* template_obj, v8::Local<Name> name,
-                         Getter getter, Setter setter, Data data,
-                         PropertyAttribute attribute, bool replace_on_access,
+                         AccessorNameGetterCallback getter,
+                         AccessorNameSetterCallback setter,
+                         v8::Local<Data> data, PropertyAttribute attribute,
+                         bool replace_on_access,
                          SideEffectType getter_side_effect_type,
                          SideEffectType setter_side_effect_type) {
   auto info = Utils::OpenDirectHandle(template_obj);
@@ -1608,7 +1554,7 @@ void TemplateSetAccessor(Template* template_obj, v8::Local<Name> name,
 
 void Template::SetNativeDataProperty(v8::Local<Name> name,
                                      AccessorNameGetterCallback getter,
-                                     AccessorNameSetterCallbackV2 setter,
+                                     AccessorNameSetterCallback setter,
                                      v8::Local<Data> data,
                                      PropertyAttribute attribute,
                                      SideEffectType getter_side_effect_type,
@@ -1623,9 +1569,8 @@ void Template::SetLazyDataProperty(v8::Local<Name> name,
                                    PropertyAttribute attribute,
                                    SideEffectType getter_side_effect_type,
                                    SideEffectType setter_side_effect_type) {
-  TemplateSetAccessor(
-      this, name, getter, static_cast<AccessorNameSetterCallbackV2>(nullptr),
-      data, attribute, true, getter_side_effect_type, setter_side_effect_type);
+  TemplateSetAccessor(this, name, getter, nullptr, data, attribute, true,
+                      getter_side_effect_type, setter_side_effect_type);
 }
 
 void Template::SetIntrinsicDataProperty(Local<Name> name, Intrinsic intrinsic,
@@ -3425,12 +3370,33 @@ MaybeLocal<String> Message::GetSourceLine(Local<Context> context) const {
   return handle_scope.Escape(Utils::ToLocal(self->GetSourceLine()));
 }
 
+void Message::PrintCurrentStackTrace(Isolate* v8_isolate, std::ostream& out) {
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(v8_isolate);
+  EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
+  i_isolate->PrintCurrentStackTrace(out);
+}
+
+void Message::PrintCurrentStackTrace(Isolate* v8_isolate, std::ostream& out,
+                                     std::nullptr_t) {
+  PrintCurrentStackTrace(v8_isolate, out);
+}
+
 void Message::PrintCurrentStackTrace(
     Isolate* v8_isolate, std::ostream& out,
     PrintCurrentStackTraceFilterCallback should_include_frame_callback) {
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(v8_isolate);
   EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
   i_isolate->PrintCurrentStackTrace(out, should_include_frame_callback);
+}
+
+void Message::PrintCurrentStackTrace(
+    Isolate* v8_isolate, std::ostream& out,
+    PrintCurrentStackTraceWithOriginFilterCallback
+        should_include_frame_callback) {
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(v8_isolate);
+  EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
+  i_isolate->PrintCurrentStackTrace(out, nullptr,
+                                    should_include_frame_callback);
 }
 
 // --- S t a c k T r a c e ---
@@ -5290,14 +5256,12 @@ Maybe<bool> v8::Object::Has(Local<Context> context, uint32_t index) {
   return i::JSReceiver::HasElement(i_isolate, self, index);
 }
 
-template <typename Getter, typename Setter, typename Data>
-static Maybe<bool> ObjectSetAccessor(Local<Context> context, Object* self,
-                                     Local<Name> name, Getter getter,
-                                     Setter setter, Data data,
-                                     PropertyAttribute attributes,
-                                     bool replace_on_access,
-                                     SideEffectType getter_side_effect_type,
-                                     SideEffectType setter_side_effect_type) {
+static Maybe<bool> ObjectSetAccessor(
+    Local<Context> context, Object* self, Local<Name> name,
+    AccessorNameGetterCallback getter, AccessorNameSetterCallback setter,
+    Local<Data> data, PropertyAttribute attributes, bool replace_on_access,
+    SideEffectType getter_side_effect_type,
+    SideEffectType setter_side_effect_type) {
   auto i_isolate = i::Isolate::Current();
   EnterV8NoScriptScope<> api_scope{i_isolate, context,
                                    RCCId::kAPI_Object_SetAccessor};
@@ -5355,7 +5319,7 @@ void Object::SetAccessorProperty(Local<Name> name, Local<Function> getter,
 
 Maybe<bool> Object::SetNativeDataProperty(
     v8::Local<v8::Context> context, v8::Local<Name> name,
-    AccessorNameGetterCallback getter, AccessorNameSetterCallbackV2 setter,
+    AccessorNameGetterCallback getter, AccessorNameSetterCallback setter,
     v8::Local<Data> data, PropertyAttribute attributes,
     SideEffectType getter_side_effect_type,
     SideEffectType setter_side_effect_type) {
@@ -5369,9 +5333,8 @@ Maybe<bool> Object::SetLazyDataProperty(
     AccessorNameGetterCallback getter, v8::Local<Data> data,
     PropertyAttribute attributes, SideEffectType getter_side_effect_type,
     SideEffectType setter_side_effect_type) {
-  return ObjectSetAccessor(context, this, name, getter,
-                           static_cast<AccessorNameSetterCallbackV2>(nullptr),
-                           data, attributes, true, getter_side_effect_type,
+  return ObjectSetAccessor(context, this, name, getter, nullptr, data,
+                           attributes, true, getter_side_effect_type,
                            setter_side_effect_type);
 }
 
@@ -8435,7 +8398,7 @@ FastIterateResult FastIterateArray(DirectHandle<JSArray> array,
         sorted.reserve(dict->NumberOfElements());
         for (InternalIndex i : dict->IterateEntries()) {
           Tagged<Object> key = dict->KeyAt(i);
-          if (!dict->IsKey(roots, key)) continue;
+          if (!NumberDictionary::IsKey(roots, key)) continue;
           uint32_t index =
               static_cast<uint32_t>(Object::NumberValue(Cast<Number>(key)));
           sorted.push_back({index, i});
@@ -12386,11 +12349,11 @@ v8::Intercepted InvokeNamedInterceptorSetterCallback(
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(info.GetIsolate());
   RCS_SCOPE(i_isolate, RuntimeCallCounterId::kNamedSetterCallback);
 
-  v8::NamedPropertySetterCallbackV2 setter;
+  v8::NamedPropertySetterCallback setter;
   {
     DirectHandle<InterceptorInfo> interceptor_info =
         PropertyCallbackArguments::GetInterceptorInfo(info);
-    setter = reinterpret_cast<v8::NamedPropertySetterCallbackV2>(
+    setter = reinterpret_cast<v8::NamedPropertySetterCallback>(
         interceptor_info->named_setter(i_isolate));
 
     if (i_isolate->should_check_side_effects() &&

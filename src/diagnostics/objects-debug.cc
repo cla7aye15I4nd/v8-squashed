@@ -95,7 +95,6 @@
 #include "src/objects/promise-inl.h"
 #include "src/objects/property-descriptor-object-inl.h"
 #include "src/objects/sort-state.h"
-#include "src/objects/string-forwarding-table-inl.h"
 #include "src/objects/struct-inl.h"
 #include "src/objects/swiss-name-dictionary-inl.h"
 #include "src/objects/synthetic-module-inl.h"
@@ -1558,12 +1557,6 @@ void String::StringVerify(Isolate* isolate) {
     CHECK(HasHashCode());
     CHECK(!HeapLayout::InYoungGeneration(this));
   }
-  const uint32_t raw_hash = raw_hash_field();
-  if (IsForwardingIndex(raw_hash)) {
-    const int forwarding_index =
-        Name::ForwardingIndexValueBits::decode(raw_hash);
-    CHECK_LT(forwarding_index, isolate->string_forwarding_table()->size());
-  }
 }
 
 void ConsString::ConsStringVerify(Isolate* isolate) {
@@ -1582,7 +1575,6 @@ void ConsString::ConsStringVerify(Isolate* isolate) {
 void ThinString::ThinStringVerify(Isolate* isolate) {
   StringVerify(isolate);
   CHECK(Is<ThinString>(this));
-  CHECK(!HasForwardingIndex(kAcquireLoad));
   CHECK(IsInternalizedString(actual()));
   CHECK(IsSeqString(actual()) || IsExternalString(actual()));
 }
@@ -2352,6 +2344,60 @@ void JSIteratorZipHelper::JSIteratorZipHelperVerify(Isolate* isolate) {
 void JSIteratorZipKeyedHelper::JSIteratorZipKeyedHelperVerify(
     Isolate* isolate) {
   JSIteratorZipHelperVerify(isolate);
+}
+
+void JSIteratorChunksHelper::JSIteratorChunksHelperVerify(Isolate* isolate) {
+  JSIteratorHelperSimpleVerify(isolate);
+  CHECK_GE(chunk_size().value(), 1);
+}
+
+void JSIteratorWindowsHelper::JSIteratorWindowsHelperVerify(Isolate* isolate) {
+  JSIteratorHelperSimpleVerify(isolate);
+  const int window_size = this->window_size().value();
+  CHECK_GE(window_size, 1);
+  const JSIteratorWindowsHelperMode mode = this->mode();
+  CHECK(mode == JSIteratorWindowsHelperMode::kOnlyFull ||
+        mode == JSIteratorWindowsHelperMode::kAllowPartial);
+  const JSIteratorHelperState state = this->state();
+  const int element_count = this->element_count().value();
+  const uint32_t buffer_length = buffer()->length().value();
+  const int start_index = this->start_index().value();
+  if (window_size == 1 || state == JSIteratorHelperState::kSuspendedStart ||
+      state == JSIteratorHelperState::kCompleted) {
+    // No buffer is used for window_size == 1, before starting, or after
+    // completion.
+    CHECK_EQ(element_count, 0);
+    CHECK_EQ(buffer_length, 0);
+    CHECK_EQ(start_index, 0);
+  } else {
+    if (state == JSIteratorHelperState::kSuspendedYield) {
+      CHECK_EQ(element_count, window_size);
+    } else {
+      CHECK_EQ(state, JSIteratorHelperState::kExecuting);
+      CHECK_GE(element_count, 0);
+      CHECK_LE(element_count, window_size);
+    }
+    CHECK_LE(static_cast<uint32_t>(element_count), buffer_length);
+    CHECK_GE(start_index, 0);
+    if (buffer_length > 0) {
+      CHECK_LT(static_cast<uint32_t>(start_index), buffer_length);
+    } else {
+      CHECK_EQ(start_index, 0);
+    }
+    if (window_size <= 1024) {
+      // The double capacity implementation.
+      CHECK_LE(buffer_length,
+               static_cast<uint32_t>(std::max(2 * window_size - 1, 16)));
+      CHECK_LE(static_cast<uint32_t>(start_index + element_count),
+               buffer_length);
+    } else {
+      // The circular buffer implementation.
+      CHECK_LE(buffer_length, static_cast<uint32_t>(window_size));
+      if (element_count < window_size) {
+        CHECK_EQ(start_index, 0);
+      }
+    }
+  }
 }
 
 void WeakCell::WeakCellVerify(Isolate* isolate) {
@@ -3977,10 +4023,6 @@ class StringTableVerifier : public RootVisitor {
         CHECK(IsInternalizedString(object));
         CHECK_IMPLIES(v8_flags.shared_string_table,
                       HeapLayout::InAnySharedSpace(object));
-        // Internalized forwarding indices are never allowed in the string
-        // table.
-        uint32_t raw_hash = Cast<Name>(object)->raw_hash_field();
-        CHECK(!Name::IsInternalizedForwardingIndex(raw_hash));
       }
     }
   }

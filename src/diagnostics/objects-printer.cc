@@ -109,6 +109,21 @@ std::ostream& operator<<(std::ostream& os, JSIteratorZipHelperMode mode) {
   return os << JSIteratorZipHelperModeToString(mode);
 }
 
+const char* JSIteratorWindowsHelperModeToString(
+    JSIteratorWindowsHelperMode mode) {
+  switch (mode) {
+    case JSIteratorWindowsHelperMode::kOnlyFull:
+      return "ONLY_FULL";
+    case JSIteratorWindowsHelperMode::kAllowPartial:
+      return "ALLOW_PARTIAL";
+  }
+  UNREACHABLE();
+}
+
+std::ostream& operator<<(std::ostream& os, JSIteratorWindowsHelperMode mode) {
+  return os << JSIteratorWindowsHelperModeToString(mode);
+}
+
 void Print(Tagged<Object> obj) {
   // Output into debugger's command window if a debugger is attached.
   DbgStdoutStream dbg_os;
@@ -2522,6 +2537,22 @@ void JSIteratorZipKeyedHelper::JSIteratorZipKeyedHelperPrint(std::ostream& os) {
   JSObjectPrintBody(os, this);
 }
 
+void JSIteratorChunksHelper::JSIteratorChunksHelperPrint(std::ostream& os) {
+  JSIteratorHelperSimplePrintHeader(os, "JSIteratorChunksHelper");
+  os << "\n - chunk_size: " << chunk_size();
+  JSObjectPrintBody(os, this);
+}
+
+void JSIteratorWindowsHelper::JSIteratorWindowsHelperPrint(std::ostream& os) {
+  JSIteratorHelperSimplePrintHeader(os, "JSIteratorWindowsHelper");
+  os << "\n - window_size: " << window_size();
+  os << "\n - mode: " << mode();
+  os << "\n - buffer: " << Brief(buffer());
+  os << "\n - element_count: " << element_count();
+  os << "\n - start_index: " << start_index();
+  JSObjectPrintBody(os, this);
+}
+
 void JSWeakMap::JSWeakMapPrint(std::ostream& os) {
   JSObjectPrintHeader(os, this, "JSWeakMap");
   os << "\n - table: " << Brief(table());
@@ -2669,7 +2700,7 @@ void JSFunction::JSFunctionPrint(std::ostream& os) {
   // Print Builtin name for builtin functions
   Builtin builtin = code(isolate)->builtin_id();
   if (Builtins::IsBuiltinId(builtin)) {
-    os << "\n - builtin: " << isolate->builtins()->name(builtin);
+    os << "\n - builtin: " << Builtins::name(builtin);
   }
 
   os << "\n - formal_parameter_count: ";
