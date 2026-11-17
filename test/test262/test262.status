@@ -37,17 +37,21 @@
   # https://code.google.com/p/v8/issues/detail?id=4248
   'language/expressions/compound-assignment/S11.13.2_A5.*': [FAIL],
   'language/expressions/compound-assignment/S11.13.2_A6.*': [FAIL],
-  'language/expressions/compound-assignment/S11.13.2_A7.10_T4': [FAIL],
-  'language/expressions/compound-assignment/S11.13.2_A7.11_T4': [FAIL],
-  'language/expressions/compound-assignment/S11.13.2_A7.1_T4': [FAIL],
-  'language/expressions/compound-assignment/S11.13.2_A7.2_T4': [FAIL],
-  'language/expressions/compound-assignment/S11.13.2_A7.3_T4': [FAIL],
-  'language/expressions/compound-assignment/S11.13.2_A7.4_T4': [FAIL],
-  'language/expressions/compound-assignment/S11.13.2_A7.5_T4': [FAIL],
-  'language/expressions/compound-assignment/S11.13.2_A7.6_T4': [FAIL],
-  'language/expressions/compound-assignment/S11.13.2_A7.7_T4': [FAIL],
-  'language/expressions/compound-assignment/S11.13.2_A7.8_T4': [FAIL],
-  'language/expressions/compound-assignment/S11.13.2_A7.9_T4': [FAIL],
+  'language/expressions/compound-assignment/left-hand-side-property-reference-topropertykey-once-add': [FAIL],
+  'language/expressions/compound-assignment/left-hand-side-property-reference-topropertykey-once-bitand': [FAIL],
+  'language/expressions/compound-assignment/left-hand-side-property-reference-topropertykey-once-bitor': [FAIL],
+  'language/expressions/compound-assignment/left-hand-side-property-reference-topropertykey-once-bitxor': [FAIL],
+  'language/expressions/compound-assignment/left-hand-side-property-reference-topropertykey-once-div': [FAIL],
+  'language/expressions/compound-assignment/left-hand-side-property-reference-topropertykey-once-exp': [FAIL],
+  'language/expressions/compound-assignment/left-hand-side-property-reference-topropertykey-once-lshift': [FAIL],
+  'language/expressions/compound-assignment/left-hand-side-property-reference-topropertykey-once-mod': [FAIL],
+  'language/expressions/compound-assignment/left-hand-side-property-reference-topropertykey-once-mult': [FAIL],
+  'language/expressions/compound-assignment/left-hand-side-property-reference-topropertykey-once-rshift': [FAIL],
+  'language/expressions/compound-assignment/left-hand-side-property-reference-topropertykey-once-srshift': [FAIL],
+  'language/expressions/compound-assignment/left-hand-side-property-reference-topropertykey-once-sub': [FAIL],
+  'language/expressions/logical-assignment/lgcl-and-assignment-operator-topropertykey-once': [FAIL],
+  'language/expressions/logical-assignment/lgcl-nullish-assignment-operator-topropertykey-once': [FAIL],
+  'language/expressions/logical-assignment/lgcl-or-assignment-operator-topropertykey-once': [FAIL],
   'language/statements/with/unscopables-inc-dec': [FAIL],
 
   # https://code.google.com/p/v8/issues/detail?id=4249
@@ -174,6 +178,9 @@
   # b/434224293
   'intl402/DateTimeFormat/prototype/formatToParts/compare-to-temporal-lunisolar': [SKIP],
 
+  # https://crbug.com/494306044
+  'built-ins/Temporal/PlainMonthDay/from/iso-year-used-only-for-overflow': [FAIL],
+
   # End Temporal test expectations
 
   # https://github.com/tc39/test262/pull/3988
@@ -216,6 +223,21 @@
   'language/statements/with/get-binding-value-idref-with-proxy-env': [FAIL],
   'language/statements/with/set-mutable-binding-idref-compound-assign-with-proxy-env': [FAIL],
   'language/statements/with/set-mutable-binding-idref-with-proxy-env': [FAIL],
+
+  # https://crbug.com/581462605
+  'built-ins/DataView/prototype/byteLength/detached-buffer': [FAIL],
+  'built-ins/DataView/prototype/byteLength/resizable-array-buffer-auto': [FAIL],
+  'built-ins/DataView/prototype/byteLength/resizable-array-buffer-fixed': [FAIL],
+  'built-ins/DataView/prototype/byteOffset/detached-buffer': [FAIL],
+  'built-ins/DataView/prototype/byteOffset/resizable-array-buffer-auto': [FAIL],
+  'built-ins/DataView/prototype/byteOffset/resizable-array-buffer-fixed': [FAIL],
+
+  # https://crbug.com/580293064
+  'built-ins/Iterator/concat/underlying-iterator-not-closed-when-step-throws': [FAIL],
+
+  # https://crbug.com/581458354
+  'language/statements/class/elements/arrow-body-arguments-label': [FAIL],
+  'language/statements/class/static-init-arguments-label': [FAIL],
 
   ######################## NEEDS INVESTIGATION ###########################
 
@@ -267,6 +289,11 @@
 
   # https://github.com/tc39/test262/pull/3987
   'language/module-code/import-attributes/allow-nlt-before-with': [FAIL],
+
+  # https://crbug.com/517575874: Outdated expectations for \A, \z, \Z in
+  # Unicode mode (valid assertions per proposal-regexp-buffer-boundaries).
+  'built-ins/RegExp/unicode_restricted_identity_escape_alpha': [FAIL],
+  'staging/sm/RegExp/unicode-disallow-extended': [FAIL],
 
   ############################ SKIPPED TESTS #############################
 

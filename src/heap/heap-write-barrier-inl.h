@@ -88,7 +88,14 @@ inline WriteBarrierMode WriteBarrier::ComputeWriteBarrierModeForObject(
   }
   DCHECK(PageFlagsAreConsistent(object));
   MemoryChunk* chunk = MemoryChunk::FromHeapObject(object);
-  if (chunk->IsMarking()) {
+  if constexpr (v8_flags.sticky_mark_bits.value()) {
+    if (!IsLocalMarking(Isolate::Current()) &&
+        HeapLayout::InYoungGeneration(chunk, object)) {
+      return SKIP_WRITE_BARRIER_SCOPE;
+    }
+    return UPDATE_WRITE_BARRIER;
+  }
+  if (chunk->PointersFromHereAreInteresting()) {
     return UPDATE_WRITE_BARRIER;
   }
   if (HeapLayout::InYoungGeneration(chunk, object)) {
@@ -200,8 +207,10 @@ void WriteBarrier::VerifySkipWriteBarrier(Tagged<HeapObject> host,
 }
 #endif  // V8_VERIFY_WRITE_BARRIERS
 
-//   static
-void WriteBarrier::ForEphemeronHashTable(Tagged<EphemeronHashTable> host,
+// static
+template <typename IsolateT>
+void WriteBarrier::ForEphemeronHashTable(IsolateT* isolate,
+                                         Tagged<EphemeronHashTable> host,
                                          ObjectSlot slot, Tagged<Object> value,
                                          WriteBarrierMode mode) {
   if (IsSkipWriteBarrierMode(mode)) {
@@ -220,9 +229,10 @@ void WriteBarrier::ForEphemeronHashTable(Tagged<EphemeronHashTable> host,
   MemoryChunk* value_chunk = MemoryChunk::FromHeapObject(heap_object_value);
   DCHECK(!value_chunk->Metadata()->is_writable_shared());
 
+  DCHECK(!TrustedHeapLayout::InWritableSharedSpace(host));
   const bool pointers_from_here_are_interesting =
       !host_chunk->IsYoungOrSharedChunk();
-  const bool is_marking = host_chunk->IsMarking();
+  const bool is_marking = IsLocalMarking(isolate);
 
   if (is_marking) {
     // Marking barrier: mark value & record slots when marking is on.
@@ -392,7 +402,7 @@ bool WriteBarrier::IsMarking(IsolateT* isolate, Tagged<HeapObject> object) {
   if (!isolate_data->is_any_marking_active()) [[likely]] {
     return false;
   }
-  return TrustedHeapLayout::InWritableSharedSpace(object)
+  return TrustedHeapLayout::InWritableSharedSpace(isolate, object)
              ? isolate_data->is_shared_marking()
              : isolate_data->is_local_marking();
 }

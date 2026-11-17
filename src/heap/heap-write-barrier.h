@@ -72,11 +72,14 @@ class V8_EXPORT_PRIVATE WriteBarrier final {
   static void EphemeronKeyWriteBarrierFromCode(Address raw_object,
                                                Address key_slot_address,
                                                Isolate* isolate);
-  static int MarkingFromCode(Address raw_host, Address raw_slot);
+  static int MarkingFromCode(Isolate* isolate, Address raw_host,
+                             Address raw_slot);
   static int TrustedPointerMarkingFromCode(Address raw_host, Address raw_slot,
                                            Address raw_tag);
-  static int SharedMarkingFromCode(Address raw_host, Address raw_slot);
-  static int SharedFromCode(Address raw_host, Address raw_slot);
+  static int SharedMarkingFromCode(Isolate* isolate, Address raw_host,
+                                   Address raw_slot);
+  static int SharedFromCode(Isolate* isolate, Address raw_host,
+                            Address raw_slot);
 
   static inline WriteBarrierModeScope GetWriteBarrierModeForObject(
       Tagged<HeapObject> object, const DisallowGarbageCollection& promise);
@@ -90,7 +93,9 @@ class V8_EXPORT_PRIVATE WriteBarrier final {
   template <typename T>
   static inline void ForValue(HeapObject* host, MaybeObjectSlot slot,
                               Tagged<T> value, WriteBarrierMode mode);
-  static inline void ForEphemeronHashTable(Tagged<EphemeronHashTable> host,
+  template <typename IsolateT>
+  static inline void ForEphemeronHashTable(IsolateT* isolate,
+                                           Tagged<EphemeronHashTable> host,
                                            ObjectSlot slot,
                                            Tagged<Object> value,
                                            WriteBarrierMode mode);
@@ -224,6 +229,10 @@ class V8_EXPORT_PRIVATE WriteBarrier final {
   template <RecordYoungSlot kRecordYoung = RecordYoungSlot::kNo>
   V8_NOINLINE V8_PRESERVE_MOST static void MarkingSlow(
       Tagged<HeapObject> host, HeapObjectSlot, Tagged<HeapObject> value);
+  template <RecordYoungSlot kRecordYoung = RecordYoungSlot::kNo>
+  V8_NOINLINE V8_PRESERVE_MOST static void MarkingSlow(
+      MarkingBarrier* marking_barrier, Tagged<HeapObject> host, HeapObjectSlot,
+      Tagged<HeapObject> value);
   static void MarkingSlowFromCode(Tagged<HeapObject> host, MaybeObjectSlot,
                                   Tagged<MaybeObject> value);
   V8_NOINLINE V8_PRESERVE_MOST static void MarkingSlow(
@@ -247,7 +256,8 @@ class V8_EXPORT_PRIVATE WriteBarrier final {
       CppHeapPointerSlot slot, void* object);
 
   V8_NOINLINE V8_PRESERVE_MOST static void GenerationalBarrierSlow(
-      Tagged<HeapObject> object, Address slot, Tagged<HeapObject> value);
+      const LocalHeap* local_heap, Tagged<HeapObject> object, Address slot,
+      Tagged<HeapObject> value);
   static inline void GenerationalBarrierForCppHeapPointer(
       Heap* heap, Tagged<CppHeapPointerWrapperObjectT> host, void* value);
   V8_NOINLINE V8_PRESERVE_MOST static void
@@ -260,7 +270,7 @@ class V8_EXPORT_PRIVATE WriteBarrier final {
   V8_NOINLINE V8_PRESERVE_MOST static void SharedSlow(
       Tagged<InstructionStream> host, RelocInfo*, Tagged<HeapObject> value);
   V8_NOINLINE V8_PRESERVE_MOST static void SharedHeapBarrierSlow(
-      Tagged<HeapObject> object, Address slot);
+      Isolate* isolate, Tagged<HeapObject> object, Address slot);
 
   static inline void CombinedWriteBarrierInternal(Tagged<HeapObject> host,
                                                   HeapObjectSlot slot,
@@ -276,6 +286,11 @@ class V8_EXPORT_PRIVATE WriteBarrier final {
       Tagged<HeapObject> value, MemoryChunk* value_chunk);
   V8_NOINLINE V8_PRESERVE_MOST static void
   CombinedGenerationalAndSharedBarrierSlow(Tagged<HeapObject> object,
+                                           Address slot,
+                                           Tagged<HeapObject> value);
+  V8_NOINLINE V8_PRESERVE_MOST static void
+  CombinedGenerationalAndSharedBarrierSlow(const LocalHeap* local_heap,
+                                           Tagged<HeapObject> object,
                                            Address slot,
                                            Tagged<HeapObject> value);
   V8_NOINLINE V8_PRESERVE_MOST static void

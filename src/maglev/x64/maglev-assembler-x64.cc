@@ -141,7 +141,7 @@ void MaglevAssembler::StringFromCharCode(RegisterSnapshot register_snapshot,
         __ AllocateTwoByteString(register_snapshot, result, 1);
         __ movw(FieldOperand(result, OFFSET_OF_DATA_START(SeqTwoByteString)),
                 char_code);
-        __ jmp(*done);
+        __ Jump(*done);
       },
       register_snapshot, done, result, char_code, scratch);
   if (char_code_fits_one_byte != nullptr) {
@@ -190,7 +190,7 @@ void MaglevAssembler::StringCharCodeOrCodePointAt(
           __ SmiUntag(kReturnRegister0);
           __ Move(result, kReturnRegister0);
         }
-        __ jmp(*done);
+        __ Jump(*done);
       },
       mode, register_snapshot, done, result, string, index);
 
@@ -272,7 +272,7 @@ void MaglevAssembler::StringCharCodeOrCodePointAt(
   // Is a thin string.
   {
     LoadTaggedField(string, string, offsetof(ThinString, actual_));
-    jmp(&loop, Label::kNear);
+    Jump(&loop, Label::kNear);
   }
 
   bind(&sliced_string);
@@ -299,7 +299,7 @@ void MaglevAssembler::StringCharCodeOrCodePointAt(
                                   offsetof(SlicedString, offset_));
     LoadTaggedField(string, string, offsetof(SlicedString, parent_));
     addl(index, offset);
-    jmp(&loop, Label::kNear);
+    Jump(&loop, Label::kNear);
   }
 
   bind(&cons_string);
@@ -308,7 +308,7 @@ void MaglevAssembler::StringCharCodeOrCodePointAt(
                 RootIndex::kempty_string);
     j(not_equal, deferred_runtime_call);
     LoadTaggedField(string, string, offsetof(ConsString, first_));
-    jmp(&loop, Label::kNear);  // Try again with first string.
+    Jump(&loop, Label::kNear);  // Try again with first string.
   }
 
   bind(&seq_string);
@@ -332,7 +332,7 @@ void MaglevAssembler::StringCharCodeOrCodePointAt(
     // (CharCodeAt/CodePointAt), since it cannot be the first half of a
     // surrogate pair.
     SeqOneByteStringCharCodeAt(result, string, index);
-    jmp(result_fits_one_byte);
+    Jump(result_fits_one_byte);
     bind(&two_byte_string);
 
     if (mode == BuiltinStringPrototypeCharCodeOrCodePointAt::kCharCodeAt) {
@@ -341,10 +341,18 @@ void MaglevAssembler::StringCharCodeOrCodePointAt(
     } else {
       DCHECK_EQ(mode,
                 BuiltinStringPrototypeCharCodeOrCodePointAt::kCodePointAt);
+      DCHECK_NE(string, index);
+      // {result} is written before the trailing-surrogate lookahead, which
+      // still needs {string} and {index}. Preserve whichever one {result}
+      // aliases.
       Register string_backup = string;
+      Register index_backup = index;
       if (result == string) {
         string_backup = scratch2;
         movq(string_backup, string);
+      } else if (result == index) {
+        index_backup = scratch2;
+        movl(index_backup, index);
       }
       movzxwl(result, FieldOperand(string, index, times_2,
                                    OFFSET_OF_DATA_START(SeqTwoByteString)));
@@ -357,13 +365,13 @@ void MaglevAssembler::StringCharCodeOrCodePointAt(
 
       Register length = scratch1;
       StringLength(length, string_backup);
-      incl(index);
-      cmpl(index, length);
+      incl(index_backup);
+      cmpl(index_backup, length);
       j(greater_equal, *done);
 
       Register second_code_point = scratch1;
       movzxwl(second_code_point,
-              FieldOperand(string_backup, index, times_2,
+              FieldOperand(string_backup, index_backup, times_2,
                            OFFSET_OF_DATA_START(SeqTwoByteString)));
       movl(scratch2, second_code_point);
       andl(scratch2, Immediate(0xfc00));
@@ -449,7 +457,7 @@ void MaglevAssembler::TruncateDoubleToInt32(Register dst, DoubleRegister src) {
         // Avoid using `pop` to not mix implicit and explicit rsp updates.
         __ movl(dst, MemOperand(rsp, 0));
         __ addq(rsp, Immediate(kScratchSize));
-        __ jmp(*done);
+        __ Jump(*done);
       },
       src, dst, done);
   bind(*done);

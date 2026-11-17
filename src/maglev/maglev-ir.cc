@@ -90,43 +90,34 @@ CONVERSION_NODE_LIST(ASSERT_IS_CONV)
 
 }  // namespace
 
-void ValueNode::AddDeoptUse(const VirtualObjectList& virtual_objects) {
+void ValueNode::AddDeoptUse() {
   DCHECK(!Is<VirtualObject>());
   if (InlinedAllocation* alloc = TryCast<InlinedAllocation>()) {
-    VirtualObject* vobject = virtual_objects.FindAllocatedWith(alloc);
-    if (vobject) {
-      vobject->AddDeoptUse(virtual_objects);
-      // Add an escaping use for the allocation.
-      alloc->AddNonEscapingUses(1);
+    // After escape analysis, any remaining InlinedAllocation has escaped and
+    // its VirtualObject is no longer used for deopt.
+    if (!alloc->HasBeenAnalysed()) {
+      alloc->object()->AddDeoptUse();
     }
+    alloc->AddNonEscapingUses(1);
     alloc->add_use();
   } else {
     add_use();
   }
 }
 
-void VirtualObject::AddDeoptUse(const VirtualObjectList& virtual_objects) {
+void VirtualObject::AddDeoptUse() {
+  // Only called on initial VirtualObjects before escape analysis, which are
+  // never mutated after creation and therefore cannot contain cycles.
   ForEachSlot([&](ValueNode* value, vobj::Field desc) -> bool {
     if (InlinedAllocation* nested_allocation =
             value->TryCast<InlinedAllocation>()) {
-      VirtualObject* nested_object =
-          virtual_objects.FindAllocatedWith(nested_allocation);
-      if (nested_object == nullptr) {
-        CHECK(v8_flags.turbolev_non_eager_inlining ||
-              v8_flags.maglev_non_eager_inlining);
-        // The nested object must have been created by a different inlining
-        // and we cannot see it here in the virtual object list.
-        // TODO(victorgomes): Propagate somehow virtual object lists? For
-        // now, we force the allocation to escape.
-        nested_allocation->ForceEscaping();
-      } else {
-        nested_object->AddDeoptUse(virtual_objects);
-      }
+      DCHECK(!nested_allocation->HasBeenAnalysed());
+      nested_allocation->object()->AddDeoptUse();
     } else if (!IsConstantNode(value->opcode()) &&
                value->opcode() != Opcode::kArgumentsElements &&
                value->opcode() != Opcode::kArgumentsLength &&
                value->opcode() != Opcode::kRestLength) {
-      value->AddDeoptUse(virtual_objects);
+      value->AddDeoptUse();
     }
     return true;
   });
@@ -482,15 +473,6 @@ bool CheckToBooleanOnAllRoots(LocalIsolate* local_isolate) {
 #endif
 
 }  // namespace
-
-void VirtualObjectList::Print(std::ostream& os, const char* prefix) const {
-  os << prefix;
-  for (const VirtualObject* vo : *this) {
-    GetCurrentGraphLabeller()->PrintNodeLabel(os, vo, false);
-    os << "; ";
-  }
-  os << std::endl;
-}
 
 void DeoptInfo::InitializeInputLocations(Zone* zone, size_t count) {
   DCHECK_NULL(input_locations_);
@@ -3181,7 +3163,7 @@ void Int32Compare::GenerateCode(MaglevAssembler* masm,
   // TODO(leszeks): Investigate loading existing materialisations of roots here,
   // if available.
   __ LoadRoot(result, RootIndex::kFalseValue);
-  __ jmp(&end);
+  __ Jump(&end);
   {
     __ bind(&is_true);
     __ LoadRoot(result, RootIndex::kTrueValue);
@@ -3203,7 +3185,7 @@ void Int32ToBoolean::GenerateCode(MaglevAssembler* masm,
   // TODO(leszeks): Investigate loading existing materialisations of roots here,
   // if available.
   __ LoadRoot(result, flip() ? RootIndex::kTrueValue : RootIndex::kFalseValue);
-  __ jmp(&end);
+  __ Jump(&end);
   {
     __ bind(&is_true);
     __ LoadRoot(result,
@@ -3226,7 +3208,7 @@ void IntPtrToBoolean::GenerateCode(MaglevAssembler* masm,
   // TODO(leszeks): Investigate loading existing materialisations of roots here,
   // if available.
   __ LoadRoot(result, flip() ? RootIndex::kTrueValue : RootIndex::kFalseValue);
-  __ jmp(&end);
+  __ Jump(&end);
   {
     __ bind(&is_true);
     __ LoadRoot(result,
@@ -5772,6 +5754,11 @@ void GeneratorRestoreRegister::GenerateCode(MaglevAssembler* masm,
   }
 }
 
+bool GeneratorStore::store_context() const {
+  const RootConstant* constant = ContextInput().node()->TryCast<RootConstant>();
+  return constant == nullptr || constant->index() != RootIndex::kOptimizedOut;
+}
+
 int GeneratorStore::MaxCallStackArgs() const {
   return WriteBarrierDescriptor::GetStackParameterCount();
 }
@@ -5831,18 +5818,20 @@ void GeneratorStore::GenerateCode(MaglevAssembler* masm,
                             offsetof(JSGeneratorObject, input_or_debug_pos_),
                             Smi::FromInt(bytecode_offset()));
 
-  // Use WriteBarrierDescriptor::SlotAddressRegister() as the scratch
-  // register, see comment above. At this point we no longer need to preserve
-  // the array or generator registers, so use the original register snapshot.
-  Register context = __ FromAnyToRegister(
-      ContextInput(), WriteBarrierDescriptor::SlotAddressRegister());
-  __ StoreTaggedFieldWithWriteBarrier(
-      generator, offsetof(JSGeneratorObject, context_), context,
-      register_snapshot(),
-      ContextInput().node()->decompresses_tagged_result()
-          ? MaglevAssembler::kValueIsDecompressed
-          : MaglevAssembler::kValueIsCompressed,
-      MaglevAssembler::kValueCannotBeSmi);
+  if (store_context()) {
+    // Use WriteBarrierDescriptor::SlotAddressRegister() as the scratch
+    // register, see comment above. At this point we no longer need to preserve
+    // the array or generator registers, so use the original register snapshot.
+    Register context = __ FromAnyToRegister(
+        ContextInput(), WriteBarrierDescriptor::SlotAddressRegister());
+    __ StoreTaggedFieldWithWriteBarrier(
+        generator, offsetof(JSGeneratorObject, context_), context,
+        register_snapshot(),
+        ContextInput().node()->decompresses_tagged_result()
+            ? MaglevAssembler::kValueIsDecompressed
+            : MaglevAssembler::kValueIsCompressed,
+        MaglevAssembler::kValueCannotBeSmi);
+  }
 }
 
 int GetKeyedGeneric::MaxCallStackArgs() const {
@@ -7769,7 +7758,7 @@ void CallKnownApiFunction::GenerateCallApiCallbackOptimizedInline(
   Label done, call_api_callback_builtin_inline;
   __ Call(&call_api_callback_builtin_inline);
   masm->DefineExceptionHandlerAndLazyDeoptPoint(this);
-  __ jmp(&done);
+  __ Jump(&done);
 
   //
   // Generate a CallApiCallback builtin inline.
@@ -9017,7 +9006,7 @@ void BranchIfJSReceiver::GenerateCode(MaglevAssembler* masm,
   Register value = ToRegister(ConditionInput());
   __ JumpIfSmi(value, if_false()->label());
   __ JumpIfJSAnyIsNotPrimitive(value, if_true()->label());
-  __ jmp(if_false()->label());
+  __ Jump(if_false()->label());
 }
 
 void Switch::SetValueLocationConstraints() {

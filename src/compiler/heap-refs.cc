@@ -663,6 +663,19 @@ class MapData : public HeapObjectData {
     CHECK(InstanceTypeChecker::IsJSObject(instance_type()));
     return in_object_properties_;
   }
+  uint8_t GetInObjectPropertiesStartInWords() const {
+    DCHECK(InstanceTypeChecker::IsJSObject(instance_type()));
+    return inobject_properties_start_or_constructor_function_index_;
+  }
+  int GetConstructorFunctionIndex() const {
+#if V8_ENABLE_WEBASSEMBLY
+    DCHECK(instance_type() <= LAST_PRIMITIVE_HEAP_OBJECT_TYPE ||
+           instance_type() == WASM_NULL_TYPE);
+#else
+    DCHECK(instance_type() <= LAST_PRIMITIVE_HEAP_OBJECT_TYPE);
+#endif
+    return inobject_properties_start_or_constructor_function_index_;
+  }
   int UnusedPropertyFields() const { return unused_property_fields_; }
   bool is_abandoned_prototype_map() const {
     return is_abandoned_prototype_map_;
@@ -675,6 +688,7 @@ class MapData : public HeapObjectData {
 
   InstanceType instance_type_;
   int instance_size_;
+  uint8_t inobject_properties_start_or_constructor_function_index_;
   Map::Bits2 bit_field2_;
   Map::Bits3 bit_field3_;
   int unused_property_fields_;
@@ -1013,12 +1027,11 @@ MapData::MapData(JSHeapBroker* broker, ObjectData** storage,
   JSHeapBroker::MapUpdaterGuardIfNeeded mumd_scope(broker);
 
   // When background serializing the map, we can perform a lite serialization
-  // since the MapRef will read some of the Map's fields can be read directly.
-
-  // Even though MapRefs can read {instance_type} directly, other classes depend
-  // on {instance_type} being serialized.
+  // since the MapRef will read some of the Map's fields directly.
   instance_type_ = object->instance_type();
   instance_size_ = object->instance_size();
+  inobject_properties_start_or_constructor_function_index_ =
+      object->inobject_properties_start_or_constructor_function_index();
 
   bit_field2_ = object->bit_field2();
 
@@ -1032,9 +1045,11 @@ MapData::MapData(JSHeapBroker* broker, ObjectData** storage,
   // lock in more places.
   bit_field3_ = object->relaxed_bit_field3();
   is_abandoned_prototype_map_ = object->is_abandoned_prototype_map();
-  if (IsJSObjectMap(*object)) {
+  if (InstanceTypeChecker::IsJSObject(instance_type_)) {
     unused_property_fields_ = object->UnusedPropertyFields();
-    in_object_properties_ = object->GetInObjectProperties();
+    in_object_properties_ =
+        (instance_size_ >> kTaggedSizeLog2) -
+        inobject_properties_start_or_constructor_function_index_;
   } else {
     unused_property_fields_ = 0;
     in_object_properties_ = 0;
@@ -1334,11 +1349,11 @@ bool MapRef::IsStringWrapperMap() const {
 }
 
 bool MapRef::IsOneByteStringMap() const {
-  return InstanceTypeChecker::IsOneByteString(*object());
+  return InstanceTypeChecker::IsOneByteString(instance_type());
 }
 
 bool MapRef::IsTwoByteStringMap() const {
-  return InstanceTypeChecker::IsTwoByteString(*object());
+  return InstanceTypeChecker::IsTwoByteString(instance_type());
 }
 
 bool MapRef::CanInlineElementAccess() const {
@@ -1527,7 +1542,7 @@ FieldIndex MapRef::GetFieldIndexFor(InternalIndex descriptor_index) const {
 }
 
 int MapRef::GetInObjectPropertyOffset(int i) const {
-  return object()->GetInObjectPropertyOffset(i);
+  return (GetInObjectPropertiesStartInWords() + i) * kTaggedSize;
 }
 
 PropertyDetails MapRef::GetPropertyDetails(
@@ -2104,7 +2119,8 @@ bool MapRef::IsInobjectSlackTrackingInProgress() const {
 }
 
 int MapRef::constructor_function_index() const {
-  return object()->GetConstructorFunctionIndex();
+  IF_ACCESS_FROM_HEAP_C(GetConstructorFunctionIndex);
+  return data()->AsMap()->GetConstructorFunctionIndex();
 }
 
 bool MapRef::is_stable() const {
@@ -2114,10 +2130,15 @@ bool MapRef::is_stable() const {
 
 bool MapRef::CanBeDeprecated() const { return object()->CanBeDeprecated(); }
 
-bool MapRef::CanTransition() const { return object()->CanTransition(); }
+bool MapRef::CanTransition() const {
+  const InstanceType type = instance_type();
+  return InstanceTypeChecker::IsJSObject(type) &&
+         !InstanceTypeChecker::IsMaybeReadOnlyJSObject(type);
+}
 
 uint8_t MapRef::GetInObjectPropertiesStartInWords() const {
-  return object()->GetInObjectPropertiesStartInWords();
+  IF_ACCESS_FROM_HEAP_C(GetInObjectPropertiesStartInWords);
+  return data()->AsMap()->GetInObjectPropertiesStartInWords();
 }
 
 int MapRef::GetInObjectProperties() const {
@@ -2451,6 +2472,32 @@ OptionalObjectRef JSArrayRef::GetOwnCowElement(JSHeapBroker* broker,
   return TryMakeRef(broker, result.value());
 }
 
+Module::Status ModuleRef::status() const {
+  // A relaxed load is enough: the status only moves forward, so a stale value
+  // only makes the compiler more conservative. Callers check the state they
+  // depend on (e.g. export cells for TDZ holes) themselves.
+  return object()->status(kRelaxedLoad);
+}
+
+OptionalCellRef ModuleRef::LookupExportCell(JSHeapBroker* broker,
+                                            NameRef name) const {
+  // Until the module's first namespace is created, the main thread may still
+  // add the star exports to the table (possibly replacing it). Once the
+  // exports are finalized, the table no longer changes and the acquire load in
+  // ExportsFinalized orders the plain read below after the last write to it.
+  if (!object()->ExportsFinalized(kAcquireLoad)) return {};
+  // Property names reaching the compiler are internalized, so their hash is
+  // already computed.
+  DCHECK(name.IsUniqueName());
+  Tagged<Object> entry =
+      object()->exports()->Lookup(name.object(), name.object()->hash());
+  // Once exports are finalized (and status == kEvaluated), FinishInstantiate
+  // has already replaced every SourceTextModuleInfoEntry in exports() with a
+  // Cell, so entry can only be the_hole or a Cell.
+  if (i::IsTheHole(entry)) return {};
+  return TryMakeRef(broker, Cast<Cell>(entry));
+}
+
 OptionalCellRef SourceTextModuleRef::GetCell(JSHeapBroker* broker,
                                              int cell_index) const {
   return TryMakeRef(broker, object()->GetCell(cell_index));
@@ -2712,6 +2759,33 @@ int SharedFunctionInfoRef::
 int SharedFunctionInfoRef::
     internal_formal_parameter_count_without_receiver_deprecated() const {
   return object()->internal_formal_parameter_count_without_receiver();
+}
+
+OptionalModuleRef MapRef::GetNamespaceModule(JSHeapBroker* broker) const {
+  InstanceType type = instance_type();
+  if (type != JS_MODULE_NAMESPACE_TYPE &&
+      type != JS_DEFERRED_MODULE_NAMESPACE_TYPE) {
+    return {};
+  }
+  // On non-prototype maps the prototype_info field aliases the transitions.
+  if (!is_prototype_map()) return {};
+  Tagged<Object> maybe_proto_info = object()->prototype_info(kAcquireLoad);
+  Tagged<PrototypeInfo> proto_info;
+  // Private fields can still be added to a namespace (see
+  // --js-nonextensible-applies-to-private). When the namespace migrates to a
+  // new map because of that, the PrototypeInfo moves along and the old map's
+  // field is reset to Smi::zero().
+  // TODO(caiolima): Once --js-nonextensible-applies-to-private ships, we might
+  // be able to assume that namespace maps never migrate. If so, replace the
+  // bailout below with a CHECK.
+  if (!TryCast<PrototypeInfo>(maybe_proto_info, &proto_info)) return {};
+  // JSModuleNamespace creation stores the back pointer in the PrototypeInfo
+  // before the namespace is returned, and it is never cleared afterwards.
+  Tagged<JSModuleNamespace> module_namespace =
+      Cast<JSModuleNamespace>(proto_info->module_namespace(kAcquireLoad));
+  // A namespace's module is set at creation, before the namespace is
+  // published, and never changes afterwards.
+  return TryMakeRef(broker, module_namespace->module());
 }
 
 OptionalMapRef JSObjectRef::GetObjectCreateMap(JSHeapBroker* broker) const {

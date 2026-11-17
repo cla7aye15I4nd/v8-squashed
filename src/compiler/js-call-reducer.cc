@@ -1675,6 +1675,20 @@ FrameState SortContinueFromSnapshotLazyFrameState(
       ContinuationFrameStateMode::LAZY);
 }
 
+FrameState SortContinueFromSnapshotAfterCallbackEagerFrameState(
+    const SortFrameStateParams& params, TNode<Object> result) {
+  Node* checkpoint_params[] = {params.receiver, params.comparefn,
+                               params.temp_array, params.original_length,
+                               result};
+  return CreateJavaScriptBuiltinContinuationFrameState(
+      params.jsgraph, params.shared,
+      Builtin::
+          kArraySortContinueFromSnapshotAfterCallbackEagerDeoptContinuation,
+      params.target, params.context, checkpoint_params,
+      arraysize(checkpoint_params), params.outer_frame_state,
+      ContinuationFrameStateMode::EAGER);
+}
+
 // ---- Array.prototype.forEach
 // --------------------------------------------------
 
@@ -1775,11 +1789,11 @@ TNode<Object> IteratingArrayBuiltinReducerAssembler::ReduceArrayPrototypeSort(
   //   Call Array.prototype.sort with kDisallowSpeculation to prevent
   //   re-reduction.
   //
-  // On any deopt the ArraySortContinueFromSnapshot{Eager,Lazy}DeoptContinuation
-  // builtins hand temp_array + the original length to the generic PowerSort
-  // tail.  This preserves the spec's snapshot semantics across deopts:
-  // comparefn side effects on the receiver are overwritten by the writeback
-  // and never leak into the final result.
+  // On any deopt the ArraySortContinueFromSnapshot*DeoptContinuation builtins
+  // pass temp_array + the original length to the generic PowerSort tail.
+  // This preserves the spec's snapshot semantics across deopts: comparefn
+  // side effects on the receiver are overwritten by the writeback and never
+  // leak into the final result.
   static constexpr int32_t kMaxInlineSortSize = JSArray::kMaxInlineSortLength;
 
   FrameState outer_frame_state = FrameStateInput();
@@ -1909,6 +1923,12 @@ TNode<Object> IteratingArrayBuiltinReducerAssembler::ReduceArrayPrototypeSort(
         // Load elem = temp_array[j].
         TNode<Object> elem = LoadElement<Object>(element_access, temp_array, j);
 
+        // Lowering the call can add eager deopts on its inputs, e.g. argument
+        // conversions for an inlined Wasm comparefn.  Earlier comparefn calls
+        // may have had side effects, so these deopts must not resume before
+        // the sort.
+        Checkpoint(SortContinueFromSnapshotEagerFrameState(frame_state_params));
+
         TNode<Object> comparefn_this = UndefinedConstant();
         TNode<Object> cmp_result =
             JSCall2(comparefn, comparefn_this, pivot, elem,
@@ -1919,10 +1939,15 @@ TNode<Object> IteratingArrayBuiltinReducerAssembler::ReduceArrayPrototypeSort(
         // loop is unsafe: the JSCall's effect chain wipes the dominating
         // frame state, and Turboshaft's graph builder DCHECKs that a
         // dominating frame state exists for SpeculativeToNumber.
-        Checkpoint(SortContinueFromSnapshotEagerFrameState(frame_state_params));
+        Checkpoint(SortContinueFromSnapshotAfterCallbackEagerFrameState(
+            frame_state_params, cmp_result));
 
         // Convert comparefn result to a number.
         TNode<Number> cmp_num = SpeculativeToNumber(cmp_result);
+
+        // Restore the plain frame state so that no later deopt in this
+        // iteration converts the result again.
+        Checkpoint(SortContinueFromSnapshotEagerFrameState(frame_state_params));
 
         // If cmp >= 0: insertion point found; exit.
         GotoIfNot(NumberLessThan(cmp_num, ZeroConstant()), &inner_exit);
@@ -4414,7 +4439,8 @@ Reduction JSCallReducer::ReduceCallWasmFunction(
   // reason I may dereference the SharedFunctionInfoRef here but not in
   // JSInliningHeuristic later on.
   const Operator* op = javascript()->CallWasm(
-      native_module, wasm_function_index, shared, p.feedback());
+      native_module, wasm_function_index, shared, p.feedback(),
+      instance_data->break_on_entry() != 0);
 
   size_t actual_arity = n.ArgumentCount();
   DCHECK(JSCallNode::kFeedbackVectorIsLastInput);
@@ -7170,31 +7196,26 @@ Reduction JSCallReducer::ReduceArrayIterator(Node* node,
   // array. So don't bother optimizing in that case.
   if (array_kind == ArrayIteratorKind::kTypedArray &&
       !inference.AllOfInstanceTypesAre(InstanceType::JS_TYPED_ARRAY_TYPE)) {
-    return NoChange();
+    return inference.NoChange();
   }
 
   if (array_kind == ArrayIteratorKind::kTypedArray) {
-    DCHECK(!inference.AnyOfInstanceTypesAre(
-        InstanceType::JS_DETACHED_TYPED_ARRAY_TYPE));
+    CallParameters const& p = CallParametersOf(node->op());
+    if (p.speculation_mode() != SpeculationMode::kAllowSpeculation) {
+      return inference.NoChange();
+    }
+
+    // The detach check below relies on the {elements_kinds} of these maps.
+    std::set<ElementsKind> elements_kinds;
+    for (MapRef map : inference.GetMaps()) {
+      elements_kinds.insert(map.elements_kind());
+    }
+    inference.RelyOnMapsPreferStability(dependencies(), jsgraph(), &effect,
+                                        control, p.feedback());
+
     // Make sure we deopt when the JSArrayBuffer is detached.
     if (!dependencies()->DependOnArrayBufferDetachingProtector()) {
-      CallParameters const& p = CallParametersOf(node->op());
-      if (p.speculation_mode() != SpeculationMode::kAllowSpeculation) {
-        return NoChange();
-      }
-
-      std::set<ElementsKind> elements_kinds;
-      for (MapRef map : inference.GetMaps()) {
-        elements_kinds.insert(map.elements_kind());
-      }
-
-      // The following detach check is built with the given {elements_kinds} in
-      // mind, so we have to install dependency on those.
-      inference.RelyOnMapsPreferStability(
-          dependencies(), jsgraph(), &effect, control,
-          CallParametersOf(node->op()).feedback());
-
-      JSCallReducerAssembler a(this, node);
+      JSCallReducerAssembler a(this, node, effect, control);
       a.CheckIfTypedArrayWasDetachedOrOutOfBounds(
           TNode<JSTypedArray>::UncheckedCast(receiver),
           std::move(elements_kinds), p.feedback());
@@ -8703,7 +8724,7 @@ Reduction JSCallReducer::ReduceArrayBufferViewByteLengthAccessor(
     return inference.NoChange();
   }
 
-  JSCallReducerAssembler a(this, node);
+  JSCallReducerAssembler a(this, node, effect, control);
   TNode<JSTypedArray> typed_array =
       TNode<JSTypedArray>::UncheckedCast(receiver);
   TNode<Number> length = a.ArrayBufferViewByteLength(

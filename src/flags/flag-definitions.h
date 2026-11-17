@@ -3004,6 +3004,9 @@ DEFINE_IMPLICATION(enable_apx_f_ccmp, enable_apx_f)
 #ifdef V8_ENABLE_AVX10_1
 DEFINE_BOOL(enable_avx10_1, false,
             "enable use of AVX10.1 instructions if available")
+DEFINE_BOOL(enable_avx10_2, false,
+            "enable use of AVX10.2 instructions if available")
+DEFINE_IMPLICATION(enable_avx10_2, enable_avx10_1)
 #endif
 DEFINE_STRING(arm_arch, ARM_ARCH_DEFAULT,
               "generate instructions for the selected ARM architecture if "
@@ -3337,6 +3340,12 @@ DEFINE_WEAK_IMPLICATION(future, clone_object_sidestep_transitions)
 DEFINE_INT(fast_properties_soft_limit, 12,
            "limits the number of properties that can be added to an object "
            "using keyed store before transitioning to dictionary mode")
+
+// runtime-literals.cc
+DEFINE_BOOL(fast_null_proto_literals, false,
+            "create object literals with __proto__: null and boilerplate "
+            "properties in fast mode instead of dictionary mode")
+DEFINE_WEAK_IMPLICATION(future, fast_null_proto_literals)
 
 DEFINE_BOOL(native_code_counters, DEBUG_BOOL,
             "generate extra code for manipulating stats counters")

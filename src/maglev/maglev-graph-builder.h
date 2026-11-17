@@ -227,6 +227,10 @@ class MaglevGraphBuilder {
   std::tuple<DeoptFrame*, interpreter::Register, int> GetDeoptFrameForLazyDeopt(
       bool can_throw);
 
+  void OnBeginEagerDeoptFrameScope() {
+    // A cached checkpointed frame does not include this scope.
+    latest_checkpointed_frame_ = nullptr;
+  }
   void OnEndDeoptFrameScope() {
     // We might have cached a checkpointed frame which includes this scope;
     // reset it just in case.
@@ -335,9 +339,9 @@ class MaglevGraphBuilder {
     void MergeDeadInterpreterFrameState(Label* label, unsigned num);
 
    protected:
-    class BorrowParentKnownNodeAspectsAndVOs;
-    void TakeKnownNodeAspectsAndVOsFromParent();
-    void MoveKnownNodeAspectsAndVOsToParent();
+    class BorrowParentKnownNodeAspects;
+    void TakeKnownNodeAspectsFromParent();
+    void MoveKnownNodeAspectsToParent();
 
     MaglevCompilationUnit* compilation_unit() const {
       return builder_->compilation_unit();
@@ -943,7 +947,7 @@ class MaglevGraphBuilder {
       base::FunctionRef<ReduceResult(ValueNode*, ValueNode*)>;
   using GetEagerDeoptScopeCallback = base::FunctionRef<EagerDeoptFrameScope(
       compiler::JSFunctionRef, ValueNode*, ValueNode*, ValueNode*, ValueNode*,
-      ValueNode*, ValueNode*)>;
+      ValueNode*)>;
   using GetLazyDeoptScopeCallback = base::FunctionRef<LazyDeoptFrameScope(
       compiler::JSFunctionRef, ValueNode*, ValueNode*, ValueNode*, ValueNode*,
       ValueNode*, ValueNode*)>;
@@ -1251,7 +1255,9 @@ class MaglevGraphBuilder {
   ReduceResult BuildCheckNotHole(ValueNode* node);
 
   ReduceResult BuildLogicalNot(ValueNode* value);
-  ReduceResult BuildTestUndetectable(ValueNode* value);
+  ReduceResult BuildTestUndetectable(ValueNode* value) {
+    return reducer_.BuildTestUndetectable(value);
+  }
   ReduceResult BuildToNumberOrToNumeric(Object::Conversion mode);
 
   bool IsFieldConstant(ValueNode* object, int offset);
@@ -1537,7 +1543,6 @@ class MaglevGraphBuilder {
 
   void AddDeoptUse(ValueNode* node);
   void AddMaterializedDeoptUse(ValueNode* node);
-  void AddDeoptUse(VirtualObject* alloc);
 
   void AddDeoptUseToScopeData(const DeoptFrame::FrameData& data);
 
@@ -1652,6 +1657,10 @@ class MaglevGraphBuilder {
   ReduceResult BuildTaggedEqual(ValueNode* lhs, RootIndex rhs_index) {
     return reducer_.BuildTaggedEqual(lhs, rhs_index);
   }
+  ReduceResult BuildReceiverOrNullOrUndefinedEqual(ValueNode* lhs,
+                                                   ValueNode* rhs) {
+    return reducer_.BuildReceiverOrNullOrUndefinedEqual(lhs, rhs);
+  }
 
   using BranchResult = ::v8::internal::maglev::BranchResult;
   using BranchType = ::v8::internal::maglev::BranchType;
@@ -1736,7 +1745,9 @@ class MaglevGraphBuilder {
                                           ValueNode* node);
   template <typename BranchBuilderT>
   BranchResult BuildBranchIfReferenceEqual(BranchBuilderT& builder,
-                                           ValueNode* lhs, ValueNode* rhs);
+                                           ValueNode* lhs, ValueNode* rhs) {
+    return reducer_.BuildBranchIfReferenceEqual(builder, lhs, rhs);
+  }
   template <typename BranchBuilderT>
   BranchResult BuildBranchIfInt32Compare(BranchBuilderT& builder, Operation op,
                                          ValueNode* lhs, ValueNode* rhs);
@@ -2029,6 +2040,9 @@ class MaglevGraphBuilder {
   ZoneMap<int, ContextScopeInfo> dead_scope_infos_;
 
   bool is_resumable_function_ = false;
+  // True if a resumable function may change its current context.
+  bool resumable_context_may_change_ = true;
+  void AnalyzeResumableFunction();
 
   // When set, inline only small functions.
   bool only_inline_small_ = false;

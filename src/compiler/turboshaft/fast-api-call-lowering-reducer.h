@@ -87,7 +87,7 @@ class FastApiCallLoweringReducer : public Next {
         // data = data_argument
         OpIndex data_argument_to_pass = __ AdaptLocalArgument(data_argument);
         constexpr size_t data_offset =
-            offsetof(v8::FastApiCallbackOptions, data_);
+            offsetof(v8::FastApiCallbackOptions, data);
         __ StoreOffHeap(stack_slot, data_argument_to_pass,
                         MemoryRepresentation::UintPtr(), data_offset);
 
@@ -167,6 +167,7 @@ class FastApiCallLoweringReducer : public Next {
   OpIndex AdaptFastCallArgument(OpIndex argument, CTypeInfo arg_type,
                                 Label<>& handle_error) {
     uint8_t flags = static_cast<uint8_t>(arg_type.GetFlags());
+    START_ALLOW_USE_DEPRECATED()
     if (flags & static_cast<uint8_t>(CTypeInfo::Flags::kEnforceRangeBit)) {
       switch (arg_type.GetType()) {
         case CTypeInfo::Type::kInt32: {
@@ -222,6 +223,7 @@ class FastApiCallLoweringReducer : public Next {
           }
           return argument;
         }
+          END_ALLOW_USE_DEPRECATED()
         case CTypeInfo::Type::kPointer: {
           // Check that the value is a HeapObject.
           GOTO_IF(__ ObjectIsSmi(argument), handle_error);

@@ -350,6 +350,7 @@ concept ReducerBaseWithLazyDeopt = requires(BaseT* b) {
 
 template <typename BaseT>
 concept ReducerBaseWithDeoptFrameScopeHooks = requires(BaseT* b) {
+  b->OnBeginEagerDeoptFrameScope();
   b->OnEndDeoptFrameScope();
 };
 
@@ -738,10 +739,16 @@ class MaglevReducer {
   // re-executing the current bytecode.
   class V8_NODISCARD EagerDeoptFrameScope {
    public:
+    // Eager continuations never chain. By default a scope must not be created
+    // while another one is live. kShadowEnclosing replaces the enclosing scope
+    // for this scope's lifetime.
+    enum Nesting { kMustBeOutermost, kShadowEnclosing };
+
     EagerDeoptFrameScope(MaglevReducer* reducer, ValueNode* context,
                          Builtin continuation,
                          compiler::OptionalJSFunctionRef maybe_js_target = {},
-                         base::Vector<ValueNode* const> parameters = {});
+                         base::Vector<ValueNode* const> parameters = {},
+                         Nesting nesting = kMustBeOutermost);
     ~EagerDeoptFrameScope();
 
     LazyDeoptFrameScope* parent() const { return parent_; }
@@ -754,6 +761,8 @@ class MaglevReducer {
     // continuation, because we want to continue _after_ the eager deopt
     // continuation completes.
     LazyDeoptFrameScope* parent_;
+    // The shadowed enclosing scope, restored on destruction.
+    EagerDeoptFrameScope* previous_;
   };
 
   LazyDeoptFrameScope* current_lazy_deopt_scope() const {
@@ -931,6 +940,9 @@ class MaglevReducer {
 
   ReduceResult BuildTaggedEqual(ValueNode* lhs, ValueNode* rhs);
   ReduceResult BuildTaggedEqual(ValueNode* lhs, RootIndex rhs_index);
+  ReduceResult BuildReceiverOrNullOrUndefinedEqual(ValueNode* lhs,
+                                                   ValueNode* rhs);
+  ReduceResult BuildTestUndetectable(ValueNode* value);
 
   ReduceResult BuildSameValue(ValueNode* lhs, ValueNode* rhs);
   ReduceResult BuildNumberSameValue(ValueNode* lhs, ValueNode* rhs);
@@ -1490,6 +1502,9 @@ class MaglevReducer {
   BranchResult BuildBranchIfFloat64IsUndefinedOrHole(BranchBuilderT& b,
                                                      ValueNode* node);
 #endif  // V8_ENABLE_UNDEFINED_DOUBLE
+  template <typename BranchBuilderT>
+  BranchResult BuildBranchIfReferenceEqual(BranchBuilderT& b, ValueNode* lhs,
+                                           ValueNode* rhs);
   template <typename BranchBuilderT>
   BranchResult BuildBranchIfJSReceiver(BranchBuilderT& b, ValueNode* value);
   template <typename BranchBuilderT>

@@ -2767,9 +2767,8 @@ V8_WARN_UNUSED_RESULT MaybeLocal<Function> ScriptCompiler::CompileFunction(
          options == CompileOptions::kEagerCompile ||
          options == CompileOptions::kNoCompileOptions);
 
-  i::DirectHandle<i::Context> context = Utils::OpenDirectHandle(*v8_context);
-
-  DCHECK(IsNativeContext(*context));
+  i::DirectHandle<i::NativeContext> context =
+      Utils::OpenDirectHandle(*v8_context);
 
   i::Handle<i::FixedArray> arguments_list =
       i_isolate->factory()->NewFixedArray(static_cast<int>(arguments_count));
@@ -2779,18 +2778,13 @@ V8_WARN_UNUSED_RESULT MaybeLocal<Function> ScriptCompiler::CompileFunction(
     arguments_list->set(i, *argument);
   }
 
+  i::DirectHandleVector<i::JSReceiver> extensions(i_isolate,
+                                                  context_extension_count);
   for (size_t i = 0; i < context_extension_count; ++i) {
     i::DirectHandle<i::JSReceiver> extension =
         Utils::OpenDirectHandle(*context_extensions[i]);
     if (!IsJSObject(*extension)) return {};
-    context = i_isolate->factory()->NewWithContext(
-        context,
-        i::ScopeInfo::CreateForWithScope(
-            i_isolate,
-            IsNativeContext(*context)
-                ? i::Handle<i::ScopeInfo>::null()
-                : i::Handle<i::ScopeInfo>(context->scope_info(), i_isolate)),
-        extension);
+    extensions[i] = extension;
   }
 
   i::ScriptDetails script_details = GetScriptDetails(
@@ -2798,6 +2792,8 @@ V8_WARN_UNUSED_RESULT MaybeLocal<Function> ScriptCompiler::CompileFunction(
       source->resource_column_offset, source->source_map_url,
       source->host_defined_options, source->resource_options);
   script_details.wrapped_arguments = arguments_list;
+  script_details.context_extension_count =
+      static_cast<uint32_t>(context_extension_count);
 
   std::unique_ptr<i::AlignedCachedData> cached_data;
   if (options & kConsumeCodeCache) {
@@ -2811,7 +2807,8 @@ V8_WARN_UNUSED_RESULT MaybeLocal<Function> ScriptCompiler::CompileFunction(
   bool has_exception =
       !i::Compiler::GetWrappedFunction(
            i_isolate, Utils::OpenHandle(*source->source_string), context,
-           script_details, cached_data.get(), options, no_cache_reason)
+           base::VectorOf(extensions), script_details, cached_data.get(),
+           options, no_cache_reason)
            .ToHandle(&result);
   if (options & kConsumeCodeCache) {
     source->cached_data->rejected = cached_data->rejected();
@@ -12211,7 +12208,7 @@ const CTypeInfo& CFunctionInfo::ArgumentInfo(unsigned int index) const {
 }
 
 namespace api_internal {
-V8_EXPORT v8::Local<v8::Data> GetFunctionTemplateDataV2(
+V8_EXPORT v8::Local<v8::Data> GetFunctionTemplateData(
     v8::Isolate* isolate, v8::Local<v8::Data> raw_target) {
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
   i::DirectHandle<i::Object> target = Utils::OpenDirectHandle(*raw_target);
@@ -12228,7 +12225,7 @@ V8_EXPORT v8::Local<v8::Data> GetFunctionTemplateDataV2(
           shared->api_func_data()->callback_data(kAcquireLoad), i_isolate));
     }
   }
-  Utils::ApiCheck(false, "api_internal::GetFunctionTemplateDataV2",
+  Utils::ApiCheck(false, "api_internal::GetFunctionTemplateData",
                   "Target function is not an Api function");
   UNREACHABLE();
 }
@@ -12523,7 +12520,7 @@ bool ValidateFunctionCallbackInfo(const FunctionCallbackInfo<T>& info) {
   CHECK_EQ(i_isolate, Isolate::Current());
   CHECK(!i_isolate->GetIncumbentContext().is_null());
   CHECK(info.This()->IsObject());
-  CHECK(!info.DataV2().IsEmpty());
+  CHECK(!info.Data().IsEmpty());
   CHECK(info.GetReturnValue().Get()->IsValue());
   return true;
 }
@@ -12540,7 +12537,7 @@ bool ValidatePropertyCallbackInfo(const PropertyCallbackInfo<T>& info) {
         *i::PropertyCallbackArguments::GetPropertyName(info);
     CHECK(i::IsName(name));
   }
-  CHECK(info.DataV2()->IsValue());
+  CHECK(info.Data()->IsValue());
   USE(info.ShouldThrowOnError());
   if (!std::is_same_v<T, void>) {
     CHECK(info.GetReturnValue().Get()->IsValue());

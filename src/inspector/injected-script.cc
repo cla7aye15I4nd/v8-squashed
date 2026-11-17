@@ -164,7 +164,7 @@ class InjectedScript::ProtocolPromiseHandler {
   static void thenCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
     PromiseHandlerTracker::Id handlerId =
         static_cast<PromiseHandlerTracker::Id>(
-            info.DataV2().As<v8::Value>().As<v8::Number>()->Value());
+            info.Data().As<v8::Value>().As<v8::Number>()->Value());
     PromiseHandlerTracker& handlerTracker =
         static_cast<V8InspectorImpl*>(
             v8::debug::GetInspector(info.GetIsolate()))
@@ -185,7 +185,7 @@ class InjectedScript::ProtocolPromiseHandler {
   static void catchCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
     PromiseHandlerTracker::Id handlerId =
         static_cast<PromiseHandlerTracker::Id>(
-            info.DataV2().As<v8::Value>().As<v8::Number>()->Value());
+            info.Data().As<v8::Value>().As<v8::Number>()->Value());
     PromiseHandlerTracker& handlerTracker =
         static_cast<V8InspectorImpl*>(
             v8::debug::GetInspector(info.GetIsolate()))
@@ -1353,21 +1353,21 @@ Response InjectedScript::bindRemoteObjectIfNeeded(
     const String16& groupName, protocol::Runtime::RemoteObject* remoteObject) {
   if (!remoteObject) return Response::Success();
   if (remoteObject->hasValue()) return Response::Success();
-  if (remoteObject->hasUnserializableValue()) return Response::Success();
-  if (remoteObject->getType() != RemoteObject::TypeEnum::Undefined) {
-    v8::Isolate* isolate = v8::Isolate::GetCurrent();
-    V8InspectorImpl* inspector =
-        static_cast<V8InspectorImpl*>(v8::debug::GetInspector(isolate));
-    std::shared_ptr<InspectedContext> inspectedContext =
-        inspector->getContext(InspectedContext::contextId(context));
-    std::shared_ptr<InjectedScript> injectedScript =
-        inspectedContext ? inspectedContext->getInjectedScript(sessionId)
-                         : nullptr;
-    if (!injectedScript) {
-      return Response::ServerError("Cannot find context with specified id");
-    }
-    remoteObject->setObjectId(injectedScript->bindObject(value, groupName));
+  // Primitives other than symbols are reported by value (in `deep`
+  // serialization mode in `deepSerializedValue`), so they get no object id.
+  if (value->IsPrimitive() && !value->IsSymbol()) return Response::Success();
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  V8InspectorImpl* inspector =
+      static_cast<V8InspectorImpl*>(v8::debug::GetInspector(isolate));
+  std::shared_ptr<InspectedContext> inspectedContext =
+      inspector->getContext(InspectedContext::contextId(context));
+  std::shared_ptr<InjectedScript> injectedScript =
+      inspectedContext ? inspectedContext->getInjectedScript(sessionId)
+                       : nullptr;
+  if (!injectedScript) {
+    return Response::ServerError("Cannot find context with specified id");
   }
+  remoteObject->setObjectId(injectedScript->bindObject(value, groupName));
   return Response::Success();
 }
 

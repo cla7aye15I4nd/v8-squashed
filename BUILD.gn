@@ -2732,7 +2732,6 @@ if (v8_enable_experimental_tq_to_tsa) {
     action("run_torque_to_tsa" + suffix) {
       visibility = [
         ":*",
-        "test/cctest/:*",
         "tools/debug_helper/:*",
         "tools/gcmole/:*",
       ]
@@ -2803,7 +2802,6 @@ template("run_torque") {
   action("run_torque" + suffix) {
     visibility = [
       ":*",
-      "test/cctest/:*",
       "tools/debug_helper/:*",
       "tools/gcmole/:*",
     ]
@@ -3109,7 +3107,6 @@ v8_cluster_source_set("torque_generated_definitions") {
 
   deps = [
     ":generate_bytecode_builtins_list",
-    ":run_torque",
     ":v8_internal_headers",
     ":v8_libbase",
     ":v8_maybe_ecma402_icu4x",
@@ -3121,6 +3118,7 @@ v8_cluster_source_set("torque_generated_definitions") {
   }
 
   public_deps = [
+    ":run_torque",
     ":v8_abseil",
     ":v8_maybe_icu",
   ]
@@ -3800,10 +3798,7 @@ v8_source_set("v8_snapshot") {
 }
 
 v8_cluster_source_set("v8_initializers") {
-  visibility = [
-    ":*",
-    "test/cctest:*",
-  ]
+  visibility = [ ":*" ]
 
   allow_circular_includes_from = [ ":torque_generated_initializers" ]
 
@@ -5975,6 +5970,7 @@ v8_header_set("v8_internal_headers") {
   }
 
   public_deps = [
+    ":generated_headers",
     ":torque_runtime_support",
     ":v8_flags",
     ":v8_headers",
@@ -5990,7 +5986,6 @@ v8_header_set("v8_internal_headers") {
 
   deps = [
     ":cppgc_headers",
-    ":generated_headers",
     ":v8_abseil",
     ":v8_heap_base_headers",
     ":v8_libbase",
@@ -8914,11 +8909,6 @@ group("v8_archive") {
   testonly = true
 
   deps = [ ":d8" ]
-
-  if (!is_win) {
-    # On windows, cctest doesn't link with v8_static_library.
-    deps += [ "test/cctest" ]
-  }
 }
 
 # TODO(dglazkov): Remove the "!build_with_chromium" condition once this clause
@@ -9038,7 +9028,7 @@ if (is_component_build) {
     ]
 
     if (v8_enable_turbofan) {
-      # For cctest/test-serialize.
+      # For serialize-unittest.
       public_deps += [ ":v8_initializers" ]
     }
 
@@ -9113,7 +9103,7 @@ if (is_component_build) {
     ]
 
     if (v8_enable_turbofan) {
-      # For cctest/test-serialize.
+      # For serialize-unittest.
       public_deps += [ ":v8_initializers" ]
     }
 
