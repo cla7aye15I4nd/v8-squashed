@@ -501,9 +501,7 @@ using DebugObjectCache = std::vector<Handle<HeapObject>>;
     nullptr)                                                                \
   V(AllowWasmCodeGenerationCallback, allow_wasm_code_gen_callback, nullptr) \
   V(WasmModuleCallback, wasm_module_callback, nullptr)                      \
-  V(ExtensionCallback, deprecated_wasm_module_callback, nullptr)            \
   V(WasmInstanceCallback, wasm_instance_callback, nullptr)                  \
-  V(ExtensionCallback, deprecated_wasm_instance_callback, nullptr)          \
   V(SharedArrayBufferConstructorEnabledCallback,                            \
     sharedarraybuffer_constructor_enabled_callback, nullptr)                \
   V(WasmStreamingCallback, wasm_streaming_callback, nullptr)                \
@@ -1382,7 +1380,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   StubCache* load_stub_cache() const { return load_stub_cache_; }
   StubCache* store_stub_cache() const { return store_stub_cache_; }
   StubCache* define_own_stub_cache() const { return define_own_stub_cache_; }
-  StubCache* has_stub_cache() const { return has_stub_cache_; }
   Deoptimizer* GetAndClearCurrentDeoptimizer() {
     Deoptimizer* result = current_deoptimizer_;
     CHECK_NOT_NULL(result);
@@ -2492,6 +2489,16 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     memory_saver_mode_enabled_ = memory_saver_mode_enabled;
   }
 
+  // Returns true if the debugger has mutated a context slot marked as
+  // kNotAssigned in ScopeInfo, making the kNotAssigned flag unreliable for
+  // constant-folding optimizations in this isolate.
+  bool is_context_slot_not_assigned_unreliable() const {
+    return context_slot_not_assigned_is_unreliable_.load(
+        std::memory_order_relaxed);
+  }
+
+  void MarkContextSlotNotAssignedIsUnreliable();
+
   void ReportExceptionFunctionCallback(
       DirectHandle<JSReceiver> receiver,
       DirectHandle<FunctionTemplateInfo> function,
@@ -2670,7 +2677,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   StubCache* load_stub_cache_ = nullptr;
   StubCache* store_stub_cache_ = nullptr;
   StubCache* define_own_stub_cache_ = nullptr;
-  StubCache* has_stub_cache_ = nullptr;
   Deoptimizer* current_deoptimizer_ = nullptr;
   bool deoptimizer_lazy_throw_ = false;
   MaterializedObjectStore* materialized_object_store_ = nullptr;
@@ -2717,6 +2723,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 
   std::atomic<bool> battery_saver_mode_enabled_ = false;
   std::atomic<bool> memory_saver_mode_enabled_ = false;
+  std::atomic<bool> context_slot_not_assigned_is_unreliable_ = false;
 
   // Helper function for RunHostImportModuleDynamicallyCallback.
   // Unpacks import attributes, if present, from the second argument to dynamic

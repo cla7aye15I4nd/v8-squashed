@@ -3527,13 +3527,13 @@ void Shell::WasmSerializeModule(
                            ? 0
                            : wasm_serializer.GetSerializedNativeModuleSize();
 
-  Local<ArrayBuffer> array_buffer = ArrayBuffer::New(isolate, byte_length);
-
-  base::Vector<uint8_t> byte_buffer{
-      static_cast<uint8_t*>(array_buffer->GetBackingStore()->Data()),
-      byte_length};
+  // Serialize into an off-heap buffer outside the sandbox first so concurrent
+  // in-sandbox writes cannot tamper with the serialized bytes before we hash
+  // them.
+  base::UniqueArray<uint8_t> byte_buffer =
+      base::UniqueArray<uint8_t>::NewForOverwrite(byte_length);
   if (!i::v8_flags.correctness_fuzzer_suppressions &&
-      !wasm_serializer.SerializeNativeModule(byte_buffer)) {
+      !wasm_serializer.SerializeNativeModule(byte_buffer.as_span())) {
     CHECK(i::v8_flags.fuzzing);
     return;
   }
@@ -3544,10 +3544,16 @@ void Shell::WasmSerializeModule(
     size_t hash = base::Hasher{}
                       .Add(native_module->wire_bytes().size())
                       .AddRange(native_module->wire_bytes())
-                      .AddRange(byte_buffer)
+                      .AddRange(byte_buffer.as_span())
                       .hash();
     base::MutexGuard mutex_guard(Shell::wasm_serialized_bytes_mutex_.Pointer());
     Shell::wasm_serialized_bytes_hashes_.insert(hash);
+  }
+
+  Local<ArrayBuffer> array_buffer = ArrayBuffer::New(isolate, byte_length);
+  if (byte_length > 0) {
+    base::MemCopy(array_buffer->GetBackingStore()->Data(), byte_buffer.data(),
+                  byte_length);
   }
 
   info.GetReturnValue().Set(array_buffer);
@@ -5530,16 +5536,16 @@ void WriteWasmLcovData(v8::Isolate* isolate, const char* file) {
     sink << "SF:";
     sink << disasm_file_path << std::endl;
 
-    DCHECK_EQ(script_data.FunctionCount(), wasm_module->num_declared_functions);
+    DCHECK_EQ(script_data.FunctionCount(), wasm_module->num_defined_functions);
 
-    for (size_t declared_function_index = 0;
-         declared_function_index < wasm_module->num_declared_functions;
-         declared_function_index++) {
+    for (size_t defined_function_index = 0;
+         defined_function_index < wasm_module->num_defined_functions;
+         defined_function_index++) {
       debug::Coverage::FunctionData function_data =
-          script_data.GetFunctionData(declared_function_index);
+          script_data.GetFunctionData(defined_function_index);
       const i::wasm::WasmFunction& function =
           wasm_module->functions[wasm_module->num_imported_functions +
-                                 declared_function_index];
+                                 defined_function_index];
 
       // Write function stats.
       {
@@ -5548,7 +5554,7 @@ void WriteWasmLcovData(v8::Isolate* isolate, const char* file) {
         // first instruction in the function, followed by the end offset.
         int start_line = bytecode_disasm_offsets[function.code.offset()];
         uint32_t first_instruction_offset =
-            function_body_offsets[declared_function_index * 2];
+            function_body_offsets[defined_function_index * 2];
         int first_instruction_line =
             bytecode_disasm_offsets[first_instruction_offset];
         uint32_t block_count = function_data.BlockCount() == 0

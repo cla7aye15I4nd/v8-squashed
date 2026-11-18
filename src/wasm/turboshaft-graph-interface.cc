@@ -1079,7 +1079,8 @@ class TurboshaftGraphBuildingInterface
                            Value* result) {
     __ TrapIfNot(__ IsNull(obj.get<Object>(), obj.type),
                  TrapId::kTrapIllegalCast);
-    Forward(decoder, obj, result);
+    result->op = __ AnnotateWasmType(
+        obj.get<Object>(), ToNullSentinel({obj.type, decoder->module_}));
   }
 
   void AssertNotNullTypecheck(FullDecoder* decoder, const Value& obj,
@@ -1995,6 +1996,13 @@ class TurboshaftGraphBuildingInterface
                          const Value args[], Value returns[],
                          CheckForException check_for_exception) {
     uint32_t func_index = imm.index;
+    const wasm::FunctionSig* sig = decoder->module_->functions[func_index].sig;
+    size_t param_count = sig->parameter_count();
+    DCHECK_LE(sig->return_count(), 1);
+    DCHECK_GE(param_count, 1);
+    DCHECK(sig->GetParam(0).is_reference_to(GenericKind::kExtern) &&
+           !sig->GetParam(0).is_shared());
+
     V<Object> receiver = args[0].get<Object>();
     // TODO(14616): Fix this.
     V<FixedArray> imports_array = LOAD_IMMUTABLE_INSTANCE_FIELD(
@@ -2027,10 +2035,6 @@ class TurboshaftGraphBuildingInterface
     BIND(if_equal_maps);
     OpIndex receiver_handle = __ AdaptLocalArgument(receiver);
 
-    const wasm::FunctionSig* sig = decoder->module_->functions[func_index].sig;
-    size_t param_count = sig->parameter_count();
-    DCHECK_LE(sig->return_count(), 1);
-
     const MachineSignature* callback_sig =
         env_->fast_api_data[func_index].signature;
     // All normal parameters + the options as additional parameter at the end.
@@ -2057,6 +2061,8 @@ class TurboshaftGraphBuildingInterface
     for (size_t i = 1; i < param_count; ++i) {
       inputs[i] = OpIndex::Invalid();
       if (sig->GetParam(i).is_ref()) {
+        DCHECK(sig->GetParam(i).is_reference_to(GenericKind::kExtern) &&
+               !sig->GetParam(i).is_shared());
         inputs[i] = __ AdaptLocalArgument(args[i].get<Object>());
       } else if (callback_sig->GetParam(i - 1).representation() ==
                  MachineRepresentation::kWord64) {
@@ -3355,17 +3361,19 @@ class TurboshaftGraphBuildingInterface
 
   void BrOnNull(FullDecoder* decoder, const Value& ref_object, uint32_t depth,
                 bool pass_null_along_branch, Value* result_on_fallthrough) {
-    result_on_fallthrough->op = ref_object.op;
     IF (UNLIKELY(__ IsNull(ref_object.get<Object>(), ref_object.type))) {
       int drop_values = pass_null_along_branch ? 0 : 1;
       BrOrRet(decoder, depth, drop_values);
     }
+    result_on_fallthrough->op = __ AnnotateWasmType(
+        ref_object.get<Object>(), ref_object.type.AsNonNull());
   }
 
   void BrOnNonNull(FullDecoder* decoder, const Value& ref_object, Value* result,
                    uint32_t depth, bool /* drop_null_on_fallthrough */) {
-    result->op = ref_object.op;
     IF_NOT (UNLIKELY(__ IsNull(ref_object.get<Object>(), ref_object.type))) {
+      result->op = __ AnnotateWasmType(ref_object.get<Object>(),
+                                       ref_object.type.AsNonNull());
       BrOrRet(decoder, depth);
     }
   }
@@ -5987,7 +5995,6 @@ class TurboshaftGraphBuildingInterface
 
   void RefCast(FullDecoder* decoder, const Value& object, Value* result) {
     if (v8_flags.wasm_assume_ref_cast_succeeds) {
-      // TODO(14108): Implement type guards.
       Forward(decoder, object, result);
       return;
     }
@@ -6003,7 +6010,6 @@ class TurboshaftGraphBuildingInterface
   void RefCastDescEq(FullDecoder* decoder, const Value& object,
                      const Value& desc, Value* result) {
     if (v8_flags.wasm_assume_ref_cast_succeeds) {
-      // TODO(14108): Implement type guards.
       Forward(decoder, object, result);
       return;
     }
@@ -6016,7 +6022,6 @@ class TurboshaftGraphBuildingInterface
   void RefCastAbstract(FullDecoder* decoder, const Value& object, HeapType type,
                        Value* result, bool null_succeeds) {
     if (v8_flags.wasm_assume_ref_cast_succeeds) {
-      // TODO(14108): Implement type guards.
       Forward(decoder, object, result);
       return;
     }
@@ -6623,7 +6628,12 @@ class TurboshaftGraphBuildingInterface
   }
 
   void Forward(FullDecoder* decoder, const Value& from, Value* to) {
-    to->op = from.op;
+    if (to->type.is_ref() &&
+        !IsSubtypeOf(from.type, to->type, decoder->module_)) {
+      to->op = __ AnnotateWasmType(from.get<Object>(), to->type);
+    } else {
+      to->op = from.op;
+    }
   }
 
  private:
@@ -9016,14 +9026,13 @@ class TurboshaftGraphBuildingInterface
     OpIndex cast_succeeds = __ WasmTypeCheck(object.get<Object>(), rtt, config);
     IF (cast_succeeds) {
       // Narrow type for the successful cast target branch.
-      Forward(decoder, object, value_on_branch);
+      value_on_branch->op =
+          __ AnnotateWasmType(object.get<Object>(), config.to);
       BrOrRet(decoder, br_depth);
     }
-    // Note: Differently to below for br_on_cast_fail, we do not Forward
-    // the value here to perform a TypeGuard. It can't be done here due to
-    // asymmetric decoder code. A Forward here would be popped from the stack
-    // and ignored by the decoder. Therefore the decoder has to call Forward
-    // itself.
+    // Note: Unlike BrOnCastFailImpl below, we do not annotate the fallthrough
+    // value here. Due to asymmetric decoder code, the fallthrough value is
+    // pushed after BrOnCastImpl returns, so the decoder calls Forward itself.
   }
 
   void BrOnCastFailImpl(FullDecoder* decoder, V<Map> rtt,
@@ -9033,10 +9042,14 @@ class TurboshaftGraphBuildingInterface
     V<Word32> cast_succeeds =
         __ WasmTypeCheck(object.get<Object>(), rtt, config);
     IF_NOT (cast_succeeds) {
-      // It is necessary in case of {null_succeeds} to forward the value.
-      // This will add a TypeGuard to the non-null type (as in this case the
-      // object is non-nullable).
-      Forward(decoder, object, decoder->stack_value(1));
+      if (null_succeeds && object.type.is_nullable()) {
+        // Null would have succeeded the cast, so on the failing branch the
+        // object is guaranteed to be non-null.
+        decoder->stack_value(1)->op =
+            __ AnnotateWasmType(object.get<Object>(), object.type.AsNonNull());
+      } else {
+        Forward(decoder, object, decoder->stack_value(1));
+      }
       BrOrRet(decoder, br_depth);
     }
     // Narrow type for the successful cast fallthrough branch.

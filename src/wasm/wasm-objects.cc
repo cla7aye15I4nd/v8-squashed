@@ -609,7 +609,7 @@ void WasmTableObject::UpdateDispatchTable(
 
   wasm::WasmImportWrapperCache* cache = wasm::GetWasmImportWrapperCache();
   auto kind = wasm::ImportCallKind::kWasmToCapi;
-  int param_count = static_cast<int>(sig->parameter_count());
+  uint16_t param_count = static_cast<uint16_t>(sig->parameter_count());
 
   std::shared_ptr<wasm::WasmWrapperHandle> wrapper_handle =
       cache->GetCompiled(isolate, {kind, sig, param_count, wasm::kNoSuspend});
@@ -1812,7 +1812,7 @@ DirectHandle<JSFunction> WasmInternalFunction::GetOrCreateExternal(
   }
 
   // {this} can either be:
-  // - a declared function, i.e. {implicit_arg()} is a WasmTrustedInstanceData,
+  // - a defined function, i.e. {implicit_arg()} is a WasmTrustedInstanceData,
   // - or an imported callable, i.e. {implicit_arg()} is a WasmImportData which
   //   refers to the importing instance.
   // It cannot be a C API function as for those, the external function is set at

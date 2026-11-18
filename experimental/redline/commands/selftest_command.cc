@@ -50,6 +50,7 @@
 #include "experimental/redline/engine/d8_flags.h"
 #include "experimental/redline/engine/flag_minimizer.h"
 #include "experimental/redline/engine/fuzzer.h"
+#include "experimental/redline/engine/importer.h"
 #include "experimental/redline/engine/prelude.h"
 #include "experimental/redline/engine/shared_coverage.h"
 #include "experimental/redline/exec/coverage.h"
@@ -127,6 +128,9 @@ void RunD8FlagProfileChecks(Checker* checker) {
                      parsed == D8FlagProfile::kTurbolev &&
                      ParseD8FlagProfile("maglev", &parsed) &&
                      parsed == D8FlagProfile::kMaglev &&
+                     ParseD8FlagProfile("fuzzilli", &parsed) &&
+                     parsed == D8FlagProfile::kFuzzilli &&
+                     std::string(D8FlagProfileName(parsed)) == "fuzzilli" &&
                      !ParseD8FlagProfile("turbofan", &parsed),
                  "");
   // Turbolev builds its graph with the Maglev graph builder, so it also reads
@@ -216,6 +220,122 @@ void RunD8FlagProfileChecks(Checker* checker) {
   checker->Check(
       "random flags: a draw names each flag once, with the flags it needs",
       bad_draw.empty(), bad_draw);
+
+  // The `fuzzilli` profile mirrors `v8ProcessArgs` without inter-flag
+  // sanitization, and emits both polarities of `chooseBooleanFlag`.
+  std::string bad_fuzzilli;
+  bool saw_pos_bool = false;
+  bool saw_neg_bool = false;
+  Random fz_rng(11);
+  for (int i = 0; i < 500 && bad_fuzzilli.empty(); i++) {
+    std::vector<std::string> flags =
+        RandomD8Flags(fz_rng, D8FlagProfile::kFuzzilli);
+    bool no_tf = false;
+    bool no_ml = false;
+    bool ml_non_eager = false;
+    bool turbolev = false;
+    bool tl_future = false;
+    bool chaos = false;
+    bool proto_seq = false;
+    for (const std::string& flag : flags) {
+      const std::string name = name_of(flag);
+      if (name == "--no-turbofan") {
+        no_tf = true;
+      } else if (name == "--maglev-as-top-tier" && !no_tf) {
+        bad_fuzzilli = flag + " without --no-turbofan";
+      } else if (name == "--no-maglev") {
+        no_ml = true;
+      } else if (name == "--maglev-non-eager-inlining") {
+        if (no_ml) {
+          bad_fuzzilli = flag + " with --no-maglev";
+        }
+        ml_non_eager = true;
+      } else if (name == "--max-maglev-inlined-bytecode-size-small" &&
+                 !ml_non_eager) {
+        bad_fuzzilli = flag + " without --maglev-non-eager-inlining";
+      } else if (name == "--turbolev") {
+        turbolev = true;
+      } else if (name == "--turbolev-future") {
+        if (!turbolev) {
+          bad_fuzzilli = flag + " without --turbolev";
+        }
+        tl_future = true;
+      } else if (name == "--max-inlined-bytecode-size-small" && !tl_future) {
+        bad_fuzzilli = flag + " without --turbolev-future";
+      } else if (name == "--scavenger-chaos-mode") {
+        chaos = true;
+      } else if (name == "--scavenger-chaos-mode-threshold" && !chaos) {
+        bad_fuzzilli = flag + " without --scavenger-chaos-mode";
+      } else if (name == "--proto-assign-seq-lazy-func-opt") {
+        proto_seq = true;
+      } else if (name == "--proto-assign-seq-opt-count" && !proto_seq) {
+        bad_fuzzilli = flag + " without --proto-assign-seq-lazy-func-opt";
+      } else if (name == "--always-sparkplug") {
+        saw_pos_bool = true;
+      } else if (name == "--no-always-sparkplug") {
+        saw_neg_bool = true;
+      }
+    }
+  }
+  checker->Check(
+      "random flags: the fuzzilli profile keeps parent order and both "
+      "boolean polarities",
+      bad_fuzzilli.empty() && saw_pos_bool && saw_neg_bool, bad_fuzzilli);
+
+  // Fixed flags win in `fuzzilli`: sandbox mode suppresses non-sandbox draws,
+  // and `SanitizeFuzzilliFixedClashes` drops flags that clash with fixed args.
+  struct FuzzilliFixedCase {
+    const char* label;
+    std::vector<std::string> fixed;
+    std::vector<std::string> forbidden;
+  };
+  const FuzzilliFixedCase fz_fixed_cases[] = {
+      {"--sandbox-fuzzing",
+       {"--sandbox-fuzzing"},
+       {"--verify-heap", "--stress-lazy", "--maglev-assert-types",
+        "--turbo-verify-allocation", "--turbo-verify", "--assert-types"}},
+      {"--no-maglev",
+       {"--no-maglev"},
+       {"--maglev-non-eager-inlining", "--maglev-future",
+        "--maglev-as-top-tier"}},
+      {"--maglev-as-top-tier", {"--maglev-as-top-tier"}, {"--turbolev-future"}},
+      {"--stress-concurrent-inlining",
+       {"--stress-concurrent-inlining"},
+       {"--assert-types", "--maglev-as-top-tier"}},
+      {"--jitless",
+       {"--jitless"},
+       {"--maglev-as-top-tier", "--maglev-future", "--turbolev-future",
+        "--jit-fuzzing"}},
+      {"--max-lazy", {"--max-lazy"}, {"--jit-fuzzing", "--no-lazy"}},
+      {"--empty-shared-heap",
+       {"--empty-shared-heap"},
+       {"--shared-strings", "--shared-string-table"}},
+      {"--predictable-gc-schedule",
+       {"--predictable-gc-schedule"},
+       {"--stress-compaction",
+        "--stress-scavenger-conservative-object-pinning-random"}},
+  };
+  std::string bad_fz_fixed;
+  for (const FuzzilliFixedCase& c : fz_fixed_cases) {
+    Random rng(19);
+    for (int i = 0; i < 300 && bad_fz_fixed.empty(); i++) {
+      for (const std::string& flag :
+           RandomD8Flags(rng, D8FlagProfile::kFuzzilli, c.fixed)) {
+        const std::string name = name_of(flag);
+        for (const std::string& forbid : c.forbidden) {
+          if (name == forbid) {
+            bad_fz_fixed = std::string(c.label) + " drew " + flag;
+            break;
+          }
+        }
+        if (!bad_fz_fixed.empty()) break;
+      }
+    }
+  }
+  checker->Check(
+      "random flags: the fuzzilli profile respects fixed flags and sandbox "
+      "mode",
+      bad_fz_fixed.empty(), bad_fz_fixed);
   // --single-threaded and --assert-types stop the extra jobs of
   // --stress-concurrent-inlining.
   TunableRegistry& registry = TunableRegistry::Instance();
@@ -333,7 +453,8 @@ void RunD8FlagProfileChecks(Checker* checker) {
         Flags::Parse(static_cast<int>(argv.size()), argv.data(), 2);
     return DrawD8FlagLines(parsed_flags, out, err);
   };
-  std::vector<std::string> maglev_lines, maglev_again, turbolev_lines, bad_out;
+  std::vector<std::string> maglev_lines, maglev_again, turbolev_lines,
+      fuzzilli_lines, bad_out;
   std::string flags_err, bad_err, disabled_err;
   const bool maglev_ok = run_flags({"--preset=maglev", "--n=20", "--seed=7"},
                                    &maglev_lines, &flags_err) &&
@@ -341,6 +462,8 @@ void RunD8FlagProfileChecks(Checker* checker) {
                                    &maglev_again, &flags_err);
   const bool turbolev_ok = run_flags(
       {"--preset=turbolev", "--n=20", "--seed=7"}, &turbolev_lines, &flags_err);
+  const bool fuzzilli_ok = run_flags(
+      {"--preset=fuzzilli", "--n=20", "--seed=7"}, &fuzzilli_lines, &flags_err);
   const bool bad_rejected =
       !run_flags({"--preset=maglev", "--n=0"}, &bad_out, &bad_err);
   const bool disabled_rejected =
@@ -357,12 +480,19 @@ void RunD8FlagProfileChecks(Checker* checker) {
         return line.find("--verify-turboshaft") != std::string::npos ||
                line.find("--stress-concurrent-inlining") != std::string::npos;
       });
+  const bool saw_fuzzilli_tier =
+      std::any_of(fuzzilli_lines.begin(), fuzzilli_lines.end(),
+                  [](const std::string& line) {
+                    return line.find("--turbolev") != std::string::npos;
+                  });
   checker->Check(
       "random flags: the flags command draws preset flag sets",
-      maglev_ok && turbolev_ok && bad_rejected && disabled_rejected &&
-          maglev_lines.size() == 20 && turbolev_lines.size() == 20 &&
+      maglev_ok && turbolev_ok && fuzzilli_ok && bad_rejected &&
+          disabled_rejected && maglev_lines.size() == 20 &&
+          turbolev_lines.size() == 20 && fuzzilli_lines.size() == 20 &&
           maglev_lines == maglev_again && maglev_lines != turbolev_lines &&
-          saw_top_tier && saw_turbolev_flag,
+          fuzzilli_lines != turbolev_lines && saw_top_tier &&
+          saw_turbolev_flag && saw_fuzzilli_tier,
       flags_err);
 }
 
@@ -2158,6 +2288,136 @@ void RunFuzzilliCoverageChecks(Checker* checker) {
   munmap(mapping, CoverageMap::kShmSize);
 }
 
+// Offline: wildcard expansion in ListFiles and Test262 frontmatter in
+// ImportSource.
+void RunImportChecks(Checker* checker) {
+  char dir_template[] = "/tmp/redline-import.XXXXXX";
+  if (mkdtemp(dir_template) == nullptr) {
+    checker->Check("import: create a temporary directory", false,
+                   strerror(errno));
+    return;
+  }
+  const std::string dir = dir_template;
+  std::string error;
+  const bool dirs_ok =
+      MakeDirectories(dir + "/test/test262/data/harness", &error) &&
+      MakeDirectories(dir + "/test/test262/data/test/harness", &error) &&
+      MakeDirectories(dir + "/test/test262/data/test/sub1/deep", &error) &&
+      MakeDirectories(dir + "/test/test262/data/test/sub2", &error);
+  const bool files_ok =
+      dirs_ok &&
+      WriteStringToFile(dir + "/test/test262/data/harness/helper.js",
+                        "function helperValue() { return 42; }\n", &error) &&
+      WriteStringToFile(dir + "/test/test262/data/test/harness/helper.js",
+                        "throw new Error('wrong harness directory');\n",
+                        &error) &&
+      WriteStringToFile(dir + "/test/test262/data/harness/sta.js",
+                        "throw new Error('sta.js should not be inlined');\n",
+                        &error) &&
+      WriteStringToFile(
+          dir + "/test/test262/data/test/sub1/deep/keep_a.js",
+          "/*---\nincludes: [helper.js, sta.js, assert.js]\n---*/\n"
+          "assert.sameValue(helperValue(), 42);\n",
+          &error) &&
+      WriteStringToFile(
+          dir + "/test/test262/data/test/sub1/deep/dep_FIXTURE.js",
+          "var fixture = 1;\n", &error) &&
+      WriteStringToFile(dir + "/test/test262/data/test/sub2/keep_b.js",
+                        "var b = 2;\n", &error);
+
+  const std::vector<std::string> all_js =
+      ListFiles(dir + "/test/test262/data/test/**/*.js", ".js");
+  const std::vector<std::string> sub1_js =
+      ListFiles(dir + "/test/test262/data/test/sub1/**/keep_*.js", ".js");
+  const std::vector<std::string> sub2_zero_depth =
+      ListFiles(dir + "/test/test262/data/test/sub2/**/keep_*.js", ".js");
+  const std::vector<std::string> non_recursive =
+      ListFiles(dir + "/test/test262/data/test/sub1/*.js", ".js");
+  const std::vector<std::string> prefix_glob =
+      ListFiles(dir + "/test/test262/data/test/sub**/*.js", ".js");
+  const std::vector<std::string> expected_all = {
+      dir + "/test/test262/data/test/harness/helper.js",
+      dir + "/test/test262/data/test/sub1/deep/keep_a.js",
+      dir + "/test/test262/data/test/sub2/keep_b.js",
+  };
+  const std::vector<std::string> expected_sub = {
+      dir + "/test/test262/data/test/sub1/deep/keep_a.js",
+      dir + "/test/test262/data/test/sub2/keep_b.js",
+  };
+  const std::vector<std::string> expected_sub1 = {
+      dir + "/test/test262/data/test/sub1/deep/keep_a.js",
+  };
+  const std::vector<std::string> expected_sub2 = {
+      dir + "/test/test262/data/test/sub2/keep_b.js",
+  };
+  checker->Check(
+      "import: ListFiles expands wildcards and skips *_FIXTURE.js",
+      files_ok && all_js == expected_all && sub1_js == expected_sub1 &&
+          sub2_zero_depth == expected_sub2 && non_recursive.empty() &&
+          prefix_glob == expected_sub,
+      StringPrintf("all=%zu, sub1=%zu, sub2=%zu, non_rec=%zu, prefix=%zu",
+                   all_js.size(), sub1_js.size(), sub2_zero_depth.size(),
+                   non_recursive.size(), prefix_glob.size()));
+
+  ImportOptions options;
+  options.root = dir;
+  ImportInfo info;
+  std::string src;
+  bool read_ok = ReadFileToString(expected_sub1[0], &src, &error);
+  std::unique_ptr<fast::Tree> tree =
+      read_ok ? ImportSource(src, expected_sub1[0], options, &info, &error)
+              : nullptr;
+  std::string printed = tree ? fast::Print(tree->root()) : "";
+  checker->Check(
+      "import: ImportSource inlines Test262 includes and skips prelude files",
+      tree != nullptr && info.inlined.size() == 1 && info.dropped.empty() &&
+          printed.find("helperValue") != std::string::npos &&
+          printed.find("sta.js") == std::string::npos,
+      error);
+
+  ImportInfo prose_info;
+  std::string prose_err;
+  std::unique_ptr<fast::Tree> prose_tree = ImportSource(
+      "/*---\ninfo: |\n  negative: not a YAML key\n  flags: [module]\n"
+      "includes:\n  - helper.js\n  - sta.js\n---*/\nvar ok = helperValue();\n",
+      dir + "/test/test262/data/test/sub2/prose.js", options, &prose_info,
+      &prose_err);
+  std::string prose_printed = prose_tree ? fast::Print(prose_tree->root()) : "";
+  checker->Check(
+      "import: ImportSource ignores indented prose and parses block includes",
+      prose_tree != nullptr && prose_info.inlined.size() == 1 &&
+          prose_printed.find("helperValue") != std::string::npos,
+      prose_err);
+
+  ImportInfo neg_info, mod_info, mod_block_info, gen_info;
+  std::string neg_err, mod_err, mod_block_err, gen_err;
+  std::unique_ptr<fast::Tree> neg_tree = ImportSource(
+      "/*---\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\nx();\n",
+      dir + "/neg.js", options, &neg_info, &neg_err);
+  std::unique_ptr<fast::Tree> mod_tree =
+      ImportSource("/*---\nflags: [module]\n---*/\nvar m = 1;\n",
+                   dir + "/mod.js", options, &mod_info, &mod_err);
+  std::unique_ptr<fast::Tree> mod_block_tree =
+      ImportSource("/*---\nflags:\n  - module\n---*/\nvar m = 1;\n",
+                   dir + "/mod2.js", options, &mod_block_info, &mod_block_err);
+  std::unique_ptr<fast::Tree> gen_tree = ImportSource(
+      "var g = 1;\n", dir + "/RegExp/property-escapes/generated/prop.js",
+      options, &gen_info, &gen_err);
+  checker->Check(
+      "import: ImportSource skips Test262 negative, module and generated files",
+      neg_tree == nullptr && mod_tree == nullptr && mod_block_tree == nullptr &&
+          gen_tree == nullptr,
+      "");
+  fast::ParseError prelude_err;
+  fast::ParseOptions prelude_opts;
+  prelude_opts.allow_natives_syntax = true;
+  std::unique_ptr<fast::Tree> prelude_tree =
+      fast::Parser::ParseScript(DefaultPrelude(), prelude_opts, &prelude_err);
+  checker->Check("import: DefaultPrelude parses cleanly",
+                 prelude_tree != nullptr, prelude_err.ToString());
+  RemoveTree(dir);
+}
+
 int RunSelftest(const Flags& flags) {
   Checker checker;
   std::string error;
@@ -2173,6 +2433,7 @@ int RunSelftest(const Flags& flags) {
   RunCrashSlotChecks(&checker);
   RunCrashMinimizerChecks(&checker);
   RunFlagMinimizerChecks(&checker);
+  RunImportChecks(&checker);
   RunAmplifiedTestChecks(&checker);
   RunBundleStepChecks(&checker);
   RunNodeKindChecks(&checker);
@@ -2246,6 +2507,24 @@ int RunSelftest(const Flags& flags) {
   if (RunOrFail(&checker, runner.get(), "empty script", "", &result)) {
     checker.Check("empty script succeeds", result.execution.succeeded(),
                   Describe(result.execution));
+  }
+  {
+    std::string prelude_script(DefaultPrelude());
+    prelude_script +=
+        "\n(function() { 'use strict';\n"
+        "  if (!isPrimitive(1) || isPrimitive({})) throw 'isPrimitive';\n"
+        "  if (!(Test262Error('x') instanceof Test262Error)) throw 'err';\n"
+        "  if (assert._formatIdentityFreeValue(1) !== '1') throw 'fmt';\n"
+        "  assert._toString(Object.create(null));\n"
+        "  compareArray.format(Object.create(null));\n"
+        "  if ($262.evalScript('1 + 1') !== 2) throw 'evalScript';\n"
+        "  if ($262.createRealm().evalScript('2 + 2') !== 4) throw 'realm';\n"
+        "})();\n";
+    if (RunOrFail(&checker, runner.get(), "default prelude", prelude_script,
+                  &result)) {
+      checker.Check("default prelude Test262 helpers run without throwing",
+                    result.execution.succeeded(), Describe(result.execution));
+    }
   }
   if (RunOrFail(&checker, runner.get(), "uncaught exception",
                 "throw new Error('expected');", &result)) {

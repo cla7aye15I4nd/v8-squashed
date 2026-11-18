@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "include/v8-primitive.h"
 #include "src/ast/ast-source-ranges.h"
 #include "src/ast/ast.h"
 #include "src/ast/scopes.h"
@@ -2147,6 +2148,7 @@ ParserBase<Impl>::ParsePrimaryExpression() {
   if (Token::IsAnyIdentifier(token)) {
     Consume(token);
 
+    int arrow_beg_pos = beg_pos;
     FunctionKind kind = FunctionKind::kArrowFunction;
 
     if (V8_UNLIKELY(token == Token::kAsync &&
@@ -2173,7 +2175,8 @@ ParserBase<Impl>::ParsePrimaryExpression() {
       next_arrow_function_info_.function_literal_id =
           parsing_scope.function_literal_id();
       next_arrow_function_info_.could_be_immediately_invoked =
-          position_after_last_primary_expression_open_parenthesis_ == beg_pos;
+          position_after_last_primary_expression_open_parenthesis_ ==
+          arrow_beg_pos;
       return result;
     }
 
@@ -2564,6 +2567,25 @@ typename ParserBase<Impl>::ExpressionT ParserBase<Impl>::ParseProperty(
 
     case Token::kBigInt: {
       Consume(Token::kBigInt);
+      // Only hexadecimal BigInt literals can expand when converted to decimal
+      // (log10(16) < 5/4, so H hex digits produce <= floor(5*H/4) + 1 chars).
+      // Rejecting hex literals above this rounded-down threshold guarantees
+      // that the decimal property name (even with a 4-char "get " / "set "
+      // prefix) never exceeds String::kMaxLength.
+      constexpr uint32_t kAccessorPrefixLength = 4;
+      constexpr size_t kMaxBigIntHexSymbolLength =
+          2 +
+          static_cast<size_t>((static_cast<uint64_t>(v8::String::kMaxLength -
+                                                     kAccessorPrefixLength) *
+                               4) /
+                              5);
+      base::Vector<const uint8_t> literal = scanner()->BigIntLiteral();
+      if (V8_UNLIKELY(literal.size() > kMaxBigIntHexSymbolLength &&
+                      (literal[1] == 'x' || literal[1] == 'X'))) {
+        ReportMessage(MessageTemplate::kInvalidStringLength);
+        prop_info->kind = ParsePropertyKind::kNotSet;
+        return impl()->FailureExpression();
+      }
       prop_info->name = impl()->GetBigIntAsSymbol();
       is_array_index = impl()->IsArrayIndex(prop_info->name, &index);
       break;
@@ -2686,6 +2708,7 @@ bool ParserBase<Impl>::ParseAccessorPropertyOrAutoAccessors(
     return true;
   }
   *name_expression = ParseProperty(prop_info);
+  if (V8_UNLIKELY(has_error())) return false;
   return VerifyCanHaveAutoAccessorOrThrow(prop_info, *name_expression,
                                           *name_token_position);
 }
@@ -2726,6 +2749,7 @@ ParserBase<Impl>::ParseClassPropertyDefinition(ClassInfo* class_info,
   } else {
     name_expression = ParseProperty(prop_info);
   }
+  if (V8_UNLIKELY(has_error())) return impl()->NullLiteralProperty();
 
   switch (prop_info->kind) {
     case ParsePropertyKind::kAssign:
@@ -2744,7 +2768,8 @@ ParserBase<Impl>::ParseClassPropertyDefinition(ClassInfo* class_info,
       DCHECK_IMPLIES(prop_info->is_computed_name, !prop_info->is_private);
 
       if (prop_info->is_computed_name) {
-        if (!has_error() && next_info_id != PeekNextInfoId() &&
+        DCHECK(!has_error());
+        if (next_info_id != PeekNextInfoId() &&
             !(prop_info->is_static ? class_info->has_static_elements()
                                    : class_info->has_instance_members())) {
           DCHECK(prop_info->allow_reindex_scope.has_value());
@@ -2926,6 +2951,7 @@ ParserBase<Impl>::ParseObjectPropertyDefinition(ParsePropertyInfo* prop_info,
   ExpressionT name_expression = ParseProperty(prop_info);
 
   DCHECK_IMPLIES(name_token == Token::kPrivateName, has_error());
+  if (V8_UNLIKELY(has_error())) return impl()->NullLiteralProperty();
 
   IdentifierT name = prop_info->name;
   ParseFunctionFlags function_flags = prop_info->function_flags;
@@ -3897,6 +3923,8 @@ ParserBase<Impl>::ParseLeftHandSideContinuation(ExpressionT result) {
                   !scanner()->HasLineTerminatorBeforeNext())) {
     DCHECK(impl()->IsAsync(impl()->AsIdentifier(result)));
     int pos = position();
+    bool could_be_immediately_invoked =
+        position_after_last_primary_expression_open_parenthesis_ == pos;
     ExpressionListT args(pointer_buffer());
     bool has_spread;
     {
@@ -3910,6 +3938,8 @@ ParserBase<Impl>::ParseLeftHandSideContinuation(ExpressionT result) {
         next_arrow_function_info_.scope = maybe_arrow.ValidateAndCreateScope();
         next_arrow_function_info_.function_literal_id =
             maybe_arrow.function_literal_id();
+        next_arrow_function_info_.could_be_immediately_invoked =
+            could_be_immediately_invoked;
         scope_snapshot.Reparent(next_arrow_function_info_.scope);
       } else {
         result = factory()->NewCall(result, args, pos, has_spread);
@@ -4278,7 +4308,7 @@ ParserBase<Impl>::ParseSuperExpression() {
         impl()->ReportMessage(MessageTemplate::kUnexpectedPrivateField);
         return impl()->FailureExpression();
       }
-      scope->RecordSuperPropertyUsage();
+      this->scope()->RecordSuperPropertyUsage(scope);
       UseThis();
       return impl()->NewSuperPropertyReference(pos);
     }
@@ -5089,12 +5119,18 @@ ParserBase<Impl>::ParseArrowFunctionLiteral(
   eager_compile_hint =
       impl()->GetEmbedderCompileHint(eager_compile_hint, compile_hint_position);
 
-  bool can_preparse = impl()->parse_lazily() &&
-                      eager_compile_hint == FunctionLiteral::kShouldLazyCompile;
-  // TODO(marja): consider lazy-parsing inner arrow functions too. is_this
-  // handling in Scope::ResolveVariable needs to change.
-  bool is_lazy_top_level_function =
+  // Simple-parameter block-body arrow functions can be preparsed and skipped
+  // via PreparseData even when nested, because their parameters are plain kVar
+  // bindings declared by ArrowHeadParsingScope without a synthetic VarBlock
+  // (unlike non-simple arrow heads, which are parsed before SkipFunction and
+  // PreparseDataBuilder start). Keep in sync with PreParser::PreParseFunction.
+  const bool is_lazy =
+      eager_compile_hint == FunctionLiteral::kShouldLazyCompile;
+  const bool can_preparse = impl()->parse_lazily() && is_lazy;
+  const bool is_lazy_top_level_function =
       can_preparse && impl()->AllowsLazyParsingWithoutUnresolvedVariables();
+  const bool should_preparse = is_lazy_top_level_function ||
+                               (can_preparse && formal_parameters.is_simple);
   bool has_braces = true;
   ProducedPreparseData* produced_preparse_data = nullptr;
   StatementListT body(pointer_buffer());
@@ -5108,7 +5144,7 @@ ParserBase<Impl>::ParseArrowFunctionLiteral(
       // Multiple statement body
       DCHECK_EQ(scope(), formal_parameters.scope);
 
-      if (is_lazy_top_level_function) {
+      if (should_preparse) {
         // FIXME(marja): Arrow function parameters will be parsed even if the
         // body is preparsed; move relevant parts of parameter handling to
         // simulate consistent parameter handling.
@@ -5130,8 +5166,8 @@ ParserBase<Impl>::ParseArrowFunctionLiteral(
             FunctionSyntaxKind::kAnonymousExpression, formal_parameters.scope,
             &dummy_num_parameters, &dummy_function_length,
             &produced_preparse_data);
-
-        DCHECK_NULL(produced_preparse_data);
+        DCHECK_IMPLIES(produced_preparse_data != nullptr,
+                       formal_parameters.is_simple);
 
         if (did_preparse_successfully) {
           // Validate parameter names. We can do this only after preparsing the
@@ -5175,17 +5211,23 @@ ParserBase<Impl>::ParseArrowFunctionLiteral(
         }
       } else {
         Consume(Token::kLeftBrace);
+        typename Impl::SkippableArrowFunctionScope skippable_scope(
+            impl(), formal_parameters.scope,
+            is_lazy && formal_parameters.is_simple);
         FunctionParsingScope body_parsing_scope(impl());
+        typename Impl::LazyParsingScope lazy_parsing_scope(impl());
         ParseFunctionBody(&body, impl()->NullIdentifier(), kNoSourcePosition,
                           formal_parameters, kind,
                           FunctionSyntaxKind::kAnonymousExpression,
                           FunctionBodyType::kBlock);
         expected_property_count = function_state.expected_property_count();
+        skippable_scope.Finish(function_literal_id);
       }
     } else {
       // Single-expression body
       has_braces = false;
       FunctionParsingScope body_parsing_scope(impl());
+      typename Impl::LazyParsingScope lazy_parsing_scope(impl());
       ParseFunctionBody(&body, impl()->NullIdentifier(), kNoSourcePosition,
                         formal_parameters, kind,
                         FunctionSyntaxKind::kAnonymousExpression,
@@ -5223,7 +5265,9 @@ ParserBase<Impl>::ParseArrowFunctionLiteral(
     Scope* scope = formal_parameters.scope;
     double ms = timer.Elapsed().InMillisecondsF();
     const char* event_name =
-        is_lazy_top_level_function ? "preparse-no-resolution" : "parse";
+        should_preparse ? (is_lazy_top_level_function ? "preparse-no-resolution"
+                                                      : "preparse-resolution")
+                        : "parse";
     const char* name = "arrow function";
     v8_file_logger_->FunctionEvent(event_name, flags().script_id(), ms,
                                    scope->start_position(),
@@ -5292,6 +5336,7 @@ typename ParserBase<Impl>::ExpressionT ParserBase<Impl>::ParseClassLiteral(
   Expect(Token::kLeftBrace);
 
   ParseClassLiteralBody(class_info, name, class_token_pos, Token::kRightBrace);
+  if (V8_UNLIKELY(has_error())) return impl()->FailureExpression();
 
   CheckStrictOctalLiteral(scope()->start_position(), scope()->end_position());
 

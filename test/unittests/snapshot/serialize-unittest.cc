@@ -4833,6 +4833,75 @@ TEST_F(UninitializedSerializeTest, SnapshotCreatorUnknownExternalReferences) {
   FreeCurrentEmbeddedBlob();
 }
 
+TEST_F(UninitializedSerializeTest, SnapshotCreatorRareDataReadOnlyPromotion) {
+  DisableEmbeddedBlobRefcounting();
+  v8::StartupData blob;
+  {
+    SnapshotCreatorParams testing_params(original_external_references);
+    v8::SnapshotCreator creator(testing_params.create_params);
+    v8::Isolate* isolate = creator.GetIsolate();
+    {
+      v8::HandleScope handle_scope(isolate);
+      v8::Local<v8::Context> context = v8::Context::New(isolate);
+      v8::Context::Scope context_scope(context);
+
+      v8::Local<v8::FunctionTemplate> parent =
+          v8::FunctionTemplate::New(isolate);
+      parent->SealAndPrepareForPromotionToReadOnly();
+
+      v8::Local<v8::FunctionTemplate> sealed_child =
+          v8::FunctionTemplate::New(isolate);
+      sealed_child->Inherit(parent);
+      sealed_child->SealAndPrepareForPromotionToReadOnly();
+
+      // The rare data of this template only references read-only objects.
+      v8::Local<v8::FunctionTemplate> unsealed_child =
+          v8::FunctionTemplate::New(isolate);
+      unsealed_child->Inherit(parent);
+
+      CHECK_EQ(0u, creator.AddData(sealed_child));
+      CHECK_EQ(1u, creator.AddData(unsealed_child));
+      creator.SetDefaultContext(context);
+    }
+    blob =
+        creator.CreateBlob(v8::SnapshotCreator::FunctionCodeHandling::kClear);
+  }
+
+  {
+    v8::Isolate::CreateParams params;
+    params.snapshot_blob = &blob;
+    params.array_buffer_allocator = array_buffer_allocator();
+    params.external_references = original_external_references;
+    v8::Isolate* isolate = TestSerializer::NewIsolate(params);
+    {
+      v8::Isolate::Scope isolate_scope(isolate);
+      v8::HandleScope handle_scope(isolate);
+      v8::Local<v8::Context> context = v8::Context::New(isolate);
+      v8::Context::Scope context_scope(context);
+      auto get_template = [isolate](size_t index) {
+        return isolate->GetDataFromSnapshotOnce<v8::FunctionTemplate>(index)
+            .ToLocalChecked();
+      };
+      auto rare_data_in_read_only_space =
+          [](v8::Local<v8::FunctionTemplate> function_template) {
+            return HeapLayout::InReadOnlySpace(
+                Cast<HeapObject>(Utils::OpenDirectHandle(*function_template)
+                                     ->rare_data(kAcquireLoad)));
+          };
+
+      CHECK(rare_data_in_read_only_space(get_template(0)));
+
+      v8::Local<v8::FunctionTemplate> unsealed_child = get_template(1);
+      CHECK(!rare_data_in_read_only_space(unsealed_child));
+      // Creating the instance template writes to the rare data.
+      CHECK(!unsealed_child->InstanceTemplate().IsEmpty());
+    }
+    isolate->Dispose();
+  }
+  delete[] blob.data;
+  FreeCurrentEmbeddedBlob();
+}
+
 namespace {
 void TestSnapshotCreatorTemplates(bool promote_templates_to_read_only) {
   serialized_static_field = 314;
@@ -7487,6 +7556,42 @@ TEST_F(SerializeTest, CodeCacheSha256SourceHash) {
     SerializedCodeData::SourceHash hash_wrapped_a_bc(
         one_byte, wrapped_a_bc, default_origin_options, i_isolate);
     CHECK_NE(hash_wrapped_ab_c, hash_wrapped_a_bc);
+
+    // One-byte and two-byte strings of the same character length are
+    // domain-separated across argument/source boundaries (crbug.com/582260175):
+    // - Input 1: two-byte arg of length 2 (bytes: 61 62 02 00) + one-byte
+    //   source of length 0 (length bytes: 00 00 00 00).
+    // - Input 2: one-byte arg of length 2 (bytes: 61 62) + one-byte source of
+    //   length 2 (length bytes: 02 00 00 00, content: 00 00).
+    Handle<SeqTwoByteString> arg_two_byte =
+        i_isolate->factory()->NewRawTwoByteString(2).ToHandleChecked();
+    {
+      DisallowGarbageCollection no_gc;
+      const uint16_t chars[2] = {0x6261, 0x0002};
+      CopyChars(arg_two_byte->GetChars(no_gc), chars, 2);
+    }
+    Handle<FixedArray> wrapped_two_byte =
+        i_isolate->factory()->NewFixedArray(1);
+    wrapped_two_byte->set(0, *arg_two_byte);
+    Handle<String> empty_source = i_isolate->factory()->empty_string();
+
+    Handle<FixedArray> wrapped_one_byte =
+        i_isolate->factory()->NewFixedArray(1);
+    wrapped_one_byte->set(
+        0, *i_isolate->factory()->NewStringFromAsciiChecked("ab"));
+    Handle<SeqOneByteString> zero_bytes_source =
+        i_isolate->factory()->NewRawOneByteString(2).ToHandleChecked();
+    {
+      DisallowGarbageCollection no_gc;
+      const uint8_t chars[2] = {0x00, 0x00};
+      CopyChars(zero_bytes_source->GetChars(no_gc), chars, 2);
+    }
+
+    SerializedCodeData::SourceHash hash_two_byte_arg(
+        empty_source, wrapped_two_byte, default_origin_options, i_isolate);
+    SerializedCodeData::SourceHash hash_one_byte_arg(
+        zero_bytes_source, wrapped_one_byte, default_origin_options, i_isolate);
+    CHECK_NE(hash_two_byte_arg, hash_one_byte_arg);
   }
 
   // 2. End-to-end code cache serialization and rejection on same-length source

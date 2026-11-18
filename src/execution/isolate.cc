@@ -5478,8 +5478,6 @@ Isolate::~Isolate() {
   store_stub_cache_ = nullptr;
   delete define_own_stub_cache_;
   define_own_stub_cache_ = nullptr;
-  delete has_stub_cache_;
-  has_stub_cache_ = nullptr;
 
   delete materialized_object_store_;
   materialized_object_store_ = nullptr;
@@ -6309,7 +6307,6 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
   load_stub_cache_ = new StubCache(this);
   store_stub_cache_ = new StubCache(this);
   define_own_stub_cache_ = new StubCache(this);
-  has_stub_cache_ = new StubCache(this);
   materialized_object_store_ = new MaterializedObjectStore(this);
   regexp_stack_ = regexp::Stack::New();
   isolate_data_.set_regexp_static_result_offsets_vector(
@@ -8790,6 +8787,16 @@ void Isolate::PrintNumberStringCacheStats(const char* comment,
            v8_flags.double_string_cache_size.value());
   }
   PrintF("\n");
+}
+
+void Isolate::MarkContextSlotNotAssignedIsUnreliable() {
+  if (is_context_slot_not_assigned_unreliable()) return;
+  context_slot_not_assigned_is_unreliable_.store(true,
+                                                 std::memory_order_relaxed);
+  // Abort any in-flight concurrent compilations that may have relied on
+  // kNotAssigned and deoptimize existing optimized code.
+  AbortConcurrentOptimization(BlockingBehavior::kBlock);
+  Deoptimizer::DeoptimizeAll(this);
 }
 
 }  // namespace internal

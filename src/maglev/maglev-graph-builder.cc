@@ -679,8 +679,12 @@ MaglevGraphBuilder::MaglevGraphBuilder(LocalIsolate* local_isolate,
       flags_(compilation_unit->info()->flags()),
       graph_(graph),
       tracer_(graph->compilation_info()),
-      bytecode_analysis_(bytecode().object(), zone(),
-                         compilation_unit->osr_offset(), true),
+      bytecode_analysis_(
+          bytecode().object(), zone(), compilation_unit->osr_offset(),
+          /*analyze_liveness=*/true,
+          /*analyze_function_assignments=*/caller_details == nullptr &&
+              IsGeneratorFunction(
+                  compilation_unit->shared_function_info().kind())),
       iterator_(bytecode().object()),
       source_position_iterator_(bytecode().SourcePositionTable(broker())),
       allow_loop_peeling_(v8_flags.maglev_loop_peeling),
@@ -9751,6 +9755,10 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayPrototypeSort(
   compiler::OptionalSharedFunctionInfoRef comparefn_shared;
   if (auto maybe_fn = TryGetConstant<JSFunction>(comparefn)) {
     comparefn_shared = maybe_fn->shared(broker());
+  } else if (auto* alloc = comparefn->TryCast<InlinedAllocation>();
+             alloc != nullptr &&
+             alloc->object()->object_type() == vobj::ObjectType::kJSFunction) {
+    comparefn_shared = alloc->object()->shared_function_info(broker());
   } else if (auto* fcc = comparefn->TryCast<FastCreateClosure>()) {
     comparefn_shared = fcc->shared_function_info();
   } else if (auto* cc = comparefn->TryCast<CreateClosure>()) {
@@ -12043,8 +12051,18 @@ ReduceResult MaglevGraphBuilder::ReduceCall(
   // If the implementation here becomes more complex, we could probably
   // deduplicate the code for FastCreateClosure and CreateClosure by using
   // templates or giving them a shared base class.
-  if (FastCreateClosure* fast_create_closure =
-          target_node->TryCast<FastCreateClosure>()) {
+  if (InlinedAllocation* alloc = target_node->TryCast<InlinedAllocation>();
+      alloc != nullptr &&
+      alloc->object()->object_type() == vobj::ObjectType::kJSFunction) {
+    const VirtualObject* vobj = alloc->object();
+    compiler::FeedbackCellRef feedback_cell = vobj->feedback_cell(broker());
+    MaybeReduceResult result = TryReduceCallForNewClosure(
+        alloc, vobj->context(), feedback_cell.dispatch_handle(),
+        vobj->shared_function_info(broker()), feedback_cell, args,
+        feedback_source);
+    RETURN_IF_DONE(result);
+  } else if (FastCreateClosure* fast_create_closure =
+                 target_node->TryCast<FastCreateClosure>()) {
     MaybeReduceResult result = TryReduceCallForNewClosure(
         fast_create_closure, fast_create_closure->ContextInput().node(),
         fast_create_closure->feedback_cell().dispatch_handle(),
@@ -14335,6 +14353,36 @@ ReduceResult MaglevGraphBuilder::VisitGetTemplateObject() {
   return ReduceResult::Done();
 }
 
+MaybeReduceResult MaglevGraphBuilder::TryBuildInlinedAllocatedClosure(
+    compiler::SharedFunctionInfoRef shared_function_info,
+    compiler::FeedbackCellRef feedback_cell) {
+  compiler::MapRef cell_map = feedback_cell.map(broker());
+  DCHECK(cell_map.equals(broker()->no_closures_cell_map()) ||
+         cell_map.equals(broker()->one_closure_cell_map()) ||
+         cell_map.equals(broker()->many_closures_cell_map()));
+  if (!cell_map.equals(broker()->many_closures_cell_map()) ||
+      IsClassConstructor(shared_function_info.kind())) {
+    return {};
+  }
+
+  compiler::MapRef function_map =
+      broker()->target_native_context().GetFunctionMapFromIndex(
+          broker(), shared_function_info.function_map_index());
+  DCHECK(!function_map.IsInobjectSlackTrackingInProgress());
+  DCHECK(!function_map.is_dictionary_map());
+  DCHECK_NE(feedback_cell.dispatch_handle(), kNullJSDispatchHandle);
+
+  ValueNode* dispatch_handle = AddNewNodeNoInputConversion<LoadUint32>(
+      {GetConstant(feedback_cell)},
+      static_cast<int>(offsetof(FeedbackCell, dispatch_handle_)));
+
+  VirtualObject* closure = reducer_.CreateJSFunction(
+      function_map, shared_function_info, feedback_cell, GetContext(),
+      dispatch_handle, compilation_unit_->specialization_context(),
+      GetCurrentScopeInfo());
+  return reducer_.BuildInlinedAllocation(closure);
+}
+
 ReduceResult MaglevGraphBuilder::VisitCreateClosure() {
   compiler::SharedFunctionInfoRef shared_function_info =
       GetRefOperand<SharedFunctionInfo>(0);
@@ -14343,6 +14391,11 @@ ReduceResult MaglevGraphBuilder::VisitCreateClosure() {
   uint32_t flags = GetFlag8Operand(2);
 
   if (interpreter::CreateClosureFlags::FastNewClosureBit::decode(flags)) {
+    MaybeReduceResult inlined =
+        TryBuildInlinedAllocatedClosure(shared_function_info, feedback_cell);
+    if (inlined.IsDone()) {
+      return SetAccumulator(inlined.Checked());
+    }
     return SetAccumulator(AddNewNode<FastCreateClosure>(
         {GetContext()}, shared_function_info, feedback_cell,
         compilation_unit_->specialization_context(), GetCurrentScopeInfo()));
@@ -15793,36 +15846,52 @@ ReduceResult MaglevGraphBuilder::VisitSuspendGenerator() {
   interpreter::RegisterList args = iterator_.GetRegisterListOperand(1);
   uint32_t suspend_id = iterator_.GetUnsignedImmediateOperand(3);
 
-  int input_count = parameter_count_without_receiver() + args.register_count() +
-                    GeneratorStore::kFixedInputCount;
+  const int param_count = parameter_count_without_receiver();
+  const int slot_count = param_count + args.register_count();
+  const int input_count = slot_count + GeneratorStore::kFixedInputCount;
   if (input_count > Node::kMaxInputs) {
     should_abort_compilation_ = true;
     return reducer_.BuildAbort(AbortReason::kUnreachable);
   }
+
   int debug_pos_offset = iterator_.current_offset() +
                          (BytecodeArray::kHeaderSize - kHeapObjectTag);
+
+  // Slot layout is all parameters followed by all registers. Unassigned
+  // parameters and dead registers already hold the right value in the
+  // generator object, so they are passed as optimized out.
+  const compiler::BytecodeLivenessState* liveness = GetOutLiveness();
+  // The initial yield must store all parameters, later suspends rely on it.
+  const bool skip_unassigned_params =
+      suspend_id != 0 && can_skip_unassigned_param_stores_;
+  auto slot_value = [&](int slot) -> ReduceResult {
+    if (slot < param_count) {
+      // Argument index 0 is the receiver, which is never stored.
+      int arg_index = slot + 1;
+      if (skip_unassigned_params &&
+          !bytecode_analysis_.function_assignments().ContainsParameter(
+              arg_index)) {
+        return GetRootConstant(RootIndex::kOptimizedOut);
+      }
+      return GetTaggedValue(GetArgument(arg_index));
+    }
+    interpreter::Register reg = args[slot - param_count];
+    if (!liveness->RegisterIsLive(reg.index())) {
+      return GetRootConstant(RootIndex::kOptimizedOut);
+    }
+    return GetTaggedValue(reg);
+  };
+
   RETURN_IF_ABORT(AddNewNode<GeneratorStore>(
       input_count,
-      [&](GeneratorStore* node) {
-        int arg_index = 0;
-        for (int i = 1 /* skip receiver */; i < parameter_count(); ++i) {
-          ValueNode* tagged_arg;
-          GET_VALUE_OR_ABORT(tagged_arg, GetTaggedValue(GetArgument(i)));
-          node->set_parameters_and_registers(arg_index++, tagged_arg);
-        }
-        const compiler::BytecodeLivenessState* liveness = GetOutLiveness();
-        for (int i = 0; i < args.register_count(); ++i) {
+      [&](GeneratorStore* node) -> ReduceResult {
+        for (int slot = 0; slot < slot_count; ++slot) {
           ValueNode* value;
-          if (liveness->RegisterIsLive(args[i].index())) {
-            GET_VALUE_OR_ABORT(value, GetTaggedValue(args[i]));
-          } else {
-            value = GetRootConstant(RootIndex::kOptimizedOut);
-          }
-          node->set_parameters_and_registers(arg_index++, value);
+          GET_VALUE_OR_ABORT(value, slot_value(slot));
+          node->set_parameters_and_registers(slot, value);
         }
         return ReduceResult::Done();
       },
-
       context, generator, suspend_id, debug_pos_offset));
 
   if (is_inline()) {
@@ -15857,12 +15926,28 @@ ReduceResult MaglevGraphBuilder::VisitSuspendGenerator() {
 // JSGeneratorObject::context_ when the generator object is created, and the
 // value the resume trampoline puts into the context register. Storing the
 // context on suspend and loading it on resume can then both be skipped.
+//
+// Unassigned parameters (can_skip_unassigned_param_stores_): formal parameters
+// that no bytecode ever writes to. Generators (function* and async function*)
+// store all parameters at their initial yield (suspend_id 0), which runs
+// synchronously when the generator object is created, and resuming never
+// clears them. Later suspends can then skip storing unassigned parameters.
+// Plain async functions also get here but have no initial yield, so any of
+// their suspends can be the first one executed. Inlined generators only run up
+// to their initial yield, which stores everything anyway. OSR code is entered
+// from an interpreted frame whose parameters the debugger may have changed
+// without updating the generator object.
 void MaglevGraphBuilder::AnalyzeResumableFunction() {
+  compiler::SharedFunctionInfoRef shared =
+      compilation_unit_->shared_function_info();
+  auto scope_info = shared.scope_info(broker());
   resumable_context_may_change_ = bytecode_analysis_.has_push_context();
-  DCHECK_IMPLIES(compilation_unit_->shared_function_info()
-                     .scope_info(broker())
-                     .SloppyEvalCanExtendVars(),
+  DCHECK_IMPLIES(scope_info.SloppyEvalCanExtendVars(),
                  resumable_context_may_change_);
+  can_skip_unassigned_param_stores_ =
+      IsGeneratorFunction(shared.kind()) && !is_inline() &&
+      !compilation_unit_->is_osr() && !scope_info.SloppyEvalCanExtendVars() &&
+      !scope_info.HasContextExtensionSlot();
 }
 
 ReduceResult MaglevGraphBuilder::VisitResumeGenerator() {

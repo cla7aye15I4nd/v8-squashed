@@ -100,7 +100,7 @@ struct WasmElemSegment;
 class WasmWrapperHandle;
 class WasmValue;
 enum class OnResume : int;
-enum Suspend : int;
+enum Suspend : uint8_t;
 enum Promise : int;
 struct CanonicalTypeIndex;
 class CanonicalValueType;
@@ -977,6 +977,10 @@ class V8_EXPORT_PRIVATE Factory : public FactoryBase<Factory> {
                                        DirectHandle<JSArrayBuffer> buffer,
                                        size_t byte_offset, size_t length,
                                        bool is_length_tracking = false);
+
+  MaybeHandle<JSTypedArray> NewJSTypedArrayWithData(ExternalArrayType type,
+                                                    const uint8_t* data,
+                                                    size_t length);
 
   Handle<JSDataViewOrRabGsabDataView> NewJSDataViewOrRabGsabDataView(
       DirectHandle<JSArrayBuffer> buffer, size_t byte_offset,
