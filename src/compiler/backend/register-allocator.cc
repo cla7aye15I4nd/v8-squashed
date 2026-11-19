@@ -1174,8 +1174,7 @@ RegisterAllocationData::RegisterAllocationData(
       preassigned_slot_ranges_(zone),
       spill_state_(code->InstructionBlockCount(), ZoneVector<LiveRange*>(zone),
                    zone),
-      tick_counter_(tick_counter),
-      slot_for_const_range_(zone) {
+      tick_counter_(tick_counter) {
   if (kFPAliasing == AliasingKind::kCombine) {
     fixed_float_live_ranges_.resize(
         kNumberOfFixedRangesPerRegister * this->config()->num_float_registers(),
@@ -1645,51 +1644,16 @@ void ConstraintBuilder::MeetConstraintsAfter(int instr_index) {
 void ConstraintBuilder::MeetConstraintsBefore(int instr_index) {
   Instruction* second = code()->InstructionAt(instr_index);
   // Handle fixed input operands of second instruction.
-  ZoneVector<TopLevelLiveRange*>* spilled_consts = nullptr;
   for (size_t i = 0; i < second->InputCount(); i++) {
     InstructionOperand* input = second->InputAt(i);
     if (input->IsImmediate()) {
       continue;  // Ignore immediates.
     }
     UnallocatedOperand* cur_input = UnallocatedOperand::cast(input);
-    if (cur_input->HasSlotPolicy()) {
-      TopLevelLiveRange* range =
-          data()->GetLiveRangeFor(cur_input->virtual_register());
-      if (range->HasSpillOperand() && range->GetSpillOperand()->IsConstant()) {
-        bool already_spilled = false;
-        if (spilled_consts == nullptr) {
-          spilled_consts =
-              allocation_zone()->New<ZoneVector<TopLevelLiveRange*>>(
-                  allocation_zone());
-        } else {
-          auto it =
-              std::find(spilled_consts->begin(), spilled_consts->end(), range);
-          already_spilled = it != spilled_consts->end();
-        }
-        auto it = data()->slot_for_const_range().find(range);
-        if (it == data()->slot_for_const_range().end()) {
-          DCHECK(!already_spilled);
-          int width = ByteWidthForStackSlot(range->representation());
-          int index = data()->frame()->AllocateSpillSlot(width);
-          auto* slot = AllocatedOperand::New(allocation_zone(),
-                                             LocationOperand::STACK_SLOT,
-                                             range->representation(), index);
-          it = data()->slot_for_const_range().emplace(range, slot).first;
-        }
-        if (!already_spilled) {
-          auto* slot = it->second;
-          int input_vreg = cur_input->virtual_register();
-          UnallocatedOperand input_copy(UnallocatedOperand::REGISTER_OR_SLOT,
-                                        input_vreg);
-          // Spill at every use position for simplicity, this case is very rare.
-          data()->AddGapMove(instr_index, Instruction::END, input_copy, *slot);
-          if (second->HasReferenceMap() && code()->IsReference(input_vreg)) {
-            second->reference_map()->RecordReference(*slot);
-          }
-          spilled_consts->push_back(range);
-        }
-      }
-    }
+    // OperandForDeopt and UpdateRenames lower all constant FrameState inputs to
+    // immediates
+    CHECK_IMPLIES(cur_input->HasSlotPolicy(),
+                  !code()->IsConstant(cur_input->virtual_register()));
     if (cur_input->HasFixedPolicy()) {
       int input_vreg = cur_input->virtual_register();
       UnallocatedOperand input_copy(UnallocatedOperand::REGISTER_OR_SLOT,
@@ -2407,8 +2371,8 @@ void LiveRangeBuilder::BuildLiveRanges() {
     // operand assigned.
     if (range->HasSpillOperand() && range->GetSpillOperand()->IsConstant()) {
       for (UsePosition* pos : range->positions()) {
-        if (pos->type() == UsePositionType::kRequiresSlot ||
-            pos->type() == UsePositionType::kRegisterOrSlotOrConstant) {
+        DCHECK_NE(pos->type(), UsePositionType::kRequiresSlot);
+        if (pos->type() == UsePositionType::kRegisterOrSlotOrConstant) {
           continue;
         }
         UsePositionType new_type = UsePositionType::kRegisterOrSlot;
@@ -4344,13 +4308,15 @@ void LinearScanAllocator::AllocateBlockedReg(LiveRange* current) {
     new_end = block_pos[reg].Start();
   }
 
-  // If there is no register available at all, we can only spill this range.
-  // Happens for instance on entry to deferred code where registers might
-  // become blocked yet we aim to reload ranges.
-  if (new_end == current->Start()) {
-    SpillBetween(current, new_end, register_use->pos());
-    return;
-  }
+  // Reaching new_end <= current->Start() means block_pos[reg].Start() clamped
+  // new_end, so even the best register is already blocked at current->Start()
+  // (use_pos[reg] <= block_pos[reg] <= current->Start().End()). Any range with
+  // a gap before register_use->pos() therefore satisfied use_pos[reg] <
+  // register_use->pos() and spilled above, leaving only oversubscription here.
+  CHECK_WITH_MSG(
+      new_end > current->Start(),
+      "Register oversubscription: instruction requires more registers than "
+      "available");
 
   // Split at the new end if we found one.
   if (new_end != current->End()) {
@@ -4652,12 +4618,7 @@ void OperandAssigner::CommitAssignment() {
     if (top_range->IsEmpty()) continue;
     InstructionOperand spill_operand;
     if (top_range->HasSpillOperand()) {
-      auto it = data()->slot_for_const_range().find(top_range);
-      if (it != data()->slot_for_const_range().end()) {
-        spill_operand = *it->second;
-      } else {
-        spill_operand = *top_range->GetSpillOperand();
-      }
+      spill_operand = *top_range->GetSpillOperand();
     } else if (top_range->HasSpillRange()) {
       spill_operand = top_range->GetSpillRangeOperand();
     }

@@ -80,7 +80,6 @@ load(":bazel/v8-generators.bzl", "v8_torque_files")
 # v8_enable_precise_zone_stats
 # v8_enable_swiss_name_dictionary
 # v8_generate_external_defines_header
-# v8_dict_property_const_tracking
 # v8_enable_map_packing
 # v8_enable_javascript_promise_hooks
 # v8_enable_allocation_folding
@@ -296,6 +295,16 @@ v8_flag(
 v8_flag(
     name = "v8_enable_descriptor_array_lookup_table",
     default = True,
+)
+
+v8_flag(
+    name = "v8_dict_property_const_tracking",
+    default = False,
+)
+
+v8_flag(
+    name = "v8_dict_prototypes",
+    default = False,
 )
 
 selects.config_setting_group(
@@ -547,7 +556,7 @@ selects.config_setting_group(
     match_all = [
         ":v8_enable_short_builtin_calls_is_none",
         "@v8//bazel/config:v8_target_arm64",
-        "@v8//bazel/config:is_not_android",
+        "@v8//bazel/config:v8_target_is_not_android",
     ],
 )
 
@@ -614,6 +623,8 @@ v8_config(
         "v8_enable_ecma402_icu4x": "V8_ENABLE_ECMA402_ICU4X",
         "v8_add_descriptor_array_lookup_table": "V8_ADD_DESCRIPTOR_ARRAY_LOOKUP_TABLE",
         "v8_enable_descriptor_array_lookup_table": "V8_ENABLE_DESCRIPTOR_ARRAY_LOOKUP_TABLE",
+        "v8_dict_property_const_tracking": "V8_DICT_PROPERTY_CONST_TRACKING",
+        "v8_dict_prototypes": "V8_DICT_PROTOTYPES",
     },
     defines = [
         "GOOGLE3",
@@ -677,27 +688,34 @@ v8_config(
             ],
         },
         no_match_error = "Please specify a target cpu supported by v8",
+    ) + select(
+        {
+            "@v8//bazel/config:v8_target_android": [
+                "V8_HAVE_TARGET_OS",
+                "V8_TARGET_OS_ANDROID",
+            ],
+            "@v8//bazel/config:v8_target_linux": [
+                "V8_HAVE_TARGET_OS",
+                "V8_TARGET_OS_LINUX",
+            ],
+            "@v8//bazel/config:v8_target_macos": [
+                "V8_HAVE_TARGET_OS",
+                "V8_TARGET_OS_MACOS",
+            ],
+            "@v8//bazel/config:v8_target_windows": [
+                "V8_HAVE_TARGET_OS",
+                "V8_TARGET_OS_WIN",
+            ],
+        },
+        no_match_error = "Please specify a target os supported by v8",
     ) + select({
-        "@v8//bazel/config:is_android": [
-            "V8_HAVE_TARGET_OS",
-            "V8_TARGET_OS_ANDROID",
-        ],
-        "@v8//bazel/config:is_linux": [
-            "V8_HAVE_TARGET_OS",
-            "V8_TARGET_OS_LINUX",
-        ],
-        "@v8//bazel/config:is_macos": [
-            "V8_HAVE_TARGET_OS",
-            "V8_TARGET_OS_MACOS",
-        ],
         "@v8//bazel/config:is_windows": [
-            "V8_HAVE_TARGET_OS",
-            "V8_TARGET_OS_WIN",
             "UNICODE",
             "_UNICODE",
             "_CRT_RAND_S",
             "_WIN32_WINNT=0x0A00",
         ],
+        "//conditions:default": [],
     }) + select({
         ":is_v8_enable_pointer_compression": [
             "V8_COMPRESS_POINTERS",

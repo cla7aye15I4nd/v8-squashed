@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include <algorithm>
-
 #include "src/codegen/assembler-inl.h"
 #include "src/compiler/pipeline.h"
 #include "src/compiler/turboshaft/pipelines.h"
@@ -857,83 +855,40 @@ TEST_F(RegisterAllocatorTest, AllocateBlockedRegDeferredClampBelowStart) {
   Allocate();
 }
 
-TEST_F(RegisterAllocatorTest, TaggedConstantSlotReferenceMap) {
+#if V8_LOGGING_LEVEL == 0
+constexpr const char* kOversubscribedDeathRegex = ".*";
+#else
+constexpr const char* kOversubscribedDeathRegex =
+    "Register oversubscription: instruction requires more registers than "
+    "available";
+#endif
+
+TEST_F(RegisterAllocatorTest, OversubscribedRegistersAtGapEnd) {
+  SetNumRegs(2, 1);
+
   StartBlock();
-  VReg tagged_const = DefineConstant();
-  sequence()->MarkAsRepresentation(MachineRepresentation::kTagged,
-                                   tagged_const.value_);
-  VReg compressed_const = DefineConstant();
-  sequence()->MarkAsRepresentation(MachineRepresentation::kCompressed,
-                                   compressed_const.value_);
-  VReg untagged_const = DefineConstant();
-
-  // First call uses reference constants in registers before any slot
-  // constraint; their constant spill slots are not yet initialized here.
-  EmitCall(Slot(-1), Reg(tagged_const), Reg(compressed_const));
-  const int call1_index = sequence()->LastInstructionIndex();
-
-  // Second call requires stack slots for all three constants, including
-  // duplicate slot inputs for `tagged_const`.
-  TestOperand call2_inputs[] = {Slot(tagged_const), Slot(tagged_const),
-                                Slot(compressed_const), Slot(untagged_const)};
-  EmitCall(Slot(-2), arraysize(call2_inputs), call2_inputs);
-  const int call2_index = sequence()->LastInstructionIndex();
-
-  // Third call uses reference constants in registers rather than slots.
-  EmitCall(Slot(-3), Reg(tagged_const), Reg(compressed_const));
-  const int call3_index = sequence()->LastInstructionIndex();
-
-  // Fourth call again requires stack slots for both reference constants.
-  EmitCall(Slot(-4), Slot(tagged_const), Slot(compressed_const));
-  const int call4_index = sequence()->LastInstructionIndex();
-
-  // Non-call instruction requiring stack slots (e.g. eager deoptimize) has no
-  // ReferenceMap; verify slots are assigned without null-dereferencing it.
-  const Instruction* non_call =
-      EmitI(Slot(tagged_const), Slot(compressed_const));
-
-  Return(Reg(tagged_const));
+  VReg c0 = DefineConstant();
+  VReg c1 = DefineConstant();
+  VReg c2 = DefineConstant();
+  EmitCall(Slot(-1));
+  EmitI(DeoptArg(c0), DeoptArg(c1), DeoptArg(c2));
+  Return(Reg(c0));
   EndBlock(Last());
 
-  Allocate();
+  ASSERT_DEATH_IF_SUPPORTED(Allocate(), kOversubscribedDeathRegex);
+}
 
-  const Instruction* call1 = sequence()->InstructionAt(call1_index);
-  const Instruction* call2 = sequence()->InstructionAt(call2_index);
-  const Instruction* call3 = sequence()->InstructionAt(call3_index);
-  const Instruction* call4 = sequence()->InstructionAt(call4_index);
-  ASSERT_TRUE(call1->HasReferenceMap());
-  ASSERT_TRUE(call2->HasReferenceMap());
-  ASSERT_TRUE(call3->HasReferenceMap());
-  ASSERT_TRUE(call4->HasReferenceMap());
-  ASSERT_FALSE(non_call->HasReferenceMap());
+TEST_F(RegisterAllocatorTest, OversubscribedRegistersAtInstructionStart) {
+  SetNumRegs(2, 1);
 
-  const InstructionOperand tagged_slot = *call2->InputAt(0);
-  const InstructionOperand compressed_slot = *call2->InputAt(2);
-  const InstructionOperand untagged_slot = *call2->InputAt(3);
-  ASSERT_TRUE(tagged_slot.IsStackSlot());
-  ASSERT_TRUE(compressed_slot.IsStackSlot());
-  ASSERT_TRUE(untagged_slot.IsStackSlot());
-  EXPECT_TRUE(tagged_slot.Equals(*call2->InputAt(1)));
-  EXPECT_TRUE(tagged_slot.Equals(*call4->InputAt(0)));
-  EXPECT_TRUE(compressed_slot.Equals(*call4->InputAt(1)));
-  EXPECT_TRUE(tagged_slot.Equals(*non_call->InputAt(0)));
-  EXPECT_TRUE(compressed_slot.Equals(*non_call->InputAt(1)));
+  StartBlock();
+  VReg v0 = Define(Reg());
+  VReg v1 = Define(Reg());
+  VReg out = EmitOI(Reg(), UniqueReg(v0), UniqueReg(v1));
+  Return(Reg(out));
+  EndBlock(Last());
 
-  auto count_in_ref_map = [](const Instruction* call,
-                             const InstructionOperand& op) {
-    const auto& refs = call->reference_map()->reference_operands();
-    return std::count(refs.begin(), refs.end(), op);
-  };
-
-  EXPECT_EQ(0, count_in_ref_map(call1, tagged_slot));
-  EXPECT_EQ(0, count_in_ref_map(call1, compressed_slot));
-  EXPECT_EQ(1, count_in_ref_map(call2, tagged_slot));
-  EXPECT_EQ(1, count_in_ref_map(call2, compressed_slot));
-  EXPECT_EQ(0, count_in_ref_map(call2, untagged_slot));
-  EXPECT_EQ(0, count_in_ref_map(call3, tagged_slot));
-  EXPECT_EQ(0, count_in_ref_map(call3, compressed_slot));
-  EXPECT_EQ(1, count_in_ref_map(call4, tagged_slot));
-  EXPECT_EQ(1, count_in_ref_map(call4, compressed_slot));
+  ASSERT_DEATH_IF_SUPPORTED(Allocate(), kOversubscribedDeathRegex);
 }
 
 }  // namespace

@@ -4050,7 +4050,7 @@ bool MaglevGraphBuilder::CanTreatHoleAsUndefined(
 compiler::OptionalObjectRef
 MaglevGraphBuilder::TryFoldLoadDictPrototypeConstant(
     compiler::PropertyAccessInfo const& access_info) {
-  DCHECK(V8_DICT_PROPERTY_CONST_TRACKING_BOOL);
+  DCHECK(V8_DICT_PROTOTYPES_BOOL);
   DCHECK(access_info.IsDictionaryProtoDataConstant());
   DCHECK(access_info.holder().has_value());
 
@@ -5026,6 +5026,7 @@ ReduceResult MaglevGraphBuilder::BuildLoadTypedArrayElement(
     case UINT16_ELEMENTS:
     case UINT32_ELEMENTS:
       BUILD_AND_RETURN_LOAD_TYPED_ARRAY(UnsignedInt);
+    case FLOAT16_ELEMENTS:
     case FLOAT32_ELEMENTS:
     case FLOAT64_ELEMENTS:
       BUILD_AND_RETURN_LOAD_TYPED_ARRAY(Double);
@@ -5052,6 +5053,7 @@ ReduceResult MaglevGraphBuilder::BuildLoadConstantTypedArrayElement(
     case UINT16_ELEMENTS:
     case UINT32_ELEMENTS:
       BUILD_AND_RETURN_LOAD_CONSTANT_TYPED_ARRAY(UnsignedInt);
+    case FLOAT16_ELEMENTS:
     case FLOAT32_ELEMENTS:
     case FLOAT64_ELEMENTS:
       BUILD_AND_RETURN_LOAD_CONSTANT_TYPED_ARRAY(Double);
@@ -5079,6 +5081,7 @@ ReduceResult MaglevGraphBuilder::BuildStoreTypedArrayElement(
       BUILD_STORE_TYPED_ARRAY(Int, value)
       break;
     }
+    case FLOAT16_ELEMENTS:
     case FLOAT32_ELEMENTS:
     case FLOAT64_ELEMENTS: {
       BUILD_STORE_TYPED_ARRAY(Double, value)
@@ -5109,6 +5112,7 @@ ReduceResult MaglevGraphBuilder::BuildStoreConstantTypedArrayElement(
       BUILD_STORE_CONSTANT_TYPED_ARRAY(Int, value)
       break;
     }
+    case FLOAT16_ELEMENTS:
     case FLOAT32_ELEMENTS:
     case FLOAT64_ELEMENTS: {
       BUILD_STORE_CONSTANT_TYPED_ARRAY(Double, value)
@@ -5128,7 +5132,7 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildElementAccessOnTypedArray(
   DCHECK(HasOnlyJSTypedArrayMaps(
       base::VectorOf(access_info.lookup_start_object_maps())));
   ElementsKind elements_kind = access_info.elements_kind();
-  if (elements_kind == FLOAT16_ELEMENTS ||
+  if ((elements_kind == FLOAT16_ELEMENTS && !reducer_.CanInlineFloat16()) ||
       elements_kind == BIGUINT64_ELEMENTS ||
       elements_kind == BIGINT64_ELEMENTS) {
     return {};
@@ -5237,6 +5241,7 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildElementAccessOnTypedArray(
           GET_VALUE_OR_ABORT(value, GetAccumulatorTruncatedInt32ForToNumber(
                                         NodeType::kNumberOrOddball));
           break;
+        case FLOAT16_ELEMENTS:
         case FLOAT32_ELEMENTS:
         case FLOAT64_ELEMENTS:
           GET_VALUE_OR_ABORT(value, GetAccumulatorFloat64ForToNumber(
@@ -15801,9 +15806,16 @@ ReduceResult MaglevGraphBuilder::VisitSwitchOnGeneratorState() {
       generator, new_state, offsetof(JSGeneratorObject, continuation_),
       StoreTaggedMode::kDefault));
 
-  // Guarantee that we have something in the accumulator.
-  MoveNodeBetweenRegisters(iterator_.GetRegisterOperand(0),
-                           interpreter::Register::virtual_accumulator());
+  // Guarantee that we have something in the accumulator and registers for the
+  // resume targets (which will overwrite live registers and the accumulator in
+  // VisitResumeGenerator).
+  ValueNode* optimized_out = GetRootConstant(RootIndex::kOptimizedOut);
+  current_interpreter_frame_.set_accumulator(optimized_out);
+  for (int i = 0; i < register_count(); i++) {
+    if (i != iterator_.GetRegisterOperand(0).index()) {
+      current_interpreter_frame_.set(interpreter::Register(i), optimized_out);
+    }
+  }
 
   // Switch on generator state. Convert the input before constructing
   // BasicBlockRefs, so bailing out does not leave dangling refs in

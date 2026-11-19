@@ -9039,7 +9039,8 @@ class LoadDoubleDataViewElement
  public:
   explicit LoadDoubleDataViewElement(uint64_t bitfield, ExternalArrayType type)
       : Base(bitfield | ExternalArrayTypeField::encode(type)) {
-    DCHECK(type == ExternalArrayType::kExternalFloat32Array ||
+    DCHECK(type == ExternalArrayType::kExternalFloat16Array ||
+           type == ExternalArrayType::kExternalFloat32Array ||
            type == ExternalArrayType::kExternalFloat64Array);
   }
 
@@ -9094,7 +9095,7 @@ LOAD_TYPED_ARRAY(LoadUnsignedIntTypedArrayElement, OpProperties::Uint32(),
                  UINT16_ELEMENTS, UINT32_ELEMENTS)
 
 LOAD_TYPED_ARRAY(LoadDoubleTypedArrayElement, OpProperties::Float64(),
-                 FLOAT32_ELEMENTS, FLOAT64_ELEMENTS)
+                 FLOAT16_ELEMENTS, FLOAT32_ELEMENTS, FLOAT64_ELEMENTS)
 
 #undef LOAD_TYPED_ARRAY
 
@@ -9138,8 +9139,8 @@ LOAD_CONSTANT_TYPED_ARRAY(LoadUnsignedIntConstantTypedArrayElement,
                           UINT16_ELEMENTS, UINT32_ELEMENTS)
 
 LOAD_CONSTANT_TYPED_ARRAY(LoadDoubleConstantTypedArrayElement,
-                          OpProperties::Float64(), FLOAT32_ELEMENTS,
-                          FLOAT64_ELEMENTS)
+                          OpProperties::Float64(), FLOAT16_ELEMENTS,
+                          FLOAT32_ELEMENTS, FLOAT64_ELEMENTS)
 
 #undef LOAD_CONSTANT_TYPED_ARRAY
 
@@ -9171,7 +9172,7 @@ STORE_TYPED_ARRAY(StoreIntTypedArrayElement, OpProperties::CanWrite(), Int32,
                   UINT8_CLAMPED_ELEMENTS, UINT16_ELEMENTS, UINT16_ELEMENTS,
                   UINT32_ELEMENTS)
 STORE_TYPED_ARRAY(StoreDoubleTypedArrayElement, OpProperties::CanWrite(),
-                  Float64, FLOAT32_ELEMENTS, FLOAT64_ELEMENTS)
+                  Float64, FLOAT16_ELEMENTS, FLOAT32_ELEMENTS, FLOAT64_ELEMENTS)
 #undef STORE_TYPED_ARRAY
 
 #define STORE_CONSTANT_TYPED_ARRAY(name, properties, type, ...)             \
@@ -9208,8 +9209,8 @@ STORE_CONSTANT_TYPED_ARRAY(StoreIntConstantTypedArrayElement,
                            UINT8_CLAMPED_ELEMENTS, UINT16_ELEMENTS,
                            UINT16_ELEMENTS, UINT32_ELEMENTS)
 STORE_CONSTANT_TYPED_ARRAY(StoreDoubleConstantTypedArrayElement,
-                           OpProperties::CanWrite(), Float64, FLOAT32_ELEMENTS,
-                           FLOAT64_ELEMENTS)
+                           OpProperties::CanWrite(), Float64, FLOAT16_ELEMENTS,
+                           FLOAT32_ELEMENTS, FLOAT64_ELEMENTS)
 #undef STORE_CONSTANT_TYPED_ARRAY
 
 // StoreInt32DataViewElement handles stores for all integer DataView types
@@ -9259,7 +9260,8 @@ class StoreDoubleDataViewElement
  public:
   explicit StoreDoubleDataViewElement(uint64_t bitfield, ExternalArrayType type)
       : Base(bitfield | ExternalArrayTypeField::encode(type)) {
-    DCHECK(type == ExternalArrayType::kExternalFloat32Array ||
+    DCHECK(type == ExternalArrayType::kExternalFloat16Array ||
+           type == ExternalArrayType::kExternalFloat32Array ||
            type == ExternalArrayType::kExternalFloat64Array);
   }
 
@@ -11590,6 +11592,12 @@ class BranchControlNode : public ConditionalControlNode {
   void set_if_true(BasicBlock* block) { if_true_.set_block_ptr(block); }
   void set_if_false(BasicBlock* block) { if_false_.set_block_ptr(block); }
 
+  void SwapTargets() {
+    BasicBlock* tmp = if_true();
+    set_if_true(if_false());
+    set_if_false(tmp);
+  }
+
  private:
   BasicBlockRef if_true_;
   BasicBlockRef if_false_;
@@ -11884,12 +11892,16 @@ class BranchIfRootConstant
   explicit BranchIfRootConstant(uint64_t bitfield, RootIndex root_index,
                                 BasicBlockRef* if_true_refs,
                                 BasicBlockRef* if_false_refs)
-      : Base(bitfield, if_true_refs, if_false_refs), root_index_(root_index) {}
+      : Base(RootIndexField::update(bitfield, root_index), if_true_refs,
+             if_false_refs) {}
 
   DECLARE_INPUTS(Condition)
   DECLARE_INPUT_TYPES(Tagged)
 
-  RootIndex root_index() { return root_index_; }
+  RootIndex root_index() const { return RootIndexField::decode(bitfield()); }
+  void set_root_index(RootIndex root_index) {
+    set_bitfield(RootIndexField::update(bitfield(), root_index));
+  }
 
 #ifdef V8_COMPRESS_POINTERS
   void MarkTaggedInputsAsDecompressing() {
@@ -11902,7 +11914,9 @@ class BranchIfRootConstant
   void PrintParams(std::ostream&) const;
 
  private:
-  RootIndex root_index_;
+  static constexpr int kRootIndexBitSize =
+      std::bit_width(static_cast<unsigned>(RootIndex::kRootListLength));
+  using RootIndexField = Base::NextBitField<RootIndex, kRootIndexBitSize>;
 };
 
 class BranchIfUndefinedOrNull
@@ -11939,6 +11953,9 @@ class BranchIfUndetectable
   DECLARE_INPUT_TYPES(Tagged)
 
   CheckType check_type() const { return CheckTypeBitField::decode(bitfield()); }
+  void set_check_type(CheckType check_type) {
+    set_bitfield(CheckTypeBitField::update(bitfield(), check_type));
+  }
 
   void SetValueLocationConstraints();
   void GenerateCode(MaglevAssembler*, const ProcessingState&);

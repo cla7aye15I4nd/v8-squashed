@@ -392,7 +392,7 @@ INCOMPATIBLE_FLAGS_PER_BUILD_VARIABLE = {
         "--stress-concurrent-allocation", "--stress-concurrent-inlining",
         "--wasm-test-streaming"
     ],
-    "dict_property_const_tracking": ["--stress-concurrent-inlining"],
+    "dict_prototypes": ["--stress-concurrent-inlining"],
 }
 
 # Flags that lead to a contradiction when a certain extra-flag is present.
@@ -404,6 +404,11 @@ INCOMPATIBLE_FLAGS_PER_EXTRA_FLAG = {
     "--concurrent-recompilation": [
         "--predictable", "--assert-types", "--turboshaft-assert-types",
         "--single-threaded"
+    ],
+    # Conflicts when extra-flags (e.g. --gc-stress) and a test specify
+    # different values.
+    "--concurrent-recompilation-delay=*": [
+        "--concurrent-recompilation-delay=*"
     ],
     "--parallel-compile-tasks-for-eager-toplevel": ["--predictable"],
     "--parallel-compile-tasks-for-lazy": ["--predictable"],

@@ -1956,11 +1956,13 @@ void MacroAssembler::Move(Register dst, Register src) {
 
 void MacroAssembler::MovePair(Register dst0, Register src0, Register dst1,
                               Register src1) {
-  DCHECK_NE(dst0, dst1);
-  if (dst0 != src1) {
+  DCHECK(!AreAliased(dst0, dst1));
+  DCHECK(AreSameSizeAndType(dst0, src0, dst1, src1));
+  DCHECK(dst0.Is64Bits());
+  if (!dst0.Aliases(src1)) {
     Mov(dst0, src0);
     Mov(dst1, src1);
-  } else if (dst1 != src0) {
+  } else if (!dst1.Aliases(src0)) {
     // Swap the order of the moves to resolve the overlap.
     Mov(dst1, src1);
     Mov(dst0, src0);
@@ -4366,19 +4368,21 @@ void MacroAssembler::CallVerifySkippedTrustedWriteBarrierStub(Register object,
 void MacroAssembler::MoveObjectAndSlot(Register dst_object, Register dst_slot,
                                        Register object, Operand offset) {
   ASM_CODE_COMMENT(this);
-  DCHECK_NE(dst_object, dst_slot);
+  DCHECK(!AreAliased(dst_object, dst_slot));
+  DCHECK(AreSameSizeAndType(dst_object, dst_slot, object));
+  DCHECK(object.Is64Bits());
   // If `offset` is a register, it cannot overlap with `object`.
   DCHECK_IMPLIES(!offset.IsImmediate(), !offset.reg().Aliases(object));
 
   // If the slot register does not overlap with the object register, we can
   // overwrite it.
-  if (dst_slot != object) {
+  if (!dst_slot.Aliases(object)) {
     Add(dst_slot, object, offset);
     Mov(dst_object, object);
     return;
   }
 
-  DCHECK_EQ(dst_slot, object);
+  DCHECK(dst_slot.Aliases(object));
 
   // If the destination object register does not overlap with the offset
   // register, we can overwrite it.
