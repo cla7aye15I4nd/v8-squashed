@@ -543,6 +543,19 @@ void VisitObjectWithCppHeapPointerField(
   DCHECK(IsCppHeapPointerWrapperObject(object));
   DCHECK(!HeapLayout::InYoungGeneration(object));
 
+  if (IsNativeContext(object)) {
+    Tagged<NativeContext> context = Cast<NativeContext>(object);
+    for (int i = 0; i < V8_EMBEDDER_DATA_ARRAY_SIZE; ++i) {
+      void* wrappable = nullptr;
+      if (EmbedderDataSlot(context, i)
+              .ToAlignedPointer(isolate, &wrappable, kAnyCppHeapPointer) &&
+          wrappable) {
+        worklist.cpp_marking_state()->MarkAndPush(wrappable);
+      }
+    }
+    return;
+  }
+
   // Wrapper using cpp_heap_wrappable field.
   void* wrappable = CppHeapObjectWrapper::From(object).GetCppHeapWrappable(
       isolate, kAnyCppHeapPointer);
@@ -751,7 +764,8 @@ void MinorMarkSweepCollector::TraceFragmentation() {
   size_t allocatable_bytes = 0;
   for (NormalPage* p : *new_space) {
     Address free_start = p->area_start();
-    for (auto [object, size] : LiveObjectRange(p)) {
+    for (auto [object, size] :
+         LiveObjectRange<ConcurrencyMode::kSynchronous>(p)) {
       Address free_end = object.address();
       if (free_end != free_start) {
         size_t free_bytes = free_end - free_start;

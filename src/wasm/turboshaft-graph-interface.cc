@@ -2879,8 +2879,7 @@ class TurboshaftGraphBuildingInterface
         // Note that the `implicit_arg` can never be a `WasmImportData`,
         // since we don't inline imported functions right now.
         if (use_deopt_slowpath) {
-          DeoptIfNot(decoder, __ TaggedEqual(implicit_arg, instance),
-                     frame_state);
+          DeoptIfNot(__ TaggedEqual(implicit_arg, instance), frame_state);
           __ Goto(case_blocks[0]);
         } else {
           constexpr BranchHint kUnlikelyCrossInstanceCall = BranchHint::kTrue;
@@ -2931,8 +2930,7 @@ class TurboshaftGraphBuildingInterface
 
           bool is_last_feedback_case = (i == feedback_cases.size() - 1);
           if (use_deopt_slowpath && is_last_feedback_case) {
-            DeoptIfNot(decoder, __ Word32Equal(target, inlined_target),
-                       frame_state);
+            DeoptIfNot(__ Word32Equal(target, inlined_target), frame_state);
           } else {
             TSBlock* inline_block = __ NewBlock();
             BranchHint hint =
@@ -3214,7 +3212,6 @@ class TurboshaftGraphBuildingInterface
               CreateFrameState(decoder, sig, &func_ref, args);
           if (frame_state.valid()) {
             DeoptIfNot(
-                decoder,
                 __ TaggedEqual(func_ref.get<MaybeObject>(), inlined_func_ref),
                 frame_state);
           } else {
@@ -5924,50 +5921,17 @@ class TurboshaftGraphBuildingInterface
   }
 
   void RefI31(FullDecoder* decoder, const Value& input, Value* result) {
-    if constexpr (SmiValuesAre31Bits()) {
-      V<Word32> shifted =
-          __ Word32ShiftLeft(input.get<Word32>(), kSmiTagSize + kSmiShiftSize);
-      result->op = __ ChangeUint32ToUintPtr(shifted);
-    } else {
-      // Set the topmost bit to sign-extend the second bit. This way,
-      // interpretation in JS (if this value escapes there) will be the same as
-      // i31.get_s.
-      V<WordPtr> input_wordptr = __ ChangeUint32ToUintPtr(input.get<Word32>());
-      result->op = __ WordPtrShiftRightArithmetic(
-          __ WordPtrShiftLeft(input_wordptr, kSmiShiftSize + kSmiTagSize + 1),
-          1);
-    }
-    result->op = __ AnnotateWasmType(
-        __ BitcastWordPtrToSmi(result->get<WordPtr>()), result->type);
+    result->op = __ WasmRefI31(input.get<Word32>(), result->type.is_shared());
   }
 
   void I31GetS(FullDecoder* decoder, const Value& input, Value* result) {
     V<Smi> input_non_null = NullCheck<Smi>(input);
-    if constexpr (SmiValuesAre31Bits()) {
-      result->op = __ Word32ShiftRightArithmeticShiftOutZeros(
-          __ TruncateWordPtrToWord32(__ BitcastSmiToWordPtr(input_non_null)),
-          kSmiTagSize + kSmiShiftSize);
-    } else {
-      // Topmost bit is already sign-extended.
-      result->op = __ TruncateWordPtrToWord32(
-          __ WordPtrShiftRightArithmeticShiftOutZeros(
-              __ BitcastSmiToWordPtr(input_non_null),
-              kSmiTagSize + kSmiShiftSize));
-    }
+    result->op = __ WasmI31Get(input_non_null, /*is_signed=*/true);
   }
 
   void I31GetU(FullDecoder* decoder, const Value& input, Value* result) {
     V<Smi> input_non_null = NullCheck<Smi>(input);
-    if constexpr (SmiValuesAre31Bits()) {
-      result->op = __ Word32ShiftRightLogical(
-          __ TruncateWordPtrToWord32(__ BitcastSmiToWordPtr(input_non_null)),
-          kSmiTagSize + kSmiShiftSize);
-    } else {
-      // Topmost bit is sign-extended, remove it.
-      result->op = __ TruncateWordPtrToWord32(__ WordPtrShiftRightLogical(
-          __ WordPtrShiftLeft(__ BitcastSmiToWordPtr(input_non_null), 1),
-          kSmiTagSize + kSmiShiftSize + 1));
-    }
+    result->op = __ WasmI31Get(input_non_null, /*is_signed=*/false);
   }
 
   void RefGetDesc(FullDecoder* decoder, ModuleTypeIndex struct_index,
@@ -7126,8 +7090,7 @@ class TurboshaftGraphBuildingInterface
         builder.AllocateFrameStateData(*frame_state_info, zone));
   }
 
-  void DeoptIfNot(FullDecoder* decoder, OpIndex deopt_condition,
-                  V<EagerFrameState> frame_state) {
+  void DeoptIfNot(OpIndex deopt_condition, V<EagerFrameState> frame_state) {
     CHECK(deopts_enabled());
     DCHECK(frame_state.valid());
     __ DeoptimizeIfNot(deopt_condition, frame_state,

@@ -15,6 +15,7 @@
 #include "src/maglev/maglev-kna-map.h"
 #include "src/maglev/maglev-node-type.h"
 #include "src/objects/contexts.h"
+#include "src/zone/zone-containers.h"
 
 namespace v8 {
 namespace internal {
@@ -405,6 +406,11 @@ class KnownNodeAspects {
   // collide afterwards. Used at loop headers to normalize the cached backedge
   // KNA before merging it into the forward KNA.
   void UnwrapIdentitiesAndPhisInKeys();
+
+  // Rewrites references to replaced loop-header phis (keys and cached values)
+  // in a peeled loop's saved backedge KNA before the old phis are overwritten
+  // with identities to the peel-exit-merge phis.
+  void RemapLoopHeaderPhis(const ZoneAbslFlatHashMap<Phi*, Phi*>& replacements);
 
   // Loop headers can safely clone the node types, since those won't be
   // invalidated in the loop body, and similarly stable maps will have
@@ -951,6 +957,9 @@ class KnownNodeAspects {
 
   bool MarkSingleMapAsStale(ValueNode* node, bool is_tracing_enabled);
 
+  template <bool kRemapValues, typename RemapFn>
+  void RemapPropertyAndContextNodes(RemapFn&& remap);
+
   static constexpr uint32_t kEffectEpochForPureInstructions =
       std::numeric_limits<uint32_t>::max();
   static constexpr uint32_t kEffectEpochOverflow =
@@ -1074,14 +1083,23 @@ class KnownNodeAspects {
   // TODO(496266449): Simply use `Unwrap` once `kTagged` is split into
   // `kTaggedSigned` and `kTaggedPointer` representations.
   static ValueNode* GetCanonical(ValueNode* node) {
-    node = node->UnwrapIdentitiesAndReturnedValues();
-    if (node->is_tagged()) return node;
-    while (node->is_conversion()) {
-      ValueNode* input =
-          node->input_node(0)->UnwrapIdentitiesAndReturnedValues();
-      if (input->is_tagged()) break;
-      node = input;
+    node = node->UnwrapIdentitiesReturnedValuesAndPhis();
+    if (!node->is_tagged()) {
+      while (node->is_conversion()) {
+        ValueNode* input =
+            node->input_node(0)->UnwrapIdentitiesReturnedValuesAndPhis();
+        if (input->is_tagged()) break;
+        node = input;
+      }
     }
+    DCHECK(!node->Is<Identity>() && !node->Is<ReturnedValue>());
+    // Only tagging and untagging conversions can be canonical; untagged-to-
+    // untagged conversions are always unwrapped above.
+    DCHECK_IMPLIES(
+        node->is_conversion(),
+        node->is_tagged() != node->input_node(0)
+                                 ->UnwrapIdentitiesReturnedValuesAndPhis()
+                                 ->is_tagged());
     return node;
   }
 

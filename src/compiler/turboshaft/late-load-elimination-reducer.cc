@@ -248,10 +248,8 @@ void LateLoadEliminationAnalyzer::ProcessBlock(const Block& block,
         break;
 
       case Opcode::kCatchBlockBegin:
-        // Throwing ops handle their own side effects, and Debug::OnException
-        // lazy-deoptimizes optimized JS frames / skips pausing on optimized
-        // Wasm frames. CatchBlockBeginOp has `can_allocate`, so string maps
-        // are still invalidated below.
+        ProcessCatchBlockBegin(op_idx);
+        break;
       case Opcode::kRetain:
       case Opcode::kDidntThrow:
       case Opcode::kCheckException:
@@ -382,20 +380,20 @@ void LateLoadEliminationAnalyzer::ProcessLoad(OpIndex op_idx,
   // all loads need to be revisited during processing.
   int32_truncated_loads_[op_idx];
 
-  if (MemorySlotValue existing = memory_.Find(load); existing.value.valid()) {
-    const Operation& replacement = graph_.Get(existing.value);
+  if (MemorySlotValue existing = memory_.Find(load); existing.valid()) {
+    const Operation& replacement = graph_.Get(existing.value());
     DCHECK_EQ(replacement.outputs_rep().size(), 1);
     DCHECK_EQ(load.outputs_rep().size(), 1);
-    TRACE(">> Found potential replacement at offset " << existing.value);
+    TRACE(">> Found potential replacement at offset " << existing.value());
     if (RepIsCompatible(replacement.outputs_rep()[0], load.outputs_rep()[0],
                         load.loaded_rep)) {
       TRACE(">>> Confirming replacement");
-      if (load.kind.is_immutable && !existing.is_immutable) {
+      if (load.kind.is_immutable && !existing.is_immutable()) {
         // Promote a live mutable entry (e.g. from an initializing store) to
         // immutable in the current snapshot so it survives subsequent calls.
-        memory_.Insert(load, existing.value);
+        memory_.Insert(load, existing.value());
       }
-      replacements_[op_idx] = Replacement::LoadElimination(existing.value);
+      replacements_[op_idx] = Replacement::LoadElimination(existing.value());
       return;
     } else {
       TRACE(">>> Replacement has wrong representation: "
@@ -433,18 +431,18 @@ void LateLoadEliminationAnalyzer::ProcessTrustedLoad(
   // all loads need to be revisited during processing.
   int32_truncated_loads_[op_idx];
 
-  if (MemorySlotValue existing = memory_.Find(load); existing.value.valid()) {
-    const Operation& replacement = graph_.Get(existing.value);
+  if (MemorySlotValue existing = memory_.Find(load); existing.valid()) {
+    const Operation& replacement = graph_.Get(existing.value());
     USE(replacement);
     // All trusted loads have the same representation and they can't alias with
     // any other loads.
     DCHECK(replacement.Is<LoadTrustedPointerOp>());
     DCHECK_EQ(replacement.outputs_rep(), load.outputs_rep());
-    TRACE(">> Found replacement at offset " << existing.value);
-    if (load.kind.is_immutable && !existing.is_immutable) {
-      memory_.Insert(load, existing.value);
+    TRACE(">> Found replacement at offset " << existing.value());
+    if (load.kind.is_immutable && !existing.is_immutable()) {
+      memory_.Insert(load, existing.value());
     }
-    replacements_[op_idx] = Replacement::LoadElimination(existing.value);
+    replacements_[op_idx] = Replacement::LoadElimination(existing.value());
     return;
   }
   // Reset the replacement of {op_idx} to Invalid, in case a previous visit of a
@@ -703,6 +701,30 @@ void LateLoadEliminationAnalyzer::ProcessAssumeMap(
                                          ComputeMinMaxHash(assume_map.maps)));
 }
 
+void LateLoadEliminationAnalyzer::ProcessCatchBlockBegin(OpIndex op_idx) {
+  TRACE("> ProcessCatchBlockBegin(" << op_idx << ")");
+  switch (data_->pipeline_kind()) {
+    case TurboshaftPipelineKind::kCSA:
+    case TurboshaftPipelineKind::kTSABuiltin:
+    case TurboshaftPipelineKind::kJSToWasm:
+      // Builtin and JS-to-Wasm wrapper frames cannot lazy-deoptimize, so if a
+      // throwing op without `can_write()` (e.g. `StringAdd_NoMapCheck` in TSA)
+      // pauses in `Debug::OnException`, arbitrary JS can mutate heap memory
+      // before unwinding enters the catch block. (`object_maps_` is empty in
+      // builtin/wrapper pipelines; call `WipeAllMaps()` here if that changes.)
+      DCHECK(object_maps_.empty());
+      memory_.InvalidateMaybeAliasing();
+      break;
+    case TurboshaftPipelineKind::kJS:
+    case TurboshaftPipelineKind::kWasm:
+      // For JS/Wasm, throwing ops handle their own side effects, and
+      // Debug::OnException lazy-deoptimizes optimized JS frames / skips
+      // pausing on optimized Wasm frames. CatchBlockBeginOp has `can_allocate`,
+      // so string maps are still invalidated in `ProcessBlock`.
+      break;
+  }
+}
+
 bool IsInt32TruncatedLoadPattern(const Graph& graph, OpIndex change_idx,
                                  const ChangeOp& change, OpIndex* bitcast_idx,
                                  OpIndex* load_idx) {
@@ -868,12 +890,11 @@ bool LateLoadEliminationAnalyzer::BeginBlock(const Block* block) {
           base::Vector<const MemorySlotValue> predecessors) -> MemorySlotValue {
     DCHECK(!predecessors.empty());
     MemorySlotValue merged = predecessors[0];
-    for (const MemorySlotValue& pred : predecessors.SubVectorFrom(1)) {
-      if (pred.value != merged.value) {
-        merged = MemorySlotValue{};
-        break;
+    if (merged.valid()) {
+      for (MemorySlotValue pred : predecessors.SubVectorFrom(1)) {
+        merged = merged.Intersect(pred);
+        if (!merged.valid()) break;
       }
-      merged.is_immutable &= pred.is_immutable;
     }
     if (for_loop_revisit && merged != predecessors[kForwardEdgeOffset]) {
       // {key} had a value in the loop header, but the backedge and the forward

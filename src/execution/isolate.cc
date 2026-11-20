@@ -121,7 +121,6 @@
 #include "src/snapshot/embedded/embedded-file-writer-interface.h"
 #include "src/snapshot/read-only-deserializer.h"
 #include "src/snapshot/shared-heap-deserializer.h"
-#include "src/snapshot/snapshot.h"
 #include "src/snapshot/startup-deserializer.h"
 #include "src/strings/string-builder-inl.h"
 #include "src/strings/string-stream.h"
@@ -2970,10 +2969,7 @@ Tagged<Object> Isolate::UnwindAndFindHandler() {
           reinterpret_cast<uintptr_t>(iter.wasm_stack()->jslimit());
       stack_guard()->SetStackLimitForStackSwitching(limit);
       iter.wasm_stack()->clear_stack_switch_info();
-#if V8_OS_WIN
-      base::Stack::SetCurrentThreadStackBounds(iter.wasm_stack()->limit(),
-                                               iter.wasm_stack()->base());
-#endif
+      iter.wasm_stack()->SwitchStackBoundsFromCentral();
     }
 #endif
 
@@ -5356,12 +5352,7 @@ void Isolate::Deinit() {
 
   ClearSerializerData();
 
-  if (OwnsStringTables()) {
-    string_forwarding_table()->TearDown();
-  } else {
-    DCHECK_NULL(string_table_.get());
-    DCHECK_NULL(string_forwarding_table_.get());
-  }
+  DCHECK_IMPLIES(!OwnsStringTables(), string_table_ == nullptr);
 
 #ifdef V8_COMPRESS_POINTERS
   external_pointer_table().TearDownSpace(
@@ -6062,27 +6053,10 @@ void Isolate::AddCrashKeysForIsolateAndHeapPointers() {
   SET_CRASH_KEY("v8_isolate_address", reinterpret_cast<uintptr_t>(this));
   SET_CRASH_KEY("v8_ro_space_firstpage_address",
                 heap()->read_only_space()->FirstPageAddress());
-  SET_CRASH_KEY("v8_old_space_firstpage_address",
-                heap()->old_space()->FirstPageAddress());
-
-  if (heap()->code_range_base()) {
-    SET_CRASH_KEY("v8_code_range_base_address", heap()->code_range_base());
-  }
 
   if (heap()->code_space()->first_page()) {
     SET_CRASH_KEY("v8_code_space_firstpage_address",
                   heap()->code_space()->FirstPageAddress());
-  }
-
-  if (snapshot_available()) {
-    // TODO(cbruni): Implement strategy to infrequently collect this.
-    const uint32_t v8_snapshot_checksum_calculated = 0;
-    SET_CRASH_KEY("v8_snapshot_checksum_calculated",
-                  v8_snapshot_checksum_calculated);
-    const uint32_t v8_snapshot_checksum_expected =
-        Snapshot::GetExpectedChecksum(snapshot_blob());
-    SET_CRASH_KEY("v8_snapshot_checksum_expected",
-                  v8_snapshot_checksum_expected);
   }
 #undef SET_CRASH_KEY
 }
@@ -6441,13 +6415,11 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
 
   if (OwnsStringTables()) {
     string_table_ = std::make_unique<StringTable>(this);
-    string_forwarding_table_ = std::make_unique<StringForwardingTable>(this);
   } else {
     // Only refer to shared string table after attaching to the shared isolate.
     DCHECK(has_shared_space());
     DCHECK(!is_shared_space_isolate());
     DCHECK_NOT_NULL(string_table());
-    DCHECK_NOT_NULL(string_forwarding_table());
   }
 
 #ifdef V8_EXTERNAL_CODE_SPACE

@@ -5037,8 +5037,6 @@ v8_header_set("v8_internal_headers") {
     "src/objects/source-text-module-inl.h",
     "src/objects/source-text-module.h",
     "src/objects/string-comparator.h",
-    "src/objects/string-forwarding-table-inl.h",
-    "src/objects/string-forwarding-table.h",
     "src/objects/string-inl.h",
     "src/objects/string-set-inl.h",
     "src/objects/string-set.h",
@@ -6785,7 +6783,6 @@ v8_cluster_source_set("v8_base_without_compiler") {
     "src/objects/simd.cc",
     "src/objects/source-text-module.cc",
     "src/objects/string-comparator.cc",
-    "src/objects/string-forwarding-table.cc",
     "src/objects/string-table.cc",
     "src/objects/string.cc",
     "src/objects/swiss-name-dictionary.cc",
@@ -9208,6 +9205,40 @@ v8_executable("d8") {
   }
 
   defines = []
+
+  if (v8_enable_experimental_mock_dom) {
+    defines += [ "V8_ENABLE_EXPERIMENTAL_MOCK_DOM" ]
+    sources += [
+      "experimental/d8/mock-dom/bindings-canvas.cc",
+      "experimental/d8/mock-dom/bindings-core.cc",
+      "experimental/d8/mock-dom/bindings-element.cc",
+      "experimental/d8/mock-dom/bindings-indexeddb.cc",
+      "experimental/d8/mock-dom/bindings-misc.cc",
+      "experimental/d8/mock-dom/bindings-range.cc",
+      "experimental/d8/mock-dom/bindings-window.cc",
+      "experimental/d8/mock-dom/bindings.h",
+      "experimental/d8/mock-dom/css.cc",
+      "experimental/d8/mock-dom/css.h",
+      "experimental/d8/mock-dom/dom.cc",
+      "experimental/d8/mock-dom/dom.h",
+      "experimental/d8/mock-dom/html.cc",
+      "experimental/d8/mock-dom/html.h",
+      "experimental/d8/mock-dom/interfaces.h",
+      "experimental/d8/mock-dom/isolate-data.h",
+      "experimental/d8/mock-dom/layout.cc",
+      "experimental/d8/mock-dom/layout.h",
+      "experimental/d8/mock-dom/mock-dom.cc",
+      "experimental/d8/mock-dom/mock-dom.h",
+      "experimental/d8/mock-dom/objects.cc",
+      "experimental/d8/mock-dom/objects.h",
+      "experimental/d8/mock-dom/selector.cc",
+      "experimental/d8/mock-dom/selector.h",
+      "experimental/d8/mock-dom/strings.cc",
+      "experimental/d8/mock-dom/strings.h",
+      "experimental/d8/mock-dom/url.cc",
+      "experimental/d8/mock-dom/url.h",
+    ]
+  }
 
   if (v8_enable_vtunejit) {
     deps += [ "third_party/vtune:v8_vtune" ]

@@ -364,7 +364,8 @@ DirectHandle<NativeContext> Bootstrapper::CreateEnvironment(
                     context_snapshot_index, embedder_fields_deserializer,
                     microtask_queue);
     env = genesis.result();
-    if (env.is_null() || !InstallExtensions(env, extensions)) {
+    if (env.is_null() ||
+        (extensions != nullptr && !InstallExtensions(env, extensions))) {
       return {};
     }
   }
@@ -3354,13 +3355,6 @@ void Genesis::InitializeGlobal(DirectHandle<JSGlobalObject> global_object,
   InstallError(isolate_, global, factory->SuppressedError_string(),
                Context::SUPPRESSED_ERROR_FUNCTION_INDEX,
                Builtin::kSuppressedErrorConstructor, 3);
-
-  // Initialize the embedder data slot.
-  // TODO(ishell): microtask queue pointer will be moved from native context
-  // to the embedder data array so we don't need an empty embedder data array.
-  DirectHandle<EmbedderDataArray> embedder_data =
-      factory->NewEmbedderDataArray(V8_EMBEDDER_DATA_ARRAY_SIZE);
-  native_context()->set_embedder_data(*embedder_data);
 
   {  // -- g l o b a l T h i s
     DirectHandle<JSGlobalProxy> global_proxy(native_context()->global_proxy(),
