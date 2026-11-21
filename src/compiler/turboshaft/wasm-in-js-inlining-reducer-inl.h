@@ -820,6 +820,39 @@ class WasmInJsInliningInterface {
   // `turboshaft-graph-interface.cc`. Think of a way to DRY, e.g., by moving
   // functionality into Turboshaft `Assembler::Wasm*()` methods or introducing a
   // new, common reducer.
+  void RefI31(FullDecoder* decoder, const Value& input, Value* result) {
+    result->op = __ WasmRefI31(input.get<Word32>(), result->type.is_shared());
+  }
+
+  void I31GetS(FullDecoder* decoder, const Value& input, Value* result) {
+    result->op = __ WasmI31Get(NullCheck<Smi>(input), /*is_signed=*/true);
+  }
+
+  void I31GetU(FullDecoder* decoder, const Value& input, Value* result) {
+    result->op = __ WasmI31Get(NullCheck<Smi>(input), /*is_signed=*/false);
+  }
+
+  void RefTest(FullDecoder* decoder, wasm::HeapType target, const Value& object,
+               Value* result, bool null_succeeds) {
+    V<Map> rtt = RttCanon(target.ref_index());
+    compiler::WasmTypeCheckConfig config{
+        object.type,
+        ValueType::RefMaybeNull(
+            target, null_succeeds ? wasm::kNullable : wasm::kNonNullable),
+        compiler::GetExactness(decoder->module_, target)};
+    result->op = __ WasmTypeCheck(object.get<Object>(), rtt, config);
+  }
+
+  void RefTestAbstract(FullDecoder* decoder, const Value& object,
+                       wasm::HeapType type, Value* result, bool null_succeeds) {
+    compiler::WasmTypeCheckConfig config{
+        object.type,
+        ValueType::RefMaybeNull(
+            type, null_succeeds ? wasm::kNullable : wasm::kNonNullable)};
+    result->op = __ WasmTypeCheck(object.get<Object>(),
+                                  OptionalV<Map>::Nullopt(), config);
+  }
+
   void RefCast(FullDecoder* decoder, const Value& object, Value* result) {
     if (v8_flags.wasm_assume_ref_cast_succeeds) {
       Forward(decoder, object, result);
@@ -956,12 +989,7 @@ class WasmInJsInliningInterface {
   BAILOUT_WASM_OP(ArrayNewSegment)
   BAILOUT_WASM_OP(ArrayInitSegment)
 
-  BAILOUT_WASM_OP(RefI31)
-  BAILOUT_WASM_OP(I31GetS)
-  BAILOUT_WASM_OP(I31GetU)
   BAILOUT_WASM_OP(RefGetDesc)
-  BAILOUT_WASM_OP(RefTest)
-  BAILOUT_WASM_OP(RefTestAbstract)
 
   BAILOUT_WASM_OP(RefCastDescEq)
 
@@ -1021,6 +1049,17 @@ class WasmInJsInliningInterface {
   BAILOUT_WASM_OP(WideOp4)
 
  private:
+  template <typename T = Object>
+  V<T> NullCheck(const Value& value,
+                 TrapId trap_id = TrapId::kTrapNullDereference) {
+    V<T> not_null_value = value.get<T>();
+    if (value.type.is_nullable()) {
+      not_null_value =
+          __ AssertNotNull(not_null_value, frame_state_, value.type, trap_id);
+    }
+    return not_null_value;
+  }
+
   void set_current_wasm_source_position(FullDecoder* decoder) {
     __ set_current_wasm_source_position(
         SourcePosition(decoder->position(), inlining_id_));
@@ -1159,7 +1198,7 @@ WasmBodyInliningResult WasmInJSInliningReducer<Next>::TryInlineWasmBody(
 
   // The inlining succeeded, register the inlined Wasm function in the
   // compilation info.
-  int inlining_id = __ data() -> info()->AddInlinedFunction(
+  int inlining_id = __ data()->info()->AddInlinedFunction(
       inlined_data.shared_fct_info, Handle<BytecodeArray>(),
       inlined_data.call_pos);
 
@@ -1172,7 +1211,7 @@ WasmBodyInliningResult WasmInJSInliningReducer<Next>::TryInlineWasmBody(
   emitting_decoder.Decode();
   DCHECK(emitting_decoder.ok());
   DCHECK(emitting_decoder.interface().result().success);
-  __ data() -> set_wasm_in_js_inlined_any_body();
+  __ data()->set_wasm_in_js_inlined_any_body();
   TRACE("- inlining Wasm function");
   return emitting_decoder.interface().result();
 }
@@ -1196,7 +1235,7 @@ WasmInJSInliningReducer<Next>::CreateWasmInlinedIntoJSFrameState(
   constexpr int kLocalCount = 0;
   const FrameStateType frame_type = FrameStateType::kWasmInlinedIntoJS;
   IndirectHandle<BytecodeArray> bytecode_array_handle = {};
-  Zone* zone = __ data() -> compilation_zone();
+  Zone* zone = __ data()->compilation_zone();
 
   const FrameStateFunctionInfo* frame_state_function_info =
       zone->template New<compiler::FrameStateFunctionInfo>(
@@ -1235,7 +1274,7 @@ WasmInJSInliningReducer<Next>::CreateJSWasmCallBuiltinContinuationFrameState(
   const FrameStateType frame_type =
       FrameStateType::kJSToWasmBuiltinContinuation;
   Handle<SharedFunctionInfo> shared = Handle<SharedFunctionInfo>();
-  Zone* zone = __ data() -> compilation_zone();
+  Zone* zone = __ data()->compilation_zone();
 
   const FrameStateFunctionInfo* frame_state_function_info =
       zone->template New<compiler::JSToWasmFrameStateFunctionInfo>(

@@ -98,12 +98,20 @@ bool MaglevInliner::InlineCallSites() {
       break;
     }
 
+    // Unwrap identities and conversions introduced by earlier inlining rounds
+    // before checking small-function budgets or building the callee graph.
+    call_site->caller_details.UnwrapArguments();
+
     bool is_small = IsSmallFunction(
         call_site->bytecode_length, call_site->caller_details.arguments,
         call_site->generic_call_node->use_repr_hints(), flags_);
     if (!is_small) {
-      int estimated_size =
-          call_site->bytecode_length + GetExistingInlinedSize(call_site);
+      // Reserve some extra budget so that small functions exposed by this
+      // callee still have a chance to inline (matching
+      // JSInliningHeuristic::Finalize).
+      int estimated_size = static_cast<int>(
+          (call_site->bytecode_length + GetExistingInlinedSize(call_site)) *
+          v8_flags.reserve_inline_budget_scale_factor);
       if (graph_->total_inlined_bytecode_size() + estimated_size >
           flags_.max_inlined_bytecode_size_cumulative) {
         graph_->compilation_info()->set_could_not_inline_all_candidates();
@@ -306,12 +314,6 @@ MaglevInliner::InliningResult MaglevInliner::BuildInlineFunction(
   LocalIsolate* local_isolate = broker()->local_isolate_or_isolate();
   MaglevGraphBuilder inner_graph_builder(local_isolate, inner_unit, graph_,
                                          &call_site->caller_details);
-
-  // Make sure the arguments identities and conversions are unwrapped, so they
-  // don't leak to the graph builder, nor to the interpreter frame state.
-  for (ValueNode*& node : call_site->caller_details.arguments) {
-    node = node->Unwrap();
-  }
 
   // Update caller deopt frame with inlined arguments.
   caller_details->deopt_frame =

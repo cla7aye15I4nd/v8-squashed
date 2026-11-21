@@ -2247,6 +2247,10 @@ class AssemblerOpInterface : public Next {
     return V<Boolean>::Cast(
         Convert(input, ConvertOp::Kind::kObject, ConvertOp::Kind::kBoolean));
   }
+  V<HeapObject> ConvertToHeapObject(V<Object> input) {
+    return V<HeapObject>::Cast(
+        Convert(input, ConvertOp::Kind::kObject, ConvertOp::Kind::kHeapObject));
+  }
   V<String> ConvertNumberToString(V<Number> input) {
     return V<String>::Cast(
         Convert(input, ConvertOp::Kind::kNumber, ConvertOp::Kind::kString));
@@ -5165,7 +5169,7 @@ class AssemblerOpInterface : public Next {
   template <RootIndex index>
   V<root_type_t<index>> LoadRoot() {
     using RootObjectType = root_type_t<index>;
-    Isolate* isolate = __ data() -> isolate();
+    Isolate* isolate = __ data()->isolate();
     if (RootsTable::IsImmortalImmovable(index)) {
       if (isolate != nullptr) {
         Handle<Object> root = isolate->root_handle(index);
@@ -5722,7 +5726,7 @@ class AssemblerOpInterface : public Next {
   }
 
   void CanonicalizeEmbeddedBuiltinsConstantIfNeeded(Handle<HeapObject> object) {
-    Isolate* isolate = __ data() -> isolate();
+    Isolate* isolate = __ data()->isolate();
     if (!isolate) return;
     if (!isolate->IsGeneratingEmbeddedBuiltins()) return;
     CanonicalizeEmbeddedBuiltinsConstantIfNeededImpl(isolate, object);

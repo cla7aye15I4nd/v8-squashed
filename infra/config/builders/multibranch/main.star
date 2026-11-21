@@ -72,7 +72,6 @@ in_category(
         release_branches = True,
         triggering_policy = parallel_3_greedy_batching_of_1,
         dimensions = {"os": "Ubuntu-22.04", "cpu": "x86-64"},
-        gclient_vars = [GCLIENT_VARS.JSFUNFUZZ],
         barrier = BARRIER.LKGR_TREE_CLOSER,
     ),
     main_multibranch_builder(
@@ -86,7 +85,6 @@ in_category(
         dimensions = {"os": "Ubuntu-22.04", "cpu": "x86-64"},
         barrier = BARRIER.NONE,
         disable_resultdb_exports = True,
-        first_branch_version = "14.2",
     ),
     main_multibranch_builder_pair(
         name = "V8 Linux64 css - debug",
@@ -167,20 +165,17 @@ in_category(
     main_multibranch_builder_pair(
         name = "V8 Linux64 - PKU",
         dimensions = {"os": "Ubuntu-22.04", "cpu": "x86-64"},
-        first_branch_version = "13.8",
         barrier = BARRIER.NONE,
     ),
     main_multibranch_builder_pair(
         name = "V8 Linux64 - PKU - debug",
         dimensions = {"os": "Ubuntu-22.04", "cpu": "x86-64"},
-        first_branch_version = "13.8",
         barrier = BARRIER.NONE,
     ),
     main_multibranch_builder(
         name = "V8 Linux64 - dumpling - builder",
         dimensions = {"os": "Ubuntu-22.04", "cpu": "x86-64"},
         barrier = BARRIER.TREE_CLOSER,
-        first_branch_version = "15.0",
     ),
 )
 

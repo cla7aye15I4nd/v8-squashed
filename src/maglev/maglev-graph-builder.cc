@@ -741,6 +741,7 @@ MaglevGraphBuilder::MaglevGraphBuilder(LocalIsolate* local_isolate,
 
   if (is_inline()) {
     DCHECK_NOT_NULL(caller_details);
+    caller_details->CheckArgumentsAreUnwrapped();
     DCHECK_GT(compilation_unit->inlining_depth(), 0);
     // The allocation/initialisation logic here relies on inline_exit_offset
     // being the offset one past the end of the bytecode.
@@ -1738,7 +1739,10 @@ ReduceResult MaglevGraphBuilder::BuildNewConsStringMap(ValueNode* left,
   // If both are non-two byte maps, then the result is the
   // kConsOneByteStringMap.
   auto GetIsTwoByteAndMap = [&](ValueNode* input) -> Result {
-    if (auto maybe_constant = TryGetConstant<HeapObject>(input)) {
+    // Only use static constant nodes, not KnownNodeAspects `checked_value`
+    // alternatives (`TryGetConstant<HeapObject>`): a string that was checked to
+    // equal a constant has the same contents, but not necessarily the same map.
+    if (auto maybe_constant = input->TryGetConstant(broker())) {
       bool two_byte = maybe_constant->map(broker()).IsTwoByteStringMap();
       return {true, two_byte,
               GetRootConstant(two_byte ? RootIndex::kConsTwoByteStringMap
@@ -7367,6 +7371,25 @@ MaglevGraphBuilder::TryBuildFindNonDefaultConstructorOrConstruct(
     if (kind != FunctionKind::kDefaultDerivedConstructor) {
       // The hierarchy walk will end here; this is the last change to bail out
       // before creating new nodes.
+      compiler::OptionalJSFunctionRef new_target_function;
+      if (kind == FunctionKind::kDefaultBaseConstructor) {
+        // Creating the instance reads new_target.prototype, which can run user
+        // code unless new_target is a JSFunction with a prototype slot (e.g. if
+        // it's a Proxy or a bound function). Only reduce if new_target is
+        // known to be such a function; otherwise, the generic
+        // FindNonDefaultConstructorOrConstruct call leaves creating the
+        // instance to the regular Construct path. We don't check a non-constant
+        // new_target at runtime.
+        // TODO(marja): Handle non-constant new_targets too.
+        compiler::OptionalHeapObjectRef new_target_constant =
+            TryGetConstant<HeapObject>(new_target);
+        if (!new_target_constant ||
+            !new_target_constant->IsJSFunctionWithPrototype()) {
+          return {};
+        }
+        new_target_function = new_target_constant->AsJSFunction();
+      }
+
       if (!broker()->dependencies()->DependOnArrayIteratorProtector()) {
         return {};
       }
@@ -7377,10 +7400,7 @@ MaglevGraphBuilder::TryBuildFindNonDefaultConstructorOrConstruct(
         StoreRegister(result.first, GetBooleanConstant(true));
 
         ValueNode* object;
-        compiler::OptionalJSFunctionRef new_target_function =
-            TryGetConstant<JSFunction>(new_target);
-        if (new_target_function &&
-            HasValidInitialMap(new_target_function.value(), current_function)) {
+        if (HasValidInitialMap(new_target_function.value(), current_function)) {
           GET_VALUE(
               object,
               reducer_.BuildInlinedAllocation(
@@ -7571,8 +7591,8 @@ bool MaglevGraphBuilder::IsFunctionCandidateForEagerInlining(
           flags_.max_inlined_bytecode_size_small_with_heapnum_in_out &&
       args.mode() == CallArguments::kDefault) {
     bool has_float_arg = false;
-    for (size_t i = 1; i < args.count_with_receiver(); i++) {
-      if (args[i] && args[i]->is_float64_or_holey_float64()) {
+    for (size_t i = 0; i < args.count(); i++) {
+      if (IsFloat64OrHeapNumberConstant(args[i])) {
         has_float_arg = true;
         break;
       }
@@ -7726,6 +7746,7 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildInlineCall(
                           /* is_small_function */ false, call_frequency,
                           current_inlining_tree_debug_info_},
       generic_call, feedback_cell, score, bytecode.length());
+  call_site->caller_details.CheckArgumentsAreUnwrapped();
   TRACE_INLINING(TracePush(shared)
                  << "Score: " << std::right << std::setw(6) << std::fixed
                  << std::setprecision(2) << call_site->score << ", Node: n"

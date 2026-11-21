@@ -899,6 +899,15 @@ class MachineLoweringReducer : public Next {
         BIND(done, result);
         return result;
       }
+      case ConvertOp::Kind::kHeapObject: {
+        DCHECK_EQ(from, ConvertOp::Kind::kObject);
+        ScopedVar<HeapObject> result(this, V<HeapObject>::Cast(input));
+        IF (UNLIKELY(__ ObjectIsSmi(input))) {
+          result =
+              __ ConvertInt32ToHeapNumber(__ UntagSmi(V<Smi>::Cast(input)));
+        }
+        return result;
+      }
       default:
         UNREACHABLE();
     }
@@ -4998,9 +5007,9 @@ class MachineLoweringReducer : public Next {
     return *undetectable_objects_protector_;
   }
 
-  Isolate* isolate_ = __ data() -> isolate();
+  Isolate* isolate_ = __ data()->isolate();
   Factory* factory_ = isolate_ ? isolate_->factory() : nullptr;
-  JSHeapBroker* broker_ = __ data() -> broker();
+  JSHeapBroker* broker_ = __ data()->broker();
   std::optional<bool> undetectable_objects_protector_ = {};
 };
 

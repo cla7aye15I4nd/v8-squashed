@@ -2347,7 +2347,7 @@ class MachineOptimizationReducer : public Next {
           // HeapObject, so unparking the JSHeapBroker here rather than before
           // the optimization pass itself it probably more efficient.
 
-          TurboshaftPipelineKind pkind = __ data() -> pipeline_kind();
+          TurboshaftPipelineKind pkind = __ data()->pipeline_kind();
           USE(pkind);
           DCHECK_IMPLIES(pkind != TurboshaftPipelineKind::kCSA &&
                              pkind != TurboshaftPipelineKind::kTSABuiltin,
@@ -2364,7 +2364,7 @@ class MachineOptimizationReducer : public Next {
         if (offset == offsetof(String, length_) &&
             loaded_rep == MemoryRepresentation::Uint32()) {
           DCHECK_EQ(result_rep, RegisterRepresentation::Word32());
-          TurboshaftPipelineKind pkind = __ data() -> pipeline_kind();
+          TurboshaftPipelineKind pkind = __ data()->pipeline_kind();
           USE(pkind);
           DCHECK_IMPLIES(pkind != TurboshaftPipelineKind::kCSA &&
                              pkind != TurboshaftPipelineKind::kTSABuiltin,
@@ -2685,21 +2685,27 @@ class MachineOptimizationReducer : public Next {
         !matcher_.MatchHeapConstant(right, &o2)) {
       return std::nullopt;
     }
+    if (o1.address() == o2.address()) return true;
     UnparkedScopeIfNeeded unparked(broker);
     AllowHandleDereference allow_handle_dereference;
+    DisallowGarbageCollection no_gc;
     DCHECK_IMPLIES(broker, broker->IsCanonicalHandle(o1));
     DCHECK_IMPLIES(broker, broker->IsCanonicalHandle(o2));
-    if (IsString(*o1) && IsString(*o2)) {
-      // If handles refer to the same object, we can eliminate the check.
-      if (o1.address() == o2.address()) return true;
+    Tagged<HeapObject> obj1 = *o1;
+    Tagged<HeapObject> obj2 = *o2;
+    // Even with canonical handles, two distinct handle slots can refer to the
+    // same HeapObject if one started as a non-internalized String (or
+    // ConsString) and was later shortcutted by GC during a safepoint.
+    if (obj1 == obj2) return true;
+    if (IsString(obj1) && IsString(obj2)) {
       // If both strings are already internalized, they are unique in the string
       // table and can never become equal. Otherwise, at least one might be
       // internalized into a ThinString and shortcutted by GC to the other.
-      if (!IsInternalizedString(*o1) || !IsInternalizedString(*o2)) {
+      if (!IsInternalizedString(obj1) || !IsInternalizedString(obj2)) {
         return std::nullopt;
       }
     }
-    return o1.address() == o2.address();
+    return false;
   }
 
   V<Word32> ReduceCompareEqual(V<Any> left, V<Any> right,
@@ -3322,7 +3328,7 @@ class MachineOptimizationReducer : public Next {
     return base::bits::CountLeadingSignBits(c) - (64 - rep.bit_width());
   }
 
-  JSHeapBroker* broker = __ data() -> broker();
+  JSHeapBroker* broker = __ data()->broker();
   const OperationMatcher& matcher_ = __ matcher();
   // TODO(victorgomes): This also applies to JS. The bit patterns for `the_hole`
   // and `undefined` are signalling NaNs. Optimizing away an arithmetic
@@ -3333,7 +3339,7 @@ class MachineOptimizationReducer : public Next {
   static constexpr bool signalling_nan_possible = true;
 #if V8_ENABLE_WEBASSEMBLY
   // Only wasm needs NaNs to be deterministic.
-  const bool ensure_deterministic_nan = __ data() -> is_wasm();
+  const bool ensure_deterministic_nan = __ data()->is_wasm();
 #else
   static constexpr bool ensure_deterministic_nan = false;
 #endif  // V8_ENABLE_WEBASSEMBLY

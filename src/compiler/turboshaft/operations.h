@@ -750,11 +750,16 @@ struct __attribute__((packed)) OpEffects {
     result.consumes.control_flow = true;
     return result;
   }
-  // Writing heap memory that existed before the operation started. Initializing
-  // newly allocated memory doesn't count.
-  constexpr OpEffects CanWriteHeapMemory() const {
+  // Like `CanWriteHeapMemory()`, but the heap write is an internal cache or
+  // memoization update (e.g., caching a string's hash in
+  // `Name::raw_hash_field_`, internalizing a string key in place, or caching a
+  // JS wrapper) that is not language-observable if the operation is removed
+  // when unused. Unlike `CanWriteHeapMemory()`, this does not set
+  // `required_when_unused`, so the operation remains eliminatable unless
+  // another effect requires it, while still modeling `store_heap_memory` for
+  // load elimination, GVN, and scheduling when live.
+  constexpr OpEffects CanWriteHeapMemoryIfUsed() const {
     OpEffects result = *this;
-    result.required_when_unused = true;
     result.produces.store_heap_memory = true;
     // Do not reorder before stores.
     result.consumes.store_heap_memory = true;
@@ -763,6 +768,11 @@ struct __attribute__((packed)) OpEffects {
     // Do not move before deopting or aborting operations.
     result.consumes.control_flow = true;
     return result;
+  }
+  // Writing heap memory that existed before the operation started. Initializing
+  // newly allocated memory doesn't count.
+  constexpr OpEffects CanWriteHeapMemory() const {
+    return CanWriteHeapMemoryIfUsed().RequiredWhenUnused();
   }
   // Writing any memory or other output, on- or off-heap.
   constexpr OpEffects CanWriteMemory() const {
@@ -5342,6 +5352,7 @@ struct ObjectIsNumericValueOp
 struct ConvertOp : FixedArityOperationT<1, ConvertOp> {
   enum class Kind : uint8_t {
     kObject,
+    kHeapObject,
     kBoolean,
     kNumber,
     kNumberOrOddball,
@@ -7488,10 +7499,11 @@ struct FindOrderedHashEntryOp
       case Kind::kFindOrderedHashSetEntry:
         // Looking up a string key can internalize it in place into a
         // ThinString, overwriting its payload (e.g., ConsString::first_).
+        // The write is unobservable if the lookup result is unused.
         return OpEffects()
             .CanDependOnChecks()
             .CanReadMemory()
-            .CanWriteHeapMemory()
+            .CanWriteHeapMemoryIfUsed()
             .CanAllocate();
       case Kind::kFindOrderedHashMapEntryForInt32Key:
         return OpEffects().CanDependOnChecks().CanReadMemory();
@@ -11463,8 +11475,8 @@ TURBOSHAFT_THROWING_OPERATIONS_LIST(THROWING_OP_LOOKS_VALID)
 // instance, a SmiConstant is always a Smi, and a HeapObject constant is never a
 // Smi.
 enum class IsSmiDecision : uint8_t { kUnknown, kTrue, kFalse };
-IsSmiDecision DecideObjectIsSmi(const Graph& graph, V<Object> idx,
-                                int depth = 0);
+V8_EXPORT_PRIVATE IsSmiDecision DecideObjectIsSmi(const Graph& graph,
+                                                  V<Object> idx, int depth = 0);
 
 }  // namespace v8::internal::compiler::turboshaft
 

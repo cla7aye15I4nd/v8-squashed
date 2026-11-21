@@ -1140,11 +1140,16 @@ class JSGlobalProxyData : public JSObjectData {
 HEAP_BROKER_OBJECT_LIST(DEFINE_IS)
 #undef DEFINE_IS
 
-#define DEFINE_AS(Name)                              \
-  Name##Data* ObjectData::As##Name() {               \
-    CHECK(Is##Name());                               \
-    CHECK(kind_ == kBackgroundSerializedHeapObject); \
-    return static_cast<Name##Data*>(this);           \
+#define DEFINE_AS(Name)                                                  \
+  Name##Data* ObjectData::As##Name() {                                   \
+    CHECK_EQ(kind_, kBackgroundSerializedHeapObject);                    \
+    auto* ho_data = static_cast<HeapObjectData*>(this);                  \
+    /* Guard against partially-constructed HeapObjectData during */      \
+    /* corrupted recursive serialization (see crbug.com/379985068). */   \
+    CHECK_NOT_NULL(ho_data->map());                                      \
+    CHECK(InstanceTypeChecker::Is##Name(ho_data->data_instance_type())); \
+    DCHECK(Is##Name());                                                  \
+    return static_cast<Name##Data*>(this);                               \
   }
 HEAP_BROKER_BACKGROUND_SERIALIZED_OBJECT_LIST(DEFINE_AS)
 #undef DEFINE_AS
@@ -2781,8 +2786,15 @@ OptionalModuleRef MapRef::GetNamespaceModule(JSHeapBroker* broker) const {
   if (!TryCast<PrototypeInfo>(maybe_proto_info, &proto_info)) return {};
   // JSModuleNamespace creation stores the back pointer in the PrototypeInfo
   // before the namespace is returned, and it is never cleared afterwards.
-  Tagged<JSModuleNamespace> module_namespace =
-      Cast<JSModuleNamespace>(proto_info->module_namespace(kAcquireLoad));
+  // However, once the namespace migrated away from this map, a stale map can
+  // later get a fresh PrototypeInfo (e.g. via
+  // Map::GetOrCreatePrototypeChainValidityCell), whose module_namespace is
+  // undefined.
+  Tagged<JSModuleNamespace> module_namespace;
+  if (!TryCast<JSModuleNamespace>(proto_info->module_namespace(kAcquireLoad),
+                                  &module_namespace)) {
+    return {};
+  }
   // A namespace's module is set at creation, before the namespace is
   // published, and never changes afterwards.
   return TryMakeRef(broker, module_namespace->module());
