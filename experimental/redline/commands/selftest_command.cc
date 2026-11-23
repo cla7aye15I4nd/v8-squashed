@@ -27,6 +27,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <set>
 #include <thread>
 
@@ -34,6 +35,7 @@
 #include "experimental/redline/base/flags.h"
 #include "experimental/redline/base/log.h"
 #include "experimental/redline/base/time_util.h"
+#include "experimental/redline/base/v8_runtime.h"
 #include "experimental/redline/commands/command.h"
 #include "experimental/redline/commands/flags_command.h"
 #include "experimental/redline/commands/selftest_checker.h"
@@ -44,6 +46,7 @@
 #include "experimental/redline/core/tunable.h"
 #include "experimental/redline/corpus/corpus.h"
 #include "experimental/redline/corpus/feature_weights.h"
+#include "experimental/redline/corpus/material.h"
 #include "experimental/redline/engine/amplifier.h"
 #include "experimental/redline/engine/config.h"
 #include "experimental/redline/engine/crash.h"
@@ -52,14 +55,17 @@
 #include "experimental/redline/engine/fuzzer.h"
 #include "experimental/redline/engine/importer.h"
 #include "experimental/redline/engine/prelude.h"
+#include "experimental/redline/engine/salvage.h"
 #include "experimental/redline/engine/shared_coverage.h"
 #include "experimental/redline/exec/coverage.h"
 #include "experimental/redline/exec/process_run.h"
 #include "experimental/redline/exec/runner.h"
+#include "experimental/redline/exec/target_options.h"
 #include "experimental/redline/fast/ast.h"
 #include "experimental/redline/fast/parser.h"
 #include "experimental/redline/fast/printer.h"
 #include "experimental/redline/minimizer/minimizer.h"
+#include "experimental/redline/mutators/mutator.h"
 
 namespace redline {
 
@@ -96,6 +102,175 @@ std::string DefaultTestdataDir() {
   return RedlineDataDir("testdata");
 }
 
+// Offline: the `fuzzilli` and `fuzzilli-wasm` profiles of the random d8
+// flags.
+void RunFuzzilliFlagProfileChecks(Checker* checker) {
+  auto name_of = [](const std::string& flag) {
+    return flag.substr(0, flag.find('='));
+  };
+  auto value_of = [](const std::string& flag) -> int64_t {
+    size_t eq = flag.find('=');
+    return eq == std::string::npos
+               ? -1
+               : std::strtoll(flag.c_str() + eq + 1, nullptr, 10);
+  };
+  // The `fuzzilli` profiles mirror `v8ProcessArgs` without inter-flag
+  // sanitization, and emit both polarities of `chooseBooleanFlagRandomly`.
+  // Only `fuzzilli-wasm` draws the Wasm flags.
+  auto is_wasm_flag = [](const std::string& name) {
+    for (const char* prefix :
+         {"--wasm-", "--no-wasm-", "--stress-wasm-", "--no-liftoff",
+          "--turboshaft-wasm-", "--no-turboshaft-wasm-"}) {
+      if (name.rfind(prefix, 0) == 0) return true;
+    }
+    return false;
+  };
+  std::string bad_fuzzilli;
+  bool saw_pos_bool = false;
+  bool saw_neg_bool = false;
+  bool saw_wasm = false;
+  for (D8FlagProfile profile :
+       {D8FlagProfile::kFuzzilli, D8FlagProfile::kFuzzilliWasm}) {
+    const bool with_wasm = profile == D8FlagProfile::kFuzzilliWasm;
+    Random fz_rng(11);
+    for (int i = 0; i < 500 && bad_fuzzilli.empty(); i++) {
+      std::set<std::string> seen;
+      int64_t size = -1;
+      auto has = [&](const char* name) { return seen.count(name) > 0; };
+      for (const std::string& flag : RandomD8Flags(fz_rng, profile)) {
+        const std::string name = name_of(flag);
+        const int64_t value = value_of(flag);
+        std::string why;
+        if (name == "--maglev-as-top-tier" && !has("--no-turbofan")) {
+          why = "without --no-turbofan";
+        } else if (name == "--no-maglev" && has("--maglev-as-top-tier")) {
+          why = "with --maglev-as-top-tier";
+        } else if ((name == "--turbolev" ||
+                    name == "--always-osr-from-maglev" ||
+                    name == "--optimize-maglev-optimizes-to-turbofan" ||
+                    name == "--stress-concurrent-inlining") &&
+                   has("--no-turbofan")) {
+          why = "with --no-turbofan";
+        } else if ((name == "--maglev-non-eager-inlining" ||
+                    name == "--always-osr-from-maglev") &&
+                   has("--no-maglev")) {
+          why = "with --no-maglev";
+        } else if (name == "--max-maglev-inlined-bytecode-size-small" &&
+                   !has("--maglev-non-eager-inlining")) {
+          why = "without --maglev-non-eager-inlining";
+        } else if (name == "--turbolev-future" && !has("--turbolev")) {
+          why = "without --turbolev";
+        } else if (name == "--max-inlined-bytecode-size-small" &&
+                   (value == 0
+                        ? !has("--turbolev-future")
+                        : !has("--turbolev") ||
+                              has("--max-inlined-bytecode-size-small"))) {
+          why = "without its parent flag";
+        } else if (name == "--max-inlined-bytecode-size") {
+          size = value;
+        } else if (name == "--max-inlined-bytecode-size-cumulative" &&
+                   (size < 0 || value < size)) {
+          why = "without a smaller --max-inlined-bytecode-size";
+        } else if (name == "--scavenger-chaos-mode-threshold" &&
+                   !has("--scavenger-chaos-mode")) {
+          why = "without --scavenger-chaos-mode";
+        } else if (name == "--proto-assign-seq-opt-count" &&
+                   !has("--proto-assign-seq-lazy-func-opt")) {
+          why = "without --proto-assign-seq-lazy-func-opt";
+        } else if (name == "--no-use-ic" && has("--stress-ic")) {
+          why = "with --stress-ic";
+        } else if (name == "--stress-concurrent-inlining" &&
+                   has("--assert-types")) {
+          why = "with --assert-types";
+        } else if (name == "--stress-concurrent-inlining-attach-code" &&
+                   !has("--stress-concurrent-inlining")) {
+          why = "without --stress-concurrent-inlining";
+        } else if (name == "--wasm-assert-types" && !has("--no-liftoff")) {
+          why = "without --no-liftoff";
+        } else if (name == "--wasm-sync-tier-up" && has("--no-liftoff")) {
+          why = "with --no-liftoff";
+        } else if (name == "--stress-wasm-code-gc" && !has("--wasm-code-gc")) {
+          why = "without --wasm-code-gc";
+        } else if (is_wasm_flag(name) && !with_wasm) {
+          why = "in the non-Wasm profile";
+        } else if (name == "--fuzzilli-enable-optimized-code-coverage" ||
+                   name == "--harmony-struct" || name == "--maglev-licm" ||
+                   name == "--maglev-pretenure-store-values" ||
+                   name == "--turbo-splitting" ||
+                   name == "--shared-string-table" ||
+                   name == "--maglev-untagged-phis") {
+          why = "is not in the table";
+        }
+        if (!why.empty()) {
+          bad_fuzzilli =
+              std::string(D8FlagProfileName(profile)) + ": " + flag + " " + why;
+          break;
+        }
+        seen.insert(name);
+        saw_pos_bool |= name == "--always-sparkplug";
+        saw_neg_bool |= name == "--no-always-sparkplug";
+        saw_wasm |= with_wasm && is_wasm_flag(name);
+      }
+    }
+  }
+  checker->Check(
+      "random flags: the fuzzilli profiles keep the conditions of Fuzzilli, "
+      "both boolean polarities and the Wasm gate",
+      bad_fuzzilli.empty() && saw_pos_bool && saw_neg_bool && saw_wasm,
+      bad_fuzzilli);
+
+  // The marginal frequencies of the `fuzzilli` profiles are the
+  // probabilities of `v8ProcessArgs` (tools/d8_flag_sync.py computes them).
+  struct Marginal {
+    D8FlagProfile profile;
+    const char* name;
+    double expected;
+  };
+  const Marginal marginals[] = {
+      {D8FlagProfile::kFuzzilli, "--turbolev", 0.63},
+      {D8FlagProfile::kFuzzilli, "--no-maglev", 0.095},
+      {D8FlagProfile::kFuzzilli, "--no-use-ic", 0.09},
+      {D8FlagProfile::kFuzzilli, "--stress-concurrent-inlining", 0.2025},
+      {D8FlagProfile::kFuzzilli, "--max-inlined-bytecode-size-small", 0.202482},
+      {D8FlagProfile::kFuzzilli, "--maglev-range-verification", 0.126},
+      {D8FlagProfile::kFuzzilliWasm, "--no-liftoff", 0.5},
+      {D8FlagProfile::kFuzzilliWasm, "--wasm-sync-tier-up", 0.1},
+  };
+  constexpr int kMarginalDraws = 20000;
+  std::map<std::string, int> fz_counts;
+  std::map<std::string, int> wasm_counts;
+  Random marginal_rng(29);
+  for (int i = 0; i < kMarginalDraws; i++) {
+    for (D8FlagProfile profile :
+         {D8FlagProfile::kFuzzilli, D8FlagProfile::kFuzzilliWasm}) {
+      std::set<std::string> names;
+      for (const std::string& flag : RandomD8Flags(marginal_rng, profile)) {
+        names.insert(name_of(flag));
+      }
+      for (const std::string& name : names) {
+        (profile == D8FlagProfile::kFuzzilli ? fz_counts : wasm_counts)[name]++;
+      }
+    }
+  }
+  std::string bad_marginal;
+  for (const Marginal& m : marginals) {
+    const int count =
+        (m.profile == D8FlagProfile::kFuzzilli ? fz_counts
+                                               : wasm_counts)[m.name];
+    const double observed = static_cast<double>(count) / kMarginalDraws;
+    const double sigma =
+        std::sqrt(m.expected * (1 - m.expected) / kMarginalDraws);
+    if (std::fabs(observed - m.expected) > 5 * sigma) {
+      bad_marginal += StringPrintf(" %s=%.4f (expected %.4f)", m.name, observed,
+                                   m.expected);
+    }
+  }
+  checker->Check(
+      "random flags: the fuzzilli profiles draw the marginal probabilities "
+      "of Fuzzilli",
+      bad_marginal.empty(), bad_marginal);
+}
+
 // Offline: the profiles of the random d8 flags. The Turbolev profile must not
 // draw the flags that only Maglev reads, and the Maglev profile must not draw
 // the Turbolev and Turboshaft flags.
@@ -123,16 +298,23 @@ void RunD8FlagProfileChecks(Checker* checker) {
     return found;
   };
   D8FlagProfile parsed = D8FlagProfile::kMaglev;
-  checker->Check("random flags: the profile names parse",
-                 ParseD8FlagProfile("turbolev", &parsed) &&
-                     parsed == D8FlagProfile::kTurbolev &&
-                     ParseD8FlagProfile("maglev", &parsed) &&
-                     parsed == D8FlagProfile::kMaglev &&
-                     ParseD8FlagProfile("fuzzilli", &parsed) &&
-                     parsed == D8FlagProfile::kFuzzilli &&
-                     std::string(D8FlagProfileName(parsed)) == "fuzzilli" &&
-                     !ParseD8FlagProfile("turbofan", &parsed),
-                 "");
+  checker->Check(
+      "random flags: the profile names parse",
+      ParseD8FlagProfile("turbolev", &parsed) &&
+          parsed == D8FlagProfile::kTurbolev &&
+          ParseD8FlagProfile("maglev", &parsed) &&
+          parsed == D8FlagProfile::kMaglev &&
+          ParseD8FlagProfile("fuzzilli", &parsed) &&
+          parsed == D8FlagProfile::kFuzzilli &&
+          std::string(D8FlagProfileName(parsed)) == "fuzzilli" &&
+          ParseD8FlagProfile("fuzzilli-wasm", &parsed) &&
+          parsed == D8FlagProfile::kFuzzilliWasm &&
+          std::string(D8FlagProfileName(parsed)) == "fuzzilli-wasm" &&
+          ParseD8FlagProfile("runtime", &parsed) &&
+          parsed == D8FlagProfile::kRuntime &&
+          std::string(D8FlagProfileName(parsed)) == "runtime" &&
+          !ParseD8FlagProfile("turbofan", &parsed),
+      "");
   // Turbolev builds its graph with the Maglev graph builder, so it also reads
   // the Maglev assertions and the allowed --no-maglev- flags. Only Turbolev
   // reads --maglev-range-analysis.
@@ -164,6 +346,48 @@ void RunD8FlagProfileChecks(Checker* checker) {
        "--stress-concurrent-inlining", "--concurrent-recompilation-"});
   checker->Check("random flags: the maglev profile draws no Turbolev flag",
                  turbolev_only.empty(), turbolev_only);
+  // The verifiers and stress flags of the V8 profile of Fuzzilli.
+  std::string missing_new;
+  for (const char* flag :
+       {"--turbo-verify", "--turbo-verify-allocation", "--efficiency-mode",
+        "--battery-saver-mode", "--no-short-builtin-calls",
+        "--maglev-assert-stack-size", "--stress-background-compile",
+        "--lazy-new-space-shrinking"}) {
+    if (draws_any(D8FlagProfile::kTurbolev, {flag}).empty()) {
+      missing_new += std::string(" turbolev:") + flag;
+    }
+    if (strncmp(flag, "--turbo-", 8) == 0) continue;
+    if (draws_any(D8FlagProfile::kMaglev, {flag}).empty()) {
+      missing_new += std::string(" maglev:") + flag;
+    }
+  }
+  checker->Check(
+      "random flags: the maglev and turbolev profiles draw the Fuzzilli "
+      "verifier and stress flags",
+      missing_new.empty(), missing_new);
+  // The runtime profile draws no JIT flag and no flag of the base d8 flags.
+  std::string runtime_jit = draws_any(
+      D8FlagProfile::kRuntime,
+      {"--maglev", "--no-maglev", "--turbo", "--no-turbo", "--max-",
+       "--optimize-", "--assert-types", "--jit-fuzzing", "--always-",
+       "--sparkplug", "--no-sparkplug", "--deopt-every", "--no-enable-",
+       "--stress-concurrent", "--verify-turboshaft", "--concurrent-",
+       "--stress-gc-during-compilation", "--no-baseline-batch-compilation",
+       "--disable-loop-stack-checks"});
+  for (const std::string& base : TargetOptions::DefaultArgs()) {
+    std::string found = draws_any(D8FlagProfile::kRuntime, {base.c_str()});
+    if (!found.empty() && runtime_jit.empty()) runtime_jit = found;
+  }
+  const bool runtime_draws =
+      !draws_any(D8FlagProfile::kRuntime, {"--stress-ic"}).empty() &&
+      !draws_any(D8FlagProfile::kRuntime, {"--no-use-ic"}).empty() &&
+      !draws_any(D8FlagProfile::kRuntime, {"--stress-lazy"}).empty() &&
+      !draws_any(D8FlagProfile::kRuntime, {"--stress-compaction"}).empty() &&
+      !draws_any(D8FlagProfile::kRuntime, {"--efficiency-mode"}).empty();
+  checker->Check(
+      "random flags: the runtime profile draws runtime flags and no JIT or "
+      "base flag",
+      runtime_jit.empty() && runtime_draws, runtime_jit);
 
   // The rules of the draw. A draw names each flag at most once. A flag that
   // needs another flag comes only with that flag. The cumulative inlining
@@ -221,67 +445,6 @@ void RunD8FlagProfileChecks(Checker* checker) {
       "random flags: a draw names each flag once, with the flags it needs",
       bad_draw.empty(), bad_draw);
 
-  // The `fuzzilli` profile mirrors `v8ProcessArgs` without inter-flag
-  // sanitization, and emits both polarities of `chooseBooleanFlag`.
-  std::string bad_fuzzilli;
-  bool saw_pos_bool = false;
-  bool saw_neg_bool = false;
-  Random fz_rng(11);
-  for (int i = 0; i < 500 && bad_fuzzilli.empty(); i++) {
-    std::vector<std::string> flags =
-        RandomD8Flags(fz_rng, D8FlagProfile::kFuzzilli);
-    bool no_tf = false;
-    bool no_ml = false;
-    bool ml_non_eager = false;
-    bool turbolev = false;
-    bool tl_future = false;
-    bool chaos = false;
-    bool proto_seq = false;
-    for (const std::string& flag : flags) {
-      const std::string name = name_of(flag);
-      if (name == "--no-turbofan") {
-        no_tf = true;
-      } else if (name == "--maglev-as-top-tier" && !no_tf) {
-        bad_fuzzilli = flag + " without --no-turbofan";
-      } else if (name == "--no-maglev") {
-        no_ml = true;
-      } else if (name == "--maglev-non-eager-inlining") {
-        if (no_ml) {
-          bad_fuzzilli = flag + " with --no-maglev";
-        }
-        ml_non_eager = true;
-      } else if (name == "--max-maglev-inlined-bytecode-size-small" &&
-                 !ml_non_eager) {
-        bad_fuzzilli = flag + " without --maglev-non-eager-inlining";
-      } else if (name == "--turbolev") {
-        turbolev = true;
-      } else if (name == "--turbolev-future") {
-        if (!turbolev) {
-          bad_fuzzilli = flag + " without --turbolev";
-        }
-        tl_future = true;
-      } else if (name == "--max-inlined-bytecode-size-small" && !tl_future) {
-        bad_fuzzilli = flag + " without --turbolev-future";
-      } else if (name == "--scavenger-chaos-mode") {
-        chaos = true;
-      } else if (name == "--scavenger-chaos-mode-threshold" && !chaos) {
-        bad_fuzzilli = flag + " without --scavenger-chaos-mode";
-      } else if (name == "--proto-assign-seq-lazy-func-opt") {
-        proto_seq = true;
-      } else if (name == "--proto-assign-seq-opt-count" && !proto_seq) {
-        bad_fuzzilli = flag + " without --proto-assign-seq-lazy-func-opt";
-      } else if (name == "--always-sparkplug") {
-        saw_pos_bool = true;
-      } else if (name == "--no-always-sparkplug") {
-        saw_neg_bool = true;
-      }
-    }
-  }
-  checker->Check(
-      "random flags: the fuzzilli profile keeps parent order and both "
-      "boolean polarities",
-      bad_fuzzilli.empty() && saw_pos_bool && saw_neg_bool, bad_fuzzilli);
-
   // Fixed flags win in `fuzzilli`: sandbox mode suppresses non-sandbox draws,
   // and `SanitizeFuzzilliFixedClashes` drops flags that clash with fixed args.
   struct FuzzilliFixedCase {
@@ -298,14 +461,34 @@ void RunD8FlagProfileChecks(Checker* checker) {
        {"--no-maglev"},
        {"--maglev-non-eager-inlining", "--maglev-future",
         "--maglev-as-top-tier"}},
-      {"--maglev-as-top-tier", {"--maglev-as-top-tier"}, {"--turbolev-future"}},
+      {"--maglev-as-top-tier",
+       {"--maglev-as-top-tier"},
+       {"--turbolev-future", "--no-maglev", "--stress-concurrent-inlining",
+        "--stress-concurrent-inlining-attach-code"}},
+      {"--no-turbofan",
+       {"--no-turbofan"},
+       {"--turbolev", "--always-osr-from-maglev",
+        "--optimize-maglev-optimizes-to-turbofan",
+        "--stress-concurrent-inlining"}},
+      {"--assert-types", {"--assert-types"}, {"--stress-concurrent-inlining"}},
+      {"--single-threaded",
+       {"--single-threaded"},
+       {"--stress-concurrent-inlining",
+        "--stress-concurrent-inlining-attach-code"}},
       {"--stress-concurrent-inlining",
        {"--stress-concurrent-inlining"},
        {"--assert-types", "--maglev-as-top-tier"}},
       {"--jitless",
        {"--jitless"},
        {"--maglev-as-top-tier", "--maglev-future", "--turbolev-future",
-        "--jit-fuzzing"}},
+        "--jit-fuzzing", "--verify-turboshaft", "--always-osr-from-maglev",
+        "--optimize-maglev-optimizes-to-turbofan",
+        "--stress-concurrent-inlining",
+        "--stress-concurrent-inlining-attach-code"}},
+      {"--disable-optimizing-compilers",
+       {"--disable-optimizing-compilers"},
+       {"--verify-turboshaft", "--always-osr-from-maglev",
+        "--stress-concurrent-inlining"}},
       {"--max-lazy", {"--max-lazy"}, {"--jit-fuzzing", "--no-lazy"}},
       {"--empty-shared-heap",
        {"--empty-shared-heap"},
@@ -454,7 +637,7 @@ void RunD8FlagProfileChecks(Checker* checker) {
     return DrawD8FlagLines(parsed_flags, out, err);
   };
   std::vector<std::string> maglev_lines, maglev_again, turbolev_lines,
-      fuzzilli_lines, bad_out;
+      fuzzilli_lines, wasm_lines, runtime_lines, builtins_lines, bad_out;
   std::string flags_err, bad_err, disabled_err;
   const bool maglev_ok = run_flags({"--preset=maglev", "--n=20", "--seed=7"},
                                    &maglev_lines, &flags_err) &&
@@ -464,6 +647,13 @@ void RunD8FlagProfileChecks(Checker* checker) {
       {"--preset=turbolev", "--n=20", "--seed=7"}, &turbolev_lines, &flags_err);
   const bool fuzzilli_ok = run_flags(
       {"--preset=fuzzilli", "--n=20", "--seed=7"}, &fuzzilli_lines, &flags_err);
+  const bool subsystem_ok =
+      run_flags({"--preset=wasm", "--n=20", "--seed=7"}, &wasm_lines,
+                &flags_err) &&
+      run_flags({"--preset=runtime", "--n=20", "--seed=7"}, &runtime_lines,
+                &flags_err) &&
+      run_flags({"--preset=builtins", "--n=20", "--seed=7"}, &builtins_lines,
+                &flags_err);
   const bool bad_rejected =
       !run_flags({"--preset=maglev", "--n=0"}, &bad_out, &bad_err);
   const bool disabled_rejected =
@@ -485,6 +675,22 @@ void RunD8FlagProfileChecks(Checker* checker) {
                   [](const std::string& line) {
                     return line.find("--turbolev") != std::string::npos;
                   });
+  auto any_line_has = [](const std::vector<std::string>& lines,
+                         const char* text) {
+    return std::any_of(lines.begin(), lines.end(), [&](const std::string& l) {
+      return l.find(text) != std::string::npos;
+    });
+  };
+  checker->Check(
+      "random flags: the wasm, runtime and builtins presets draw their "
+      "profiles",
+      subsystem_ok && wasm_lines.size() == 20 && runtime_lines.size() == 20 &&
+          builtins_lines.size() == 20 && any_line_has(wasm_lines, "--wasm-") &&
+          any_line_has(wasm_lines, "--turbolev") &&
+          !any_line_has(runtime_lines, "--maglev") &&
+          !any_line_has(builtins_lines, "--turbo") &&
+          any_line_has(builtins_lines, "--stress-lazy"),
+      flags_err);
   checker->Check(
       "random flags: the flags command draws preset flag sets",
       maglev_ok && turbolev_ok && fuzzilli_ok && bad_rejected &&
@@ -1231,6 +1437,458 @@ void RunCrashMinimizerChecks(Checker* checker) {
       joined == nullptr, joined == nullptr ? error : "one tree");
 }
 
+// A coverage bitmap of 256 bits (4 words) with the bits of `edges` set,
+// for SharedCoverage::ClaimNewEdges.
+std::vector<uint8_t> EdgeBitmap(std::initializer_list<uint32_t> edges) {
+  std::vector<uint8_t> bitmap(32, 0);
+  for (uint32_t edge : edges) {
+    bitmap[edge / 8] =
+        static_cast<uint8_t>(bitmap[edge / 8] | (1u << (edge % 8)));
+  }
+  return bitmap;
+}
+
+// A checked candidate with `edges` for the ChainCommits checks.
+CheckedCandidate CoalesceCandidate(const char* source,
+                                   std::vector<uint32_t> edges) {
+  std::string error;
+  CheckedCandidate candidate;
+  candidate.program = Program::Parse(source, Lineage(), &error);
+  candidate.edges = edges;
+  candidate.credit.edges = std::move(edges);
+  candidate.reruns = 2;
+  return candidate;
+}
+
+// The 1-based line of the first line of `text` that contains `needle`.
+int LineOf(const std::string& text, std::string_view needle) {
+  const size_t at = text.find(needle);
+  if (at == std::string::npos) {
+    return 0;
+  }
+  return 1 + static_cast<int>(std::count(
+                 text.begin(), text.begin() + static_cast<std::ptrdiff_t>(at),
+                 '\n'));
+}
+
+// Offline: the flaky bits of SharedCoverage and the determinism check with
+// fewer reruns for clean candidates. Also the coalesced commit of a chain,
+// and the salvage retry that a throw in the last top-level statement skips.
+void RunCoalesceChecks(Checker* checker) {
+  std::string error;
+  {
+    // AnyFlaky() reads the bits that RecordFlaky() sets, also from many
+    // threads at the same time. Edge 0 and edges after num_edges have no bit.
+    SharedCoverage none;
+    none.RecordFlaky(3, 1);
+    SharedCoverage shared;
+    const bool ok = shared.Initialize(255, 32, &error);
+    const bool before = shared.AnyFlaky({3, 70});
+    shared.RecordFlaky(70, 50);
+    const bool after = shared.AnyFlaky({3, 70});
+    const bool other = shared.AnyFlaky({3, 71, 0, 999});
+    std::vector<std::thread> threads;
+    for (uint32_t t = 0; t < 4; t++) {
+      threads.emplace_back([&shared, t] {
+        for (uint32_t edge = 100 + t; edge <= 255; edge += 4) {
+          shared.RecordFlaky(edge, 50);
+        }
+      });
+    }
+    for (std::thread& thread : threads) {
+      thread.join();
+    }
+    int set = 0;
+    for (uint32_t edge = 100; edge <= 255; edge++) {
+      set += shared.AnyFlaky({edge}) ? 1 : 0;
+    }
+    checker->Check("coalesce: AnyFlaky reads the flaky bits of RecordFlaky",
+                   ok && !none.AnyFlaky({3}) && !before && after && !other &&
+                       !shared.AnyFlaky({}) && set == 156 &&
+                       shared.suppressed_flaky_edges() == 0,
+                   StringPrintf("before %d, after %d, other %d, %d of 156 bits",
+                                before, after, other, set));
+  }
+  CheckRules rules;  // min_reruns 5, clean_min_reruns 2
+  auto check = [&](SharedCoverage& shared, std::vector<uint32_t> claimed,
+                   std::vector<CheckRun> runs, bool first_held) {
+    size_t next = 0;
+    return RunDeterminismCheck(
+        shared, rules, std::move(claimed), first_held,
+        [&](const std::vector<uint32_t>& edges, CheckRun* run) {
+          if (next < runs.size()) {
+            *run = runs[next++];
+          } else {
+            run->succeeded = true;
+          }
+          // Only the edges that are still in the set can be missing.
+          std::vector<uint32_t> missing;
+          std::set_intersection(edges.begin(), edges.end(),
+                                run->missing.begin(), run->missing.end(),
+                                std::back_inserter(missing));
+          run->missing = std::move(missing);
+          return true;
+        });
+  };
+  CheckRun clean_run;
+  clean_run.succeeded = true;
+  {
+    // A clean candidate stops after 2 reruns. A candidate with a flaky edge
+    // from an earlier check, or with an edge that a rerun loses, runs
+    // min_reruns times.
+    SharedCoverage shared;
+    const bool ok = shared.Initialize(255, 32, &error);
+    shared.MarkSeen({10, 11, 12, 13, 20, 21});
+    const CheckResult clean = check(shared, {10, 11}, {}, true);
+    shared.RecordFlaky(12, 50);
+    const CheckResult history = check(shared, {12, 13}, {}, true);
+    CheckRun lose;
+    lose.succeeded = true;
+    lose.missing = {21};
+    const CheckResult dropped = check(shared, {20, 21}, {lose}, true);
+    checker->Check(
+        "coalesce: a clean check converges after clean_min_reruns",
+        ok && clean.survived && clean.clean && clean.reruns == 2 &&
+            history.survived && !history.clean && history.reruns == 5 &&
+            dropped.survived && !dropped.clean && dropped.reruns == 5 &&
+            dropped.edges == std::vector<uint32_t>{20} && !shared.IsSeen(21) &&
+            shared.AnyFlaky({21}) && shared.IsSeen(20),
+        StringPrintf("reruns: clean %d, flaky history %d, dropped edge %d",
+                     clean.reruns, history.reruns, dropped.reruns));
+  }
+  {
+    // The parts of the Finalize executions add up.
+    const std::vector<uint64_t> split = SplitByEdges(10, {3, 1});
+    const std::vector<uint64_t> even = SplitByEdges(5, {0, 0});
+    checker->Check(
+        "coalesce: the Finalize executions are split by the new edges",
+        split == std::vector<uint64_t>{8, 2} &&
+            even == std::vector<uint64_t>{3, 2} && SplitByEdges(7, {}).empty(),
+        StringPrintf("split %llu+%llu, even %llu+%llu",
+                     static_cast<unsigned long long>(split[0]),
+                     static_cast<unsigned long long>(split[1]),
+                     static_cast<unsigned long long>(even[0]),
+                     static_cast<unsigned long long>(even[1])));
+  }
+  {
+    // A candidate that reached the pending edges in all runs merges. A
+    // candidate that missed 1 pending edge, or a merge after the limit,
+    // finalizes the pending commit first.
+    std::vector<PendingCommit> finalized;
+    CoalesceLimits limits;
+    limits.max_merges = 2;
+    ChainCommits commits(limits, [&](PendingCommit commit) {
+      finalized.push_back(std::move(commit));
+    });
+    using Offered = ChainCommits::Offered;
+    const Offered first =
+        commits.Offer(CoalesceCandidate("a = 1;", {1, 2}), true);
+    const Offered merged =
+        commits.Offer(CoalesceCandidate("a = 1; b = 2;", {3}), true);
+    const std::vector<uint32_t> pending = *commits.pending_edges();
+    const size_t before_break = finalized.size();
+    const Offered missed =
+        commits.Offer(CoalesceCandidate("a = 1; c = 3;", {4}), false);
+    const Offered merged_again =
+        commits.Offer(CoalesceCandidate("a = 1; c = 3; d = 4;", {5}), true);
+    const Offered merged_twice =
+        commits.Offer(CoalesceCandidate("a = 1; c = 3; d = 5;", {6}), true);
+    const Offered limited =
+        commits.Offer(CoalesceCandidate("a = 1; e = 6;", {7}), true);
+    commits.Flush();
+    const bool shapes =
+        finalized.size() == 3 &&
+        finalized[0].candidate.edges == std::vector<uint32_t>{1, 2, 3} &&
+        finalized[0].credits.size() == 2 && finalized[0].merges == 1 &&
+        finalized[0].candidate.reruns == 4 &&
+        finalized[0].candidate.program->source().find("b = 2") !=
+            std::string::npos &&
+        finalized[1].candidate.edges == std::vector<uint32_t>{4, 5, 6} &&
+        finalized[1].credits.size() == 3 && finalized[1].merges == 2 &&
+        finalized[1].credits[2].edges == std::vector<uint32_t>{6} &&
+        finalized[2].candidate.edges == std::vector<uint32_t>{7};
+    checker->Check(
+        "coalesce: merge if all runs reach the pending edges, else finalize",
+        first == Offered::kStarted && merged == Offered::kMerged &&
+            pending == std::vector<uint32_t>{1, 2, 3} && before_break == 0 &&
+            missed == Offered::kReplaced && merged_again == Offered::kMerged &&
+            merged_twice == Offered::kMerged && limited == Offered::kReplaced &&
+            shapes && !commits.has_pending(),
+        StringPrintf("%zu commits finalized", finalized.size()));
+  }
+  {
+    // A crash or a stop request in the middle of a chain leaves the scope of
+    // ChainCommits. Its destructor publishes the pending commit, thus no
+    // claimed edge stays without a program.
+    auto chain = [&](bool crash, size_t* finalized, uint32_t* published) {
+      SharedCoverage shared;
+      shared.Initialize(255, 32, &error);
+      *finalized = 0;
+      *published = 0;
+      std::set<uint32_t> edges;
+      {
+        ChainCommits commits(CoalesceLimits(), [&](PendingCommit commit) {
+          (*finalized)++;
+          edges.insert(commit.candidate.edges.begin(),
+                       commit.candidate.edges.end());
+        });
+        const std::vector<std::vector<uint8_t>> runs = {
+            EdgeBitmap({5, 6}), EdgeBitmap({5, 6, 7}),
+            EdgeBitmap({5, 6, 7, 8})};
+        for (size_t round = 0; round < runs.size(); round++) {
+          if (!crash && round == 2) {
+            break;  // a stop request before the 3rd link
+          }
+          std::vector<uint32_t> claimed =
+              shared.ClaimNewEdges(runs[round].data());
+          const CheckResult result =
+              check(shared, std::move(claimed), {}, true);
+          commits.Offer(CoalesceCandidate("a = 1;", result.edges),
+                        result.pending_held);
+          if (crash && round == 1) {
+            break;  // the 2nd link crashes after its check
+          }
+        }
+      }
+      *published = static_cast<uint32_t>(edges.size());
+      return shared.found_edges();
+    };
+    size_t crash_commits = 0;
+    size_t stop_commits = 0;
+    uint32_t crash_published = 0;
+    uint32_t stop_published = 0;
+    const uint32_t crash_found = chain(true, &crash_commits, &crash_published);
+    const uint32_t stop_found = chain(false, &stop_commits, &stop_published);
+    checker->Check(
+        "coalesce: a crash or a stop in a chain publishes the pending commit",
+        crash_commits == 1 && crash_published == 3 && crash_found == 3 &&
+            stop_commits == 1 && stop_published == 3 && stop_found == 3,
+        StringPrintf("crash: %zu commits, %u of %u edges; stop: %zu commits, "
+                     "%u of %u edges",
+                     crash_commits, crash_published, crash_found, stop_commits,
+                     stop_published, stop_found));
+  }
+  {
+    // A flaky candidate after a pending commit: its runs miss pending edge
+    // 41 and its own edge 43. Only edge 43 is flaky and released. The
+    // pending edges stay claimed and are not flaky.
+    SharedCoverage shared;
+    const bool ok = shared.Initialize(255, 32, &error);
+    const std::vector<uint8_t> first = EdgeBitmap({40, 41});
+    const std::vector<uint32_t> pending = shared.ClaimNewEdges(first.data());
+    const std::vector<uint8_t> second = EdgeBitmap({40, 41, 42, 43});
+    std::vector<uint32_t> claimed = shared.ClaimNewEdges(second.data());
+    CheckRun lose;
+    lose.succeeded = true;
+    lose.missing = {43};
+    lose.pending_held = false;
+    const CheckResult result = check(shared, claimed, {lose}, true);
+    // A candidate that fails a rerun is dropped. It still does not touch
+    // the pending edges.
+    const std::vector<uint8_t> third = EdgeBitmap({40, 41, 44});
+    std::vector<uint32_t> failing = shared.ClaimNewEdges(third.data());
+    CheckRun fail;
+    fail.succeeded = false;
+    const CheckResult failed = check(shared, failing, {fail}, false);
+    std::vector<PendingCommit> finalized;
+    ChainCommits::Offered offered;
+    {
+      ChainCommits commits(CoalesceLimits(), [&](PendingCommit commit) {
+        finalized.push_back(std::move(commit));
+      });
+      commits.Offer(CoalesceCandidate("a = 1;", pending), true);
+      offered = commits.Offer(CoalesceCandidate("a = 1; b = 2;", result.edges),
+                              result.pending_held);
+    }
+    checker->Check(
+        "coalesce: a flaky candidate does not mark the pending edges flaky",
+        ok && pending == std::vector<uint32_t>{40, 41} && result.survived &&
+            !result.pending_held && result.edges == std::vector<uint32_t>{42} &&
+            !shared.AnyFlaky(pending) && shared.IsSeen(40) &&
+            shared.IsSeen(41) && shared.AnyFlaky({43}) && !shared.IsSeen(43) &&
+            !failed.survived && !shared.IsSeen(44) && !shared.AnyFlaky({44}) &&
+            offered == ChainCommits::Offered::kReplaced &&
+            finalized.size() == 2 && finalized[0].candidate.edges == pending,
+        StringPrintf("kept %zu edges, pending held %d, %zu commits",
+                     result.edges.size(), result.pending_held,
+                     finalized.size()));
+  }
+  {
+    // The worker skips the salvage retry only for a throw directly in the
+    // last top-level statement. A throw in a nested list, in a called
+    // function or in a function that an earlier statement calls can have
+    // code after it.
+    auto last = [](const char* source, std::string_view inner,
+                   std::string_view outer) {
+      fast::ParseError err;
+      std::unique_ptr<fast::Tree> tree =
+          fast::Parser::ParseScript(source, fast::ParseOptions(), &err);
+      if (tree == nullptr) {
+        return false;
+      }
+      const std::string printed = fast::Print(tree->root());
+      ExceptionLines lines;
+      lines.innermost = LineOf(printed, inner);
+      lines.outermost = LineOf(printed, outer);
+      return ThrowsInLastTopLevelStatement(tree.get(), lines);
+    };
+    const bool tail = last("let a = 1;\nnull.x;\n", "null.x", "null.x");
+    const bool head = last("null.x;\nlet a = 1;\n", "null.x", "null.x");
+    const bool nested = last(
+        "let a = 1;\nfor (let i = 0; i < 2; i++) {\n  null.x;\n  a++;\n}\n",
+        "null.x", "null.x");
+    const bool call =
+        last("function f() {\n  null.x;\n  g();\n}\nf();\n", "null.x", "f();");
+    const bool earlier_call = last(
+        "f();\nlet b = 2;\nfunction f() {\n  null.x;\n}\n", "null.x", "f();");
+    checker->Check(
+        "coalesce: the salvage tail skip needs a throw directly in the last "
+        "top-level statement",
+        tail && !head && !nested && !call && !earlier_call &&
+            !ThrowsInLastTopLevelStatement(nullptr, ExceptionLines{1, 1}),
+        StringPrintf("tail %d, head %d, nested %d, call %d, earlier call %d",
+                     tail, head, nested, call, earlier_call));
+  }
+}
+
+// Offline: the parts of a commit that save executions. The probe timeout
+// tightens after a kept reduction. The hit edges come from the runs of the
+// check or of the minimization. The default order starts with `dataflow`,
+// and `expressions` uses only a part of the budget.
+void RunCommitCostChecks(Checker* checker) {
+  {
+    FuzzConfig config;
+    config.target.timeout_us = 1000000;
+    const uint64_t first = MinimizerProbeTimeout(config, 100000);
+    const uint64_t tight = TightenedProbeTimeout(config, first, 20000);
+    const uint64_t floor = TightenedProbeTimeout(config, first, 0);
+    const uint64_t capped = TightenedProbeTimeout(config, first, 400000);
+    config.probe_timeout_tighten_factor = 0;
+    const uint64_t off = TightenedProbeTimeout(config, first, 20000);
+    checker->Check(
+        "commit: a kept reduction tightens the probe timeout to 2.5 times its "
+        "run time plus 50 ms, between 50 ms and the first timeout",
+        first == 520000 && tight == 100000 && floor == 50000 &&
+            capped == first && off == first,
+        StringPrintf("first %llu, tight %llu, floor %llu, capped %llu, off "
+                     "%llu us",
+                     static_cast<unsigned long long>(first),
+                     static_cast<unsigned long long>(tight),
+                     static_cast<unsigned long long>(floor),
+                     static_cast<unsigned long long>(capped),
+                     static_cast<unsigned long long>(off)));
+  }
+  {
+    // A program that the minimizer did not change: the edges of all runs of
+    // the check. The probes of a rejected minimization do not apply.
+    HitEdges kept;
+    kept.RecordRun({5, 3, 1, 2});
+    kept.RecordRun({7, 1, 5, 2});
+    kept.RecordProbe({1, 9});
+    // A minimized program: the last kept probe and the verification run.
+    // The runs of the original program do not apply.
+    HitEdges minimized;
+    minimized.RecordRun({1, 2, 3});
+    minimized.RecordRun({1, 2, 3});
+    minimized.RecordProbe({1, 4, 8});
+    minimized.RecordProbe({6, 4, 1});
+    minimized.RecordVerifiedRun({9, 6, 4, 1});
+    // A verification without a probe gives one run. Publish then runs the
+    // program once more.
+    HitEdges alone;
+    alone.RecordRun({1, 2});
+    alone.RecordVerifiedRun({2, 3});
+    checker->Check(
+        "commit: the hit edges come from the check runs, or from the last "
+        "kept probe and the verification of the minimized program",
+        kept.runs() == 2 && kept.edges() == std::vector<uint32_t>{1, 2, 5} &&
+            minimized.runs() == 2 &&
+            minimized.edges() == std::vector<uint32_t>{1, 4, 6} &&
+            alone.runs() == 1 && alone.edges() == std::vector<uint32_t>{2, 3} &&
+            minimized.Take() == std::vector<uint32_t>{1, 4, 6} &&
+            minimized.runs() == 0);
+  }
+  checker->Check(
+      "minimizer: the default order starts with `dataflow`, the crash order "
+      "keeps `expressions`",
+      Minimizer::DefaultOrder() ==
+              std::vector<std::string_view>{"dataflow", "statements", "unwrap",
+                                            "lists", "expressions"} &&
+          std::find(Minimizer::CrashOrder().begin(),
+                    Minimizer::CrashOrder().end(),
+                    "expressions") != Minimizer::CrashOrder().end());
+  // `dataflow` removes the unused declarations with one test, and then each
+  // unused group of top-level statements with one test.
+  {
+    std::string message;
+    std::shared_ptr<Program> program = Program::Parse(
+        "var u0 = 0; var u1 = 1;\n"
+        "var a = 1; var b = a + 1;\nvar c = 2; var d = c * 2;\n"
+        "var keep = 3; print(keep);\n",
+        Lineage(), &message);
+    if (checker->Check("minimizer: the dataflow program parses",
+                       program != nullptr, message)) {
+      std::unique_ptr<fast::Tree> tree = program->CopyTree();
+      Minimizer minimizer;
+      MinimizationOracle oracle = [](const std::string& source) {
+        return source.find("print(keep)") != std::string::npos &&
+               source.find("keep = 3") != std::string::npos;
+      };
+      const MinimizationResult result = minimizer.Minimize(
+          tree.get(), oracle, nullptr, FuzzConfig().minimizer);
+      std::string printed = fast::Print(tree->root());
+      std::replace(printed.begin(), printed.end(), '\n', ' ');
+      const ComponentStats& dataflow = minimizer.Find("dataflow")->stats();
+      checker->Check(
+          "minimizer: the default order runs `dataflow` and keeps its cuts",
+          dataflow.succeeded == 3 && dataflow.executed == 4 &&
+              printed.find("var u") == std::string::npos &&
+              printed.find("var a") == std::string::npos &&
+              printed.find("var c") == std::string::npos &&
+              printed.find("print(keep)") != std::string::npos,
+          StringPrintf("%llu of %llu dataflow cuts kept, %d tests, program "
+                       "\"%s\"",
+                       static_cast<unsigned long long>(dataflow.succeeded),
+                       static_cast<unsigned long long>(dataflow.executed),
+                       result.tests, printed.c_str()));
+    }
+  }
+  // `expressions` uses only its share of the budget. The oracle keeps no
+  // reduction, so the reducer stops at its limit, not at the end of the
+  // slots.
+  {
+    std::string source;
+    for (int i = 0; i < 60; i++) {
+      source += StringPrintf("f(a%d + b%d, c%d * d%d);\n", i, i, i, i);
+    }
+    std::string message;
+    std::shared_ptr<Program> program =
+        Program::Parse(source, Lineage(), &message);
+    auto tests_with = [&](double share) {
+      std::unique_ptr<fast::Tree> tree = program->CopyTree();
+      Minimizer minimizer;
+      MinimizerOptions options;
+      options.max_tests = 200;
+      options.max_rounds = 1;
+      options.target_time_ms = 0;
+      options.expressions_share = share;
+      MinimizationOracle never = [](const std::string&) { return false; };
+      std::vector<Reducer*> reducers = {minimizer.Find("expressions")};
+      return minimizer
+          .MinimizeWith(reducers, tree.get(), never, nullptr, options)
+          .tests;
+    };
+    const int quarter = program != nullptr ? tests_with(0.25) : -1;
+    const int all = program != nullptr ? tests_with(1.0) : -1;
+    const int none = program != nullptr ? tests_with(0.0) : -1;
+    checker->Check(
+        "minimizer: `expressions` uses only its share of the remaining tests",
+        quarter == 50 && all == 200 && none == 0,
+        StringPrintf("%d tests with 0.25, %d with 1, %d with 0 (%s)", quarter,
+                     all, none, message.c_str()));
+  }
+}
+
 // Offline: the search of the d8 flags of NAME.repro.js (MinimizeFlags). The
 // oracle needs 2 flags of 7, and --allow-natives-syntax must stay.
 void RunFlagMinimizerChecks(Checker* checker) {
@@ -1516,8 +2174,9 @@ CrashSession RunCrashSession(const TargetOptions& target,
     args += (args.empty() ? "" : " ") + arg;
   }
   std::vector<std::string> all_flags = {
-      "redline",         "fuzz",    "--jobs=1",         "--seed=1",
-      "--no-introspect", "--quiet", "--no-save-corpus", "--no-component-stats"};
+      "redline",          "fuzz",    "--jobs=1",         "--seed=1",
+      "--no-introspect",  "--quiet", "--no-save-corpus", "--no-component-stats",
+      "--allow-no-dcheck"};
   all_flags.push_back("--d8=" + target.executable);
   all_flags.push_back(std::string("--target-kind=") +
                       TargetKindName(target.kind));
@@ -2288,6 +2947,316 @@ void RunFuzzilliCoverageChecks(Checker* checker) {
   munmap(mapping, CoverageMap::kShmSize);
 }
 
+// Offline: the optimized code region of the Fuzzilli layout. A process
+// with --fuzzilli-enable-optimized-code-coverage reports
+// CoverageMap::kFuzzilliNumOptimizedCodeEdges more edges.
+void RunFuzzilliOptimizedCoverageChecks(Checker* checker) {
+  constexpr uint32_t kCode = 120;
+  constexpr uint32_t kAll = kCode + CoverageMap::kFuzzilliNumOptimizedCodeEdges;
+  checker->Check(
+      "fuzzilli optcov: the last optimized code coverage flag applies",
+      CoverageMap::RequestsOptimizedCoverage(
+          {"--fuzzilli_enable_optimized_code_coverage"}) &&
+          !CoverageMap::RequestsOptimizedCoverage(
+              {"--fuzzilli-enable-optimized-code-coverage",
+               "--no-fuzzilli-enable-optimized-code-coverage"}) &&
+          !CoverageMap::RequestsOptimizedCoverage({"--maglev"}),
+      "");
+  // Writes `edges` as the edge count of a new process and initializes `map`.
+  auto start = [](CoverageMap* map, uint32_t edges, bool requested,
+                  bool possible, std::string* reason) {
+    int fd = shm_open(map->shm_name().c_str(), O_RDWR, 0);
+    if (fd < 0) {
+      *reason = strerror(errno);
+      return false;
+    }
+    const bool written = pwrite(fd, &edges, sizeof(edges), 0) ==
+                         static_cast<ssize_t>(sizeof(edges));
+    close(fd);
+    map->SetOptimizedCoverage(requested, possible);
+    return written && map->FinishInitialization(reason);
+  };
+  std::string error;
+  std::unique_ptr<CoverageMap> map = CoverageMap::Create(9992, &error);
+  if (!checker->Check("fuzzilli optcov: create a coverage map", map != nullptr,
+                      error)) {
+    return;
+  }
+  // Random d8 flags: the first process runs without the flag, but the map
+  // has the region.
+  const bool ok = start(map.get(), kCode, false, true, &error);
+  const auto& regions = map->regions();
+  checker->Check(
+      "fuzzilli optcov: a kOptimized region follows the code edges",
+      ok && map->num_edges() == kAll && map->real_edges() == kAll &&
+          map->counted_edges() == kCode && regions.size() == 2 &&
+          regions[1].kind == CoverageMap::RegionKind::kOptimized &&
+          regions[1].first == kCode + 1 &&
+          regions[1].count == CoverageMap::kFuzzilliNumOptimizedCodeEdges &&
+          map->KindOf(kCode) == CoverageMap::FeatureKind::kCode &&
+          map->KindOf(kCode + 1) == CoverageMap::FeatureKind::kOptimized,
+      StringPrintf("%u edges, %u counted: %s", map->num_edges(),
+                   map->counted_edges(), error.c_str()));
+  if (!ok) {
+    return;
+  }
+  // One code edge and one optimized code feature: only the code edge counts
+  // for the coverage, like in a process without the flag.
+  int fd = shm_open(map->shm_name().c_str(), O_RDWR, 0);
+  uint8_t bits[64] = {};
+  bits[5 / 8] = 1u << (5 % 8);
+  bits[(kCode + 3) / 8] |= 1u << ((kCode + 3) % 8);
+  const bool written = fd >= 0 && pwrite(fd, bits, sizeof(bits),
+                                         CoverageMap::kFuzzilliHeaderSize) ==
+                                      static_cast<ssize_t>(sizeof(bits));
+  if (fd >= 0) {
+    close(fd);
+  }
+  SharedCoverage shared;
+  const bool shared_ok =
+      shared.Initialize(map->num_edges(), map->bitmap_size(), &error,
+                        map->counted_edges(), map->real_edges());
+  const std::vector<uint32_t> fresh = map->EvaluateNewEdges();
+  const std::vector<uint32_t> claimed = shared.ClaimNewEdges(map->bitmap());
+  const std::vector<uint32_t> expected = {5, kCode + 3};
+  checker->Check(
+      "fuzzilli optcov: optimized code features do not count as coverage",
+      written && shared_ok && fresh == expected && claimed == expected &&
+          map->found_edges() == 1 && shared.found_edges() == 1 &&
+          map->coverage_fraction() == 1.0 / (kCode + 1) &&
+          shared.coverage_fraction() == 1.0 / (kCode + 1),
+      StringPrintf("found %u and %u", map->found_edges(),
+                   shared.found_edges()));
+  // Later processes: with and without the flag. Any other edge count is
+  // another binary.
+  std::string with_flag, without_flag, other, unrequested;
+  const bool respawns = start(map.get(), kAll, true, true, &with_flag) &&
+                        start(map.get(), kCode, false, true, &without_flag);
+  const bool other_rejected = !start(map.get(), kCode + 1, false, true, &other);
+  const bool unrequested_rejected =
+      !start(map.get(), kAll, false, true, &unrequested);
+  checker->Check(
+      "fuzzilli optcov: N and N + 32768 edges are accepted, other counts not",
+      respawns && map->num_edges() == kAll && other_rejected &&
+          other.find("mixing binaries") != std::string::npos &&
+          unrequested_rejected &&
+          unrequested.find("mixing binaries") != std::string::npos,
+      with_flag + without_flag + " | " + other + " | " + unrequested);
+  // Fixed d8 flags without the flag: no region, and a process that reports
+  // the optimized code features is an error.
+  std::unique_ptr<CoverageMap> fixed = CoverageMap::Create(9991, &error);
+  std::string grown, requested;
+  const bool fixed_ok =
+      fixed != nullptr && start(fixed.get(), kCode, false, false, &error);
+  checker->Check("fuzzilli optcov: without optcov the layout stays strict",
+                 fixed_ok && fixed->num_edges() == kCode &&
+                     fixed->regions().size() == 1 &&
+                     !start(fixed.get(), kAll, false, false, &grown) &&
+                     !start(fixed.get(), kAll, true, true, &requested) &&
+                     grown.find("mixing binaries") != std::string::npos &&
+                     requested.find("mixing binaries") != std::string::npos,
+                 error + " | " + grown + " | " + requested);
+  // A fixed flag: the first process already reports the optimized features.
+  std::unique_ptr<CoverageMap> first = CoverageMap::Create(9990, &error);
+  std::string too_few;
+  const bool first_ok =
+      first != nullptr && start(first.get(), kAll, true, true, &error);
+  std::unique_ptr<CoverageMap> small = CoverageMap::Create(9989, &error);
+  checker->Check(
+      "fuzzilli optcov: a first process with the flag sets the code edges",
+      first_ok && first->counted_edges() == kCode &&
+          first->num_edges() == kAll && small != nullptr &&
+          !start(small.get(), 100, true, true, &too_few) &&
+          too_few.find("only 100 edges") != std::string::npos,
+      error + " | " + too_few);
+  checker->Check("fuzzilli optcov: K-of-N admission of optimized code features",
+                 OptimizedAdmitWorkers(0.0, 8) == 0 &&
+                     OptimizedAdmitWorkers(0.25, 1) == 1 &&
+                     OptimizedAdmitWorkers(0.25, 4) == 1 &&
+                     OptimizedAdmitWorkers(0.25, 8) == 2 &&
+                     OptimizedAdmitWorkers(0.3, 10) == 3 &&
+                     OptimizedAdmitWorkers(1.0, 3) == 3,
+                 "");
+}
+
+// Offline: find retention. A determinism rerun that does not succeed does
+// not make edges flaky. Suppressed edges leave Program::hit_edges. Crash
+// reruns get a longer timeout, and saved corpus files parse again.
+void RunRetentionChecks(Checker* checker) {
+  std::string error;
+  CheckRules rules;
+  auto check = [&](SharedCoverage& shared, std::vector<uint32_t> claimed,
+                   std::vector<CheckRun> runs) {
+    size_t next = 0;
+    return RunDeterminismCheck(
+        shared, rules, std::move(claimed), true,
+        [&](const std::vector<uint32_t>& /*edges*/, CheckRun* run) {
+          if (next < runs.size()) {
+            *run = runs[next++];
+          } else {
+            run->succeeded = true;
+          }
+          return true;
+        });
+  };
+  {
+    // A rerun that times out or crashes (succeeded is false) after a clean
+    // rerun: the edges go back, without a flaky count.
+    SharedCoverage shared;
+    const bool ok = shared.Initialize(255, 32, &error);
+    const std::vector<uint8_t> bitmap = EdgeBitmap({50, 51});
+    std::vector<uint32_t> claimed = shared.ClaimNewEdges(bitmap.data());
+    CheckRun clean;
+    clean.succeeded = true;
+    CheckRun timeout;
+    const CheckResult result = check(shared, claimed, {clean, timeout});
+    checker->Check(
+        "retention: a rerun timeout or crash does not mark edges flaky",
+        ok && claimed == std::vector<uint32_t>{50, 51} && !result.survived &&
+            !result.deterministic && result.reruns == 2 &&
+            !shared.AnyFlaky({50, 51}) && !shared.IsSeen(50) &&
+            !shared.IsSeen(51) && shared.found_edges() == 0,
+        StringPrintf("reruns %d, found %u", result.reruns,
+                     shared.found_edges()));
+  }
+  {
+    // A check that does not converge: only the edges that a successful rerun
+    // lost are flaky. The edge that all runs reached is not.
+    SharedCoverage shared;
+    const bool ok = shared.Initialize(255, 32, &error);
+    const std::vector<uint8_t> bitmap = EdgeBitmap({60, 61, 62, 63});
+    std::vector<uint32_t> claimed = shared.ClaimNewEdges(bitmap.data());
+    rules.max_reruns = 3;
+    std::vector<CheckRun> runs(3);
+    for (uint32_t i = 0; i < 3; i++) {
+      runs[i].succeeded = true;
+      runs[i].missing = {60 + i};
+    }
+    const CheckResult result = check(shared, claimed, runs);
+    rules = CheckRules();
+    checker->Check(
+        "retention: no convergence marks only the lost edges flaky",
+        ok && !result.survived && !result.converged && shared.AnyFlaky({60}) &&
+            shared.AnyFlaky({61}) && shared.AnyFlaky({62}) &&
+            !shared.AnyFlaky({63}) && !shared.IsSeen(63),
+        StringPrintf("reruns %d, dropped %zu", result.reruns, result.dropped));
+  }
+  {
+    // A suppressed edge leaves the hit edges. RecordFlaky ignores the edges
+    // outside 1..num_edges.
+    SharedCoverage shared;
+    const bool ok = shared.Initialize(255, 32, &error);
+    const bool first = shared.RecordFlaky(70, 2);
+    const bool second = shared.RecordFlaky(70, 2);
+    const bool outside = shared.RecordFlaky(0, 1) || shared.RecordFlaky(256, 1);
+    std::vector<uint32_t> hit = {69, 70, 71};
+    shared.RemoveSuppressed(&hit);
+    checker->Check(
+        "retention: suppressed flaky edges leave the hit edges",
+        ok && !first && second && !outside && shared.IsSuppressed(70) &&
+            !shared.IsSuppressed(69) && !shared.IsSuppressed(256) &&
+            !shared.AnyFlaky({256}) && shared.suppressed_flaky_edges() == 1 &&
+            hit == std::vector<uint32_t>{69, 71},
+        StringPrintf("suppressed %llu", static_cast<unsigned long long>(
+                                            shared.suppressed_flaky_edges())));
+  }
+  {
+    // The crash rerun timeout: from the configuration, at least 1x.
+    const char* argv[] = {"redline",
+                          "fuzz",
+                          "--timeout-ms=500",
+                          "--crash-rerun-timeout-factor=3",
+                          "--opt-admit-workers-fraction=0.25",
+                          "--allow-no-dcheck"};
+    Flags flags = Flags::Parse(6, argv, 2);
+    FuzzConfig config;
+    bool ok = FuzzConfig::Load(flags, &config, &error, /*for_run=*/false);
+    const std::string dump = config.ToJson(FuzzConfig::Detail::kFull);
+    ok =
+        ok && config.crash_rerun_timeout_factor == 3 &&
+        CrashRerunTimeout(config) == 1500 * 1000 &&
+        config.opt_admit_workers_fraction == 0.25 && config.allow_no_dcheck &&
+        dump.find("\"crash_rerun_timeout_factor\":3") != std::string::npos &&
+        dump.find("\"opt_admit_workers_fraction\":0.25") != std::string::npos &&
+        dump.find("\"allow_no_dcheck\":true") != std::string::npos;
+    const char* low[] = {
+        "redline", "fuzz",
+        R"(--config={"crash_rerun_timeout_factor": 0.5, "coverage": {"opt_admit_workers_fraction": 2}})"};
+    flags = Flags::Parse(3, low, 2);
+    FuzzConfig clamped;
+    const bool low_ok =
+        FuzzConfig::Load(flags, &clamped, &error, /*for_run=*/false);
+    FuzzConfig defaults;
+    checker->Check(
+        "retention: crash rerun timeout factor and optcov admission load and "
+        "dump",
+        ok && low_ok && clamped.crash_rerun_timeout_factor == 1.0 &&
+            clamped.opt_admit_workers_fraction == 1.0 &&
+            defaults.crash_rerun_timeout_factor == 2.0 &&
+            defaults.opt_admit_workers_fraction == 0.0 &&
+            !defaults.allow_no_dcheck,
+        error);
+  }
+  checker->Check(
+      "retention: the startup crash probes use the d8 builtin",
+      CrashProbeScript(true, 2) == "fuzzilli('FUZZILLI_CRASH', 2)" &&
+          CrashProbeScript(false, 1) == "redline('REDLINE_CRASH', 1)",
+      "");
+  checker->Check(
+      "retention: the crash probes stop for the modes that filter crashes",
+      FiltersCrashProbes({"--fuzzing", "--hole-fuzzing"}) &&
+          FiltersCrashProbes({"--hole_fuzzing"}) &&
+          FiltersCrashProbes({"--sandbox-fuzzing"}) &&
+          FiltersCrashProbes({"--sandbox-trap-fuzzing"}) &&
+          FiltersCrashProbes({"--maglev", "--sandbox-testing"}) &&
+          !FiltersCrashProbes({}) &&
+          !FiltersCrashProbes({"--fuzzing", "--maglev"}) &&
+          !FiltersCrashProbes({"--hole-fuzzing-extra"}),
+      "");
+  {
+    // A corpus file header with line terminators in the lineage, and the
+    // flags of the program. The file parses again, the flags come back as
+    // program flags through SanitizeTestFlags, and they are not imported
+    // flags.
+    Lineage lineage;
+    lineage.origin = "import";
+    lineage.detail =
+        "a\nb\rc\xE2\x80\xA8"
+        "d\xE2\x80\xA9"
+        "e";
+    std::shared_ptr<Program> program =
+        Program::Parse("let x = 1;\nx + 1;\n", lineage, &error);
+    std::string header, file;
+    ImportInfo info;
+    std::unique_ptr<fast::Tree> tree;
+    if (program != nullptr) {
+      program->flags = {"--maglev", "--expose-gc",
+                        "--no-lazy-feedback-allocation"};
+      header = CorpusFileHeader(*program);
+      file = header + program->source();
+      tree =
+          ImportSource(file, "/tmp/000001.js", ImportOptions(), &info, &error);
+    }
+    const bool one_line_each =
+        std::count(header.begin(), header.end(), '\n') == 2 &&
+        header.find('\r') == std::string::npos &&
+        header.find("\xE2\x80\xA8") == std::string::npos &&
+        header.find("\xE2\x80\xA9") == std::string::npos &&
+        header.find("a\\nb\\rc\\u2028d\\u2029e") != std::string::npos;
+    checker->Check(
+        "retention: a corpus file header round-trips with its flags",
+        program != nullptr && one_line_each && tree != nullptr &&
+            info.flags.empty() && ParseFlagsLines(file).empty() &&
+            info.program_flags ==
+                std::vector<std::string>{"--maglev",
+                                         "--no-lazy-feedback-allocation"} &&
+            info.rejected_flags == std::vector<std::string>{"--expose-gc"} &&
+            header.find(std::string(kRedlineFlagsPrefix) +
+                        " --maglev --expose-gc") != std::string::npos,
+        header + error);
+  }
+}
+
 // Offline: wildcard expansion in ListFiles and Test262 frontmatter in
 // ImportSource.
 void RunImportChecks(Checker* checker) {
@@ -2418,6 +3387,1659 @@ void RunImportChecks(Checker* checker) {
   RemoveTree(dir);
 }
 
+// Target: a session with --import-all and a seed strategy that wants hit
+// edges. The check of an import uses import_reruns, not the large
+// min_reruns of the session. An edge that the first run of a new target
+// reaches only once can cause more reruns. Publish runs no program again
+// for the hit edges.
+void RunImportAllCheck(Checker* checker, const TargetOptions& target) {
+  const std::vector<std::string> programs = {
+      "var a = [1, 2, 3]; a.push(4); a.sort();\n",
+      "var o = {x: 1}; o.y = 2; Object.keys(o);\n",
+      "var s = 'abc'; s.split('').reverse().join('');\n",
+  };
+  const CrashSession session =
+      RunCrashSession(target,
+                      {"--import-all", "--min-reruns=20", "--scheduler=rarity",
+                       "--stage-log=check"},
+                      programs);
+  std::string events, error = session.error;
+  if (error.empty()) {
+    ReadFileToString(session.dir + "/out/events.jsonl", &events, &error);
+  }
+  int added = 0, import_checks = 0, cheap_checks = 0;
+  std::string reruns;
+  int64_t hit_edge_executions = -1;
+  size_t start = 0;
+  while (start < events.size()) {
+    size_t end = events.find('\n', start);
+    if (end == std::string::npos) {
+      end = events.size();
+    }
+    JsonValue event;
+    std::string parse_error;
+    if (JsonValue::Parse(std::string_view(events).substr(start, end - start),
+                         &event, &parse_error) &&
+        event.is_object()) {
+      const std::string& kind = event.Get("event").as_string();
+      if (kind == "import" && event.Get("result").as_string() == "added") {
+        added++;
+      } else if (kind == "check" &&
+                 event.Get("origin").as_string() == "import") {
+        import_checks++;
+        const int64_t count = event.GetInt("reruns", -1);
+        reruns += StringPrintf("%s%lld", reruns.empty() ? "" : " ",
+                               static_cast<long long>(count));
+        if (count >= 1 && count < 20 && event.GetBool("survived", false)) {
+          cheap_checks++;
+        }
+      } else if (kind == "stats") {
+        hit_edge_executions = event.GetInt("hit_edge_executions", -1);
+      }
+    }
+    start = end + 1;
+  }
+  checker->Check(
+      "import: --import-all uses import_reruns, and Publish runs no program "
+      "again for the hit edges",
+      error.empty() && added == static_cast<int>(programs.size()) &&
+          import_checks == added && cheap_checks == added &&
+          hit_edge_executions == 0,
+      StringPrintf("%d added, %d import checks, %d with fewer than 20 reruns "
+                   "(%s), %lld hit edge runs, stop \"%s\"%s%s",
+                   added, import_checks, cheap_checks, reruns.c_str(),
+                   static_cast<long long>(hit_edge_executions),
+                   session.stop.c_str(), error.empty() ? "" : ": ",
+                   error.c_str()));
+  if (!session.dir.empty()) {
+    RemoveTree(session.dir);
+  }
+}
+
+// Offline: exception line extraction, AST statement salvage and local type
+// propagation.
+void RunSalvageChecks(Checker* checker) {
+  // 1. ExtractExceptionLines on stdout, stderr, stack traces, prelude offset
+  // and parse-time SyntaxError.
+  {
+    Execution simple;
+    simple.outcome = Outcome::kFailed;
+    simple.stdout_output =
+        "fuzzcode.js:12: TypeError: Cannot read properties of null\n"
+        "null.x;\n"
+        "     ^\n"
+        "TypeError: Cannot read properties of null\n"
+        "    at fuzzcode.js:12:6\n";
+    ExceptionLines l1 = ExtractExceptionLines(simple, 0);
+    checker->Check(
+        "salvage: extracts top-level TypeError line from stdout",
+        l1.innermost == 12 && l1.outermost == 12,
+        StringPrintf("inner=%d outer=%d", l1.innermost, l1.outermost));
+
+    Execution multi;
+    multi.outcome = Outcome::kFailed;
+    multi.stdout_output =
+        "TypeError: earlier printed stack\n"
+        "    at fuzzcode.js:99:1\n"
+        "fuzzcode.js:110: TypeError: boom\n"
+        "  null.x;\n"
+        "       ^\n"
+        "TypeError: boom\n"
+        "    at g (fuzzcode.js:110:8)\n"
+        "    at f (fuzzcode.js:113:3)\n"
+        "    at fuzzcode.js:118:1\n";
+    ExceptionLines l2 = ExtractExceptionLines(multi, 108);
+    checker->Check(
+        "salvage: extracts innermost and outermost lines with prelude offset",
+        l2.innermost == 2 && l2.outermost == 10,
+        StringPrintf("inner=%d outer=%d", l2.innermost, l2.outermost));
+
+    Execution prelude_frame;
+    prelude_frame.outcome = Outcome::kFailed;
+    prelude_frame.stdout_output =
+        "fuzzcode.js:64: TypeError: helper failed\n"
+        "    at isInterpreted (fuzzcode.js:64:30)\n"
+        "    at fuzzcode.js:115:1\n";
+    ExceptionLines l3 = ExtractExceptionLines(prelude_frame, 108);
+    checker->Check(
+        "salvage: skips frames inside the prelude",
+        l3.innermost == 7 && l3.outermost == 7,
+        StringPrintf("inner=%d outer=%d", l3.innermost, l3.outermost));
+
+    Execution stderr_fallback;
+    stderr_fallback.outcome = Outcome::kFailed;
+    stderr_fallback.stderr_output = "fuzzcode.js:9: 42\nthrow 42;\n^\n";
+    ExceptionLines l4 = ExtractExceptionLines(stderr_fallback, 4);
+    checker->Check(
+        "salvage: falls back to stderr and header-only throws",
+        l4.innermost == 5 && l4.outermost == 5,
+        StringPrintf("inner=%d outer=%d", l4.innermost, l4.outermost));
+
+    Execution parse_err;
+    parse_err.outcome = Outcome::kFailed;
+    parse_err.stdout_output =
+        "fuzzcode.js:3: SyntaxError: Unexpected token ';'\n"
+        "let = ;\n"
+        "      ^\n"
+        "SyntaxError: Unexpected token ';'\n";
+    ExceptionLines l5 = ExtractExceptionLines(parse_err, 0);
+    checker->Check(
+        "salvage: skips unrecoverable parse-time SyntaxError", l5.empty(),
+        StringPrintf("inner=%d outer=%d", l5.innermost, l5.outermost));
+
+    Execution runtime_syntax;
+    runtime_syntax.outcome = Outcome::kFailed;
+    runtime_syntax.stdout_output =
+        "fuzzcode.js:4: SyntaxError: Invalid regular expression\n"
+        "new RegExp('[');\n"
+        "^\n"
+        "SyntaxError: Invalid regular expression\n"
+        "    at new RegExp (<anonymous>)\n"
+        "    at fuzzcode.js:4:1\n";
+    ExceptionLines l6 = ExtractExceptionLines(runtime_syntax, 0);
+    checker->Check(
+        "salvage: keeps runtime SyntaxError with stack frames",
+        l6.innermost == 4 && l6.outermost == 4,
+        StringPrintf("inner=%d outer=%d", l6.innermost, l6.outermost));
+
+    Execution crlf;
+    crlf.outcome = Outcome::kFailed;
+    crlf.stdout_output =
+        "fuzzcode.js:12: TypeError: boom\r\n"
+        "null.x;\r\n"
+        "     ^\r\n"
+        "TypeError: boom\r\n"
+        "    at g (fuzzcode.js:12:6)\r\n"
+        "    at fuzzcode.js:15:1\r\n";
+    ExceptionLines l7 = ExtractExceptionLines(crlf, 2);
+    checker->Check(
+        "salvage: handles CRLF line endings in exception output",
+        l7.innermost == 10 && l7.outermost == 13,
+        StringPrintf("inner=%d outer=%d", l7.innermost, l7.outermost));
+
+    Execution succeeded_with_text = simple;
+    succeeded_with_text.outcome = Outcome::kSucceeded;
+    Execution crashed_with_text = simple;
+    crashed_with_text.outcome = Outcome::kCrashed;
+    Execution timed_out_with_text = simple;
+    timed_out_with_text.outcome = Outcome::kTimedOut;
+    checker->Check(
+        "salvage: ignores non-kFailed executions in ExtractExceptionLines",
+        ExtractExceptionLines(succeeded_with_text, 0).empty() &&
+            ExtractExceptionLines(crashed_with_text, 0).empty() &&
+            ExtractExceptionLines(timed_out_with_text, 0).empty(),
+        "");
+
+    checker->Check(
+        "salvage: PreludeLineCount handles empty and trailing newline",
+        PreludeLineCount("") == 0 && PreludeLineCount("var a = 1;") == 1 &&
+            PreludeLineCount("var a = 1;\n") == 2,
+        StringPrintf("empty=%d one=%d trailing=%d", PreludeLineCount(""),
+                     PreludeLineCount("var a = 1;"),
+                     PreludeLineCount("var a = 1;\n")));
+  }
+
+  // 2. NodeSpan line-to-statement lookup (innermost and top-level).
+  {
+    const char* src =
+        "function boom() {\n"
+        "  let x = 1;\n"
+        "  null.y;\n"
+        "}\n"
+        "if (true) {\n"
+        "  boom();\n"
+        "}\n";
+    fast::ParseError err;
+    std::unique_ptr<fast::Tree> tree =
+        fast::Parser::ParseScript(src, fast::ParseOptions(), &err);
+    std::vector<fast::NodeSpan> spans;
+    std::string printed =
+        tree != nullptr
+            ? fast::Print(tree->root(), fast::PrintOptions(), &spans)
+            : "";
+    StatementLocation inner =
+        FindCoveringStatement(tree.get(), printed, spans, 3, false);
+    StatementLocation top =
+        FindCoveringStatement(tree.get(), printed, spans, 6, true);
+    StatementLocation nested_call =
+        FindCoveringStatement(tree.get(), printed, spans, 6, false);
+    const bool ok = inner.valid() &&
+                    inner.statement()->Is<fast::ExpressionStatement>() &&
+                    inner.owner != tree->root() && top.valid() &&
+                    top.statement()->Is<fast::IfStatement>() &&
+                    top.owner == tree->root() && nested_call.valid() &&
+                    nested_call.statement()->Is<fast::ExpressionStatement>() &&
+                    nested_call.owner != tree->root();
+    checker->Check("salvage: NodeSpan maps line to innermost and top-level", ok,
+                   err.message);
+  }
+
+  // 3. Lexical declaration splitting and skipping unsafe statements.
+  {
+    auto parse = [](const char* code) {
+      fast::ParseError err;
+      return fast::Parser::ParseScript(code, fast::ParseOptions(), &err);
+    };
+    std::unique_ptr<fast::Tree> const_tree =
+        parse("const x = null.a;\nlet y = x;\n");
+    const bool split_const = SalvageException(const_tree.get(), {1, 1}, false);
+    const std::string printed_const =
+        const_tree != nullptr ? fast::Print(const_tree->root()) : "";
+    fast::ParseError parse_err;
+    const bool const_parses =
+        fast::Parser::ParseScript(printed_const, fast::ParseOptions(),
+                                  &parse_err) != nullptr;
+    checker->Check(
+        "salvage: splits const declaration into let and guarded assignment",
+        split_const && const_parses &&
+            printed_const.find("let x;\ntry {\n  x = null.a;\n} catch {}") !=
+                std::string::npos,
+        printed_const);
+
+    std::unique_ptr<fast::Tree> multi_tree = parse("let a = 1, b = null.z;\n");
+    const bool split_multi = SalvageException(multi_tree.get(), {1, 1}, false);
+    const std::string printed_multi =
+        multi_tree != nullptr ? fast::Print(multi_tree->root()) : "";
+    checker->Check(
+        "salvage: splits multi-declarator let declaration safely",
+        split_multi &&
+            printed_multi.find(
+                "let a, b;\ntry {\n  a = 1;\n  b = null.z;\n} catch {}") !=
+                std::string::npos,
+        printed_multi);
+
+    std::unique_ptr<fast::Tree> var_tree =
+        parse("var x = null.a;\nlet y = x;\n");
+    const bool wrapped_var =
+        var_tree != nullptr && SalvageException(var_tree.get(), {1, 1}, false);
+    const std::string printed_var =
+        var_tree != nullptr ? fast::Print(var_tree->root()) : "";
+    const bool var_parses =
+        fast::Parser::ParseScript(printed_var, fast::ParseOptions(),
+                                  &parse_err) != nullptr;
+    checker->Check(
+        "salvage: wraps var declaration directly in try/catch",
+        wrapped_var && var_parses &&
+            printed_var.find("try {\n  var x = null.a;\n} catch {}") !=
+                std::string::npos,
+        printed_var);
+
+    std::unique_ptr<fast::Tree> try_tree = parse("try {\n  a();\n} catch {}\n");
+    const bool skipped_try =
+        try_tree != nullptr && !SalvageException(try_tree.get(), {1, 1}, false);
+    std::unique_ptr<fast::Tree> fn_tree = parse("function f() {}\n");
+    const bool skipped_fn =
+        fn_tree != nullptr && !SalvageException(fn_tree.get(), {1, 1}, false);
+    std::unique_ptr<fast::Tree> cls_tree = parse("class C extends null {}\n");
+    const bool skipped_cls =
+        cls_tree != nullptr && !SalvageException(cls_tree.get(), {1, 1}, false);
+    std::unique_ptr<fast::Tree> destruct_tree = parse("const {a} = null;\n");
+    const bool skipped_destruct =
+        destruct_tree != nullptr &&
+        !SalvageException(destruct_tree.get(), {1, 1}, false);
+    checker->Check(
+        "salvage: skips try, function, class and destructuring declarations",
+        skipped_try && skipped_fn && skipped_cls && skipped_destruct, "");
+
+    std::unique_ptr<fast::Tree> using_tree =
+        parse("{\n  using r = null;\n  let y = r;\n}\n");
+    bool skipped_using = false;
+    if (using_tree != nullptr) {
+      std::vector<fast::NodeSpan> using_spans;
+      std::string printed_using =
+          fast::Print(using_tree->root(), fast::PrintOptions(), &using_spans);
+      StatementLocation using_loc = FindCoveringStatement(
+          using_tree.get(), printed_using, using_spans, 2, false);
+      skipped_using = using_loc.valid() &&
+                      using_loc.statement()->Is<fast::VariableDeclaration>() &&
+                      !WrapStatementForSalvage(using_tree.get(), using_loc);
+    }
+    std::unique_ptr<fast::Tree> directive_tree = parse("\"use strict\";\n");
+    const bool skipped_directive =
+        directive_tree != nullptr &&
+        !SalvageException(directive_tree.get(), {1, 1}, false);
+    std::unique_ptr<fast::Tree> nested_label_fn_tree =
+        parse("L1: L2: function f() {}\n");
+    const bool skipped_nested_label_fn =
+        nested_label_fn_tree != nullptr &&
+        !SalvageException(nested_label_fn_tree.get(), {1, 1}, false);
+    std::unique_ptr<fast::Tree> labeled_ret_tree =
+        parse("function f() {\n  L: return null.x;\n}\nf();\n");
+    bool skipped_labeled_ret = false;
+    bool labeled_ret_fell_back = false;
+    std::string printed_labeled_ret;
+    if (labeled_ret_tree != nullptr) {
+      std::vector<fast::NodeSpan> ret_spans;
+      std::string printed_ret = fast::Print(labeled_ret_tree->root(),
+                                            fast::PrintOptions(), &ret_spans);
+      StatementLocation ret_loc = FindCoveringStatement(
+          labeled_ret_tree.get(), printed_ret, ret_spans, 2, false);
+      skipped_labeled_ret =
+          ret_loc.valid() &&
+          ret_loc.statement()->Is<fast::LabeledStatement>() &&
+          !WrapStatementForSalvage(labeled_ret_tree.get(), ret_loc);
+      labeled_ret_fell_back =
+          SalvageException(labeled_ret_tree.get(), {2, 4}, false);
+      printed_labeled_ret = fast::Print(labeled_ret_tree->root());
+    }
+    checker->Check(
+        "salvage: skips using, directives and unsafe labeled statements",
+        skipped_using && skipped_directive && skipped_nested_label_fn &&
+            skipped_labeled_ret && labeled_ret_fell_back &&
+            printed_labeled_ret.find("try {\n  f();\n} catch {}") !=
+                std::string::npos,
+        StringPrintf("using=%d dir=%d lfn=%d lret=%d fb=%d", skipped_using,
+                     skipped_directive, skipped_nested_label_fn,
+                     skipped_labeled_ret, labeled_ret_fell_back));
+
+    std::unique_ptr<fast::Tree> labeled_ok_tree = parse("L: null.x;\n");
+    const bool wrapped_labeled =
+        labeled_ok_tree != nullptr &&
+        SalvageException(labeled_ok_tree.get(), {1, 1}, false);
+    const std::string printed_labeled =
+        labeled_ok_tree != nullptr ? fast::Print(labeled_ok_tree->root()) : "";
+    const bool labeled_parses =
+        fast::Parser::ParseScript(printed_labeled, fast::ParseOptions(),
+                                  &parse_err) != nullptr;
+    checker->Check(
+        "salvage: wraps safe labeled statement outside the label",
+        wrapped_labeled && labeled_parses &&
+            printed_labeled.find("try {\n  L: null.x;\n} catch {}") !=
+                std::string::npos,
+        printed_labeled);
+
+    std::unique_ptr<fast::Tree> fallback_tree =
+        parse("function f() {\n  return null.x;\n}\nf();\n");
+    const bool fell_back = fallback_tree != nullptr &&
+                           SalvageException(fallback_tree.get(), {2, 4}, false);
+    const std::string printed_fb =
+        fallback_tree != nullptr ? fast::Print(fallback_tree->root()) : "";
+    checker->Check(
+        "salvage: falls back from ReturnStatement to outermost call statement",
+        fell_back &&
+            printed_fb.find("try {\n  f();\n} catch {}") != std::string::npos,
+        printed_fb);
+  }
+
+  // 4. Local type propagation in Builder::GuessType.
+  {
+    const char* code =
+        "let ta;\n"
+        "try {\n"
+        "  ta = new Int32Array(4);\n"
+        "} catch {}\n"
+        "let alias = ta;\n"
+        "let len = alias.length;\n"
+        "let sum = len + 1;\n"
+        "let isArr = Array.isArray(alias);\n"
+        "async function af() { return 1; }\n"
+        "let p = af();\n"
+        "function makeArr() { return [1, 2]; }\n"
+        "let arr = makeArr();\n"
+        "const makeStr = () => 'hi';\n"
+        "let str = makeStr();\n"
+        "function recFn() { return recFn(); }\n"
+        "let rec = recFn();\n"
+        "let conflict;\n"
+        "conflict = 1;\n"
+        "conflict = 's';\n"
+        "function fn(n = 5, ...rest) {\n"
+        "  for (let k in alias) {\n"
+        "    return k;\n"
+        "  }\n"
+        "}\n"
+        "let cycA = cycB;\n"
+        "let cycB = cycA;\n";
+    fast::ParseError err;
+    std::unique_ptr<fast::Tree> tree =
+        fast::Parser::ParseScript(code, fast::ParseOptions(), &err);
+    if (tree == nullptr) {
+      checker->Check(
+          "builder: GuessType propagates guarded assignments and local types",
+          false, "parse failed: " + err.ToString());
+    } else {
+      Random rng(1);
+      Builder builder(tree.get(), &rng);
+      auto type_of = [&](std::string_view name) {
+        for (fast::Binding* b : builder.scopes().bindings()) {
+          if (b->name == name) {
+            return builder.GuessType(b);
+          }
+        }
+        return JsType::kUnknown;
+      };
+      const bool ok = type_of("ta") == JsType::kTypedArray &&
+                      type_of("alias") == JsType::kTypedArray &&
+                      type_of("len") == JsType::kNumber &&
+                      type_of("sum") == JsType::kNumber &&
+                      type_of("isArr") == JsType::kBoolean &&
+                      type_of("p") == JsType::kPromise &&
+                      type_of("arr") == JsType::kArray &&
+                      type_of("str") == JsType::kString &&
+                      type_of("rec") == JsType::kUnknown &&
+                      type_of("conflict") == JsType::kUnknown &&
+                      type_of("n") == JsType::kNumber &&
+                      type_of("rest") == JsType::kArray &&
+                      type_of("k") == JsType::kString &&
+                      type_of("cycA") == JsType::kUnknown &&
+                      type_of("cycB") == JsType::kUnknown;
+      checker->Check(
+          "builder: GuessType propagates guarded assignments and local types",
+          ok,
+          StringPrintf("ta=%s alias=%s len=%s sum=%s isArr=%s p=%s arr=%s "
+                       "str=%s rec=%s conflict=%s n=%s rest=%s k=%s",
+                       JsTypeName(type_of("ta")), JsTypeName(type_of("alias")),
+                       JsTypeName(type_of("len")), JsTypeName(type_of("sum")),
+                       JsTypeName(type_of("isArr")), JsTypeName(type_of("p")),
+                       JsTypeName(type_of("arr")), JsTypeName(type_of("str")),
+                       JsTypeName(type_of("rec")),
+                       JsTypeName(type_of("conflict")),
+                       JsTypeName(type_of("n")), JsTypeName(type_of("rest")),
+                       JsTypeName(type_of("k"))));
+    }
+  }
+}
+
+// Online: end-to-end exception salvage against d8 behind DefaultPrelude.
+void RunSalvageTargetCheck(Checker* checker, ScriptRunner* runner) {
+  const std::string prelude(DefaultPrelude());
+  const int prelude_lines = PreludeLineCount(prelude);
+  auto run_behind_prelude = [&](const std::string& src,
+                                ScriptRunner::Result* out) {
+    std::string full = prelude + "\n" + src;
+    return RunOrFail(checker, runner, "salvage target", full, out);
+  };
+
+  // Case 1: throwing const declaration splits and keeps downstream code alive.
+  {
+    const char* src =
+        "const v = null.foo;\n"
+        "print('after:' + typeof v);\n";
+    fast::ParseError err;
+    std::unique_ptr<fast::Tree> tree =
+        fast::Parser::ParseScript(src, fast::ParseOptions(), &err);
+    if (tree == nullptr) {
+      checker->Check(
+          "salvage: recovers throwing const declaration end-to-end on d8",
+          false, "parse failed: " + err.ToString());
+    } else {
+      std::string initial = fast::Print(tree->root());
+      ScriptRunner::Result first, second;
+      if (run_behind_prelude(initial, &first)) {
+        ExceptionLines lines =
+            ExtractExceptionLines(first.execution, prelude_lines);
+        const bool wrapped = SalvageException(tree.get(), lines, false);
+        const std::string salvaged = fast::Print(tree->root());
+        const bool ran_second =
+            wrapped && run_behind_prelude(salvaged, &second);
+        const bool ok = first.execution.outcome == Outcome::kFailed &&
+                        lines.innermost == 1 && lines.outermost == 1 &&
+                        wrapped && ran_second && second.execution.succeeded() &&
+                        second.execution.stdout_output.find(
+                            "after:undefined") != std::string::npos;
+        checker->Check(
+            "salvage: recovers throwing const declaration end-to-end on d8", ok,
+            StringPrintf("first=%s lines=%d/%d second=%s",
+                         OutcomeName(first.execution.outcome), lines.innermost,
+                         lines.outermost,
+                         OutcomeName(second.execution.outcome)));
+      }
+    }
+  }
+
+  // Case 2: nested throw recovers in both innermost and outermost modes.
+  {
+    const char* src =
+        "function boom() {\n"
+        "  null.bar();\n"
+        "}\n"
+        "boom();\n"
+        "print('recovered');\n";
+    for (bool top_level : {false, true}) {
+      const char* check_name =
+          top_level
+              ? "salvage: recovers nested throw via outermost frame on d8"
+              : "salvage: recovers nested throw via innermost frame on d8";
+      fast::ParseError err;
+      std::unique_ptr<fast::Tree> tree =
+          fast::Parser::ParseScript(src, fast::ParseOptions(), &err);
+      if (tree == nullptr) {
+        checker->Check(check_name, false, "parse failed: " + err.ToString());
+        continue;
+      }
+      std::string initial = fast::Print(tree->root());
+      ScriptRunner::Result first, second;
+      if (run_behind_prelude(initial, &first)) {
+        ExceptionLines lines =
+            ExtractExceptionLines(first.execution, prelude_lines);
+        const bool wrapped = SalvageException(tree.get(), lines, top_level);
+        const std::string salvaged = fast::Print(tree->root());
+        const bool ran_second =
+            wrapped && run_behind_prelude(salvaged, &second);
+        const bool ok = first.execution.outcome == Outcome::kFailed &&
+                        lines.innermost == 2 && lines.outermost == 4 &&
+                        wrapped && ran_second && second.execution.succeeded() &&
+                        second.execution.stdout_output.find("recovered") !=
+                            std::string::npos;
+        checker->Check(check_name, ok,
+                       StringPrintf("first=%s lines=%d/%d second=%s",
+                                    OutcomeName(first.execution.outcome),
+                                    lines.innermost, lines.outermost,
+                                    OutcomeName(second.execution.outcome)));
+      }
+    }
+  }
+}
+
+// Offline: the `// Flags:` lines of imported tests and the denylist of the
+// js_fuzzer of V8. Also the d8 trials, the flag pools and the flag blacklist.
+// Also the second start of a target process without its random flags.
+void RunTestFlagChecks(Checker* checker) {
+  auto contains = [](const std::vector<std::string>& list, const char* flag) {
+    return std::find(list.begin(), list.end(), flag) != list.end();
+  };
+
+  const std::vector<std::string> lines = ParseFlagsLines(
+      "// Copyright\n// Flags: --turbofan --no-lazy_feedback_allocation\n"
+      "var x = 1;  //   Flags: --maglev\n//Flags: --not-a-flags-line\n");
+  checker->Check(
+      "test flags: ParseFlagsLines reads all `// Flags:` lines",
+      lines == std::vector<std::string>{"--turbofan",
+                                        "--no-lazy_feedback_allocation",
+                                        "--maglev"},
+      StringPrintf("%zu flags", lines.size()));
+
+  ImportOptions options;
+  ImportInfo info;
+  std::string error;
+  std::unique_ptr<fast::Tree> tree = ImportSource(
+      "// Flags: --allow-natives-syntax --expose_gc --turbofan --harmony-foo\n"
+      "// Flags: --js-staging --stack-size=100 --trace-turbo foo.mjs\n"
+      "// Flags: --no-lazy_feedback_allocation --random-seed=4 --verify-heap\n"
+      "// Flags: --experimental-wasm-foo --no-turbofan --print-bytecode\n"
+      "var a = 1;\n",
+      "/tmp/flags.js", options, &info, &error);
+  checker->Check(
+      "test flags: ImportSource keeps the allowed flags of `// Flags:`",
+      tree != nullptr &&
+          info.flags == std::vector<std::string>{"--turbofan", "--js-staging",
+                                                 "--no-lazy-feedback-"
+                                                 "allocation"} &&
+          info.rejected_flags.size() == 10,
+      StringPrintf("%zu flags, %zu rejected", info.flags.size(),
+                   info.rejected_flags.size()));
+
+  const bool denylist_ok =
+      IsAllowedTestFlag("--harmony-shipping") &&
+      !IsAllowedTestFlag("--harmony-temporal") &&
+      IsAllowedTestFlag("--js-shipping") &&
+      !IsAllowedTestFlag("--js-float16") &&
+      !IsAllowedTestFlag("--icu-data-file=x") &&
+      !IsAllowedTestFlag("--sandbox-fuzzing") &&
+      !IsAllowedTestFlag("--no-allow-natives-syntax") &&
+      !IsAllowedTestFlag("--noexpose-gc") && !IsAllowedTestFlag("--") &&
+      !IsAllowedTestFlag("--single-threaded") && !IsAllowedTestFlag("--help") &&
+      !IsAllowedTestFlag("--perf-prof") && !IsAllowedTestFlag("--prof") &&
+      !IsAllowedTestFlag("--log-all") && !IsAllowedTestFlag("--gdbjit") &&
+      !IsAllowedTestFlag("--abort-on-contradictory-flags") &&
+      IsAllowedTestFlag("--maglev") && IsAllowedTestFlag("--no-turbofan") &&
+      IsAllowedTestFlag("--harmony");
+  checker->Check("test flags: the denylist of exceptions.js and Redline",
+                 denylist_ok, "");
+
+  std::vector<std::string> contradictory = {"--jitless", "--maglev",
+                                            "--no-jitless", "--stress-maglev"};
+  SanitizeD8Flags(&contradictory);
+  std::vector<std::string> fixed_wins = {"--jitless", "--turbofan"};
+  SanitizeD8Flags(&fixed_wins, {"--maglev"});
+  checker->Check(
+      "test flags: SanitizeD8Flags removes negations and contradictions",
+      contradictory == std::vector<std::string>{"--jitless"} &&
+          fixed_wins == std::vector<std::string>{"--turbofan"},
+      StringPrintf("%zu, %zu flags", contradictory.size(), fixed_wins.size()));
+
+  const std::vector<std::string> merged = MergeProgramFlags(
+      {"--a", "--b=1", "--c", "--d"}, {"--no-a", "--b=2", "--e", "--f", "--g"});
+  checker->Check(
+      "test flags: MergeProgramFlags keeps 6 flags with unique names",
+      merged == std::vector<std::string>{"--a", "--b=1", "--c", "--d", "--e",
+                                         "--f"} &&
+          SharesD8Flag({"--x=1"}, {"--y", "--x=2"}) &&
+          !SharesD8Flag({"--x"}, {"--no-x"}),
+      StringPrintf("%zu flags", merged.size()));
+
+  std::vector<D8Trial> trials;
+  size_t dropped = 0;
+  std::string trial_err;
+  const bool trials_ok = ParseD8Trials(
+      R"([{"app_args": "--trial-a", "app_name": "d8", "probability": 1,
+           "contradicts": ["--trial-b"]},
+          {"app_args": "--trial-b", "app_name": "d8", "probability": 1,
+           "contradicts": ["--trial-a"]},
+          {"app_args": "--experimental-x", "app_name": "d8", "probability": 1},
+          {"app_args": "--trial-x", "app_name": "chrome", "probability": 1},
+          {"app_args": "--trial-c --trial-d", "app_name": "d8",
+           "probability": 0.5}])",
+      &trials, &trial_err, &dropped);
+  std::vector<D8Trial> bad_trials;
+  std::string bad_err;
+  const bool bad_rejected =
+      !ParseD8Trials("{\"app_args\": 1}", &bad_trials, &bad_err);
+  Random trial_rng(17);
+  int one_of_ab = 0;
+  int cd = 0;
+  int fixed_b_ok = 0;
+  for (int i = 0; i < 200; i++) {
+    std::vector<std::string> drawn;
+    AddD8Trials(trial_rng, trials, {}, &drawn);
+    if (contains(drawn, "--trial-a") != contains(drawn, "--trial-b")) {
+      one_of_ab++;
+    }
+    if (contains(drawn, "--trial-c") && contains(drawn, "--trial-d")) {
+      cd++;
+    }
+    std::vector<std::string> with_fixed;
+    AddD8Trials(trial_rng, trials, {"--trial-b"}, &with_fixed);
+    if (!contains(with_fixed, "--trial-a") &&
+        !contains(with_fixed, "--trial-b")) {
+      fixed_b_ok++;
+    }
+  }
+  checker->Check(
+      "test flags: d8 trials load, filter and honor `contradicts`",
+      trials_ok && trials.size() == 3 && dropped == 1 && bad_rejected &&
+          one_of_ab == 200 && cd > 60 && cd < 140 && fixed_b_ok == 200,
+      StringPrintf("%zu trials, %zu dropped, a xor b %d, c and d %d, fixed %d",
+                   trials.size(), dropped, one_of_ab, cd, fixed_b_ok) +
+          trial_err);
+
+  FlagSetPool pool(2);
+  pool.Record({"--pool-a"}, 1.0);
+  pool.Record({"--pool-b"}, 2.0);
+  pool.Record({"--pool-c"}, 3.0);
+  pool.Record({"--pool-c"}, 0.5);
+  pool.Record({}, 9.0);
+  pool.Record({"--pool-d"}, 0.0);
+  Random pool_rng(3);
+  std::vector<std::string> best;
+  int best_c = 0;
+  int seen_b = 0;
+  for (int i = 0; i < 100; i++) {
+    if (pool.Pick(pool_rng, 32, &best) &&
+        best == std::vector<std::string>{"--pool-c"}) {
+      best_c++;
+    }
+    if (pool.Pick(pool_rng, 1, &best) &&
+        best == std::vector<std::string>{"--pool-b"}) {
+      seen_b++;
+    }
+  }
+  FlagSetPool empty_pool(4);
+  checker->Check(
+      "test flags: FlagSetPool keeps the best sets",
+      pool.size() == 2 && best_c == 100 && seen_b > 20 && seen_b < 80 &&
+          !empty_pool.Pick(pool_rng, 1, &best),
+      StringPrintf("size %zu, best %d, b %d", pool.size(), best_c, seen_b));
+
+  D8FlagBlacklist single;
+  single.RecordSpawn({"--bad-flag=1"}, false);
+  std::vector<std::string> filtered = {"--bad-flag=2", "--ok-flag"};
+  single.Filter(&filtered);
+  D8FlagBlacklist early;
+  early.RecordSpawn({"--x", "--y"}, false);
+  D8FlagBlacklist isolated;
+  D8FlagBlacklist repeated;
+  for (int i = 0; i < 16; i++) {
+    isolated.RecordSpawn({"--good-a", "--good-b"}, true);
+    repeated.RecordSpawn({"--good-a"}, true);
+  }
+  isolated.RecordSpawn({"--good-a", "--new-flag", "--good-b"}, false);
+  repeated.RecordSpawn({"--good-a", "--p", "--q"}, false);
+  const bool repeated_first = repeated.Blocked().empty();
+  repeated.RecordSpawn({"--good-a", "--p", "--r"}, false);
+  D8FlagBlacklist boundary;
+  for (int i = 0; i < 3; i++) {
+    boundary.RecordSpawn({"--good-a"}, true);
+  }
+  boundary.RecordSpawn({"--good-a", "--late"}, false);
+  const bool boundary_first = boundary.Blocked().empty();
+  boundary.RecordSpawn({"--good-a"}, true);
+  boundary.RecordSpawn({"--good-a", "--later"}, false);
+  D8FlagBlacklist no_starts;
+  no_starts.RecordSpawn({"--bad", "--c1"}, false);
+  no_starts.RecordSpawn({"--bad", "--c2"}, false);
+  D8FlagBlacklist tie;
+  for (int i = 0; i < 16; i++) {
+    tie.RecordSpawn({"--good-a"}, true);
+  }
+  tie.RecordSpawn({"--good-a", "--s", "--t"}, false);
+  tie.RecordSpawn({"--good-a", "--s", "--t"}, false);
+  checker->Check(
+      "test flags: D8FlagBlacklist blocks the flags that stop d8",
+      single.IsBlocked("--bad-flag") &&
+          filtered == std::vector<std::string>{"--ok-flag"} &&
+          early.Blocked().empty() &&
+          isolated.Blocked() == std::vector<std::string>{"--new-flag"} &&
+          repeated_first &&
+          repeated.Blocked() == std::vector<std::string>{"--p"} &&
+          repeated.failed_spawns() == 2 && tie.Blocked().empty() &&
+          no_starts.Blocked() == std::vector<std::string>{"--bad"} &&
+          boundary_first &&
+          boundary.Blocked() == std::vector<std::string>{"--later"},
+      "");
+
+  // The flag pools of normal mode and the blacklist in DrawD8Flags.
+  TunableRegistry& tunable_reg = TunableRegistry::Instance();
+  std::string tunable_err;
+  const bool set_ok =
+      tunable_reg.Set("flags.imported_chance", 1.0, &tunable_err) &&
+      tunable_reg.Set("flags.target_keep_chance", 1.0, &tunable_err);
+  FuzzConfig cfg;
+  cfg.randomize_d8_flags = true;
+  Fuzzer fuzzer(std::move(cfg));
+  fuzzer.RecordImportedFlags({"--imported-sentinel", "--blocked-sentinel"});
+  fuzzer.RecordSpawn({"--blocked-sentinel"}, false);
+  fuzzer.RecordProductiveFlags({"--productive-a"}, 10, 1000);
+  const size_t productive_first = fuzzer.productive_flag_sets();
+  fuzzer.RecordProductiveFlags({"--productive-b"}, 100, 1000);
+  fuzzer.RecordProductiveFlags({"--productive-c"}, 0, 1000);
+  Random draw_rng(11);
+  int imported = 0;
+  int blocked = 0;
+  for (int i = 0; i < 50; i++) {
+    const std::vector<std::string> drawn = fuzzer.DrawD8Flags(draw_rng);
+    imported += contains(drawn, "--imported-sentinel") ? 1 : 0;
+    blocked += contains(drawn, "--blocked-sentinel") ? 1 : 0;
+  }
+  tunable_reg.Set("flags.imported_chance", 0.0, &tunable_err);
+  tunable_reg.Set("flags.affinity_chance", 1.0, &tunable_err);
+  int productive = 0;
+  for (int i = 0; i < 50; i++) {
+    productive +=
+        contains(fuzzer.DrawD8Flags(draw_rng), "--productive-b") ? 1 : 0;
+  }
+  tunable_reg.Reset();
+  checker->Check(
+      "test flags: DrawD8Flags uses the imported and productive flag sets",
+      set_ok && imported == 50 && blocked == 0 && productive_first == 0 &&
+          fuzzer.productive_flag_sets() == 1 && productive == 50,
+      StringPrintf("imported %d, blocked %d, productive sets %zu then %zu, "
+                   "productive %d",
+                   imported, blocked, productive_first,
+                   fuzzer.productive_flag_sets(), productive));
+
+  // A fake target: /bin/sh does the REPRL handshake and answers each
+  // execution with the status 0. An unknown option stops /bin/sh before the
+  // handshake. The file `fail_file` also stops it.
+  const std::string fail_file =
+      StringPrintf("/tmp/redline-spawn-fail.%d", static_cast<int>(getpid()));
+  unlink(fail_file.c_str());
+  ReprlChild::Options reprl;
+  reprl.executable = "/bin/sh";
+  reprl.args = {"-c",
+                "[ -e \"$FAIL_FILE\" ] && exit 3; "
+                "printf HELO >&101; head -c 4 <&100 >/dev/null; "
+                "while head -c 12 <&100 >/dev/null; do "
+                "printf '\\000\\000\\000\\000' >&101; done"};
+  reprl.capture_stdout = false;
+  reprl.capture_stderr = false;
+  reprl.env = {{"PATH", "/usr/bin:/bin"}, {"FAIL_FILE", fail_file}};
+  reprl.startup_timeout_us = 10 * 1000 * 1000;
+  std::vector<std::string> next_args = {"--bad-sh-option"};
+  std::vector<std::pair<std::vector<std::string>, bool>> results;
+  reprl.random_args = [&next_args] { return next_args; };
+  reprl.spawn_result = [&results](const std::vector<std::string>& args,
+                                  bool started) {
+    results.emplace_back(args, started);
+  };
+  std::string reprl_err;
+  std::unique_ptr<ReprlChild> child =
+      ReprlChild::Create(std::move(reprl), &reprl_err);
+  Execution execution;
+  const bool first_ok =
+      child != nullptr &&
+      child->Execute("1", 1000 * 1000, &execution, &reprl_err) &&
+      execution.succeeded() && child->random_args().empty();
+  bool second_ok = false;
+  if (first_ok) {
+    next_args = {"-e"};
+    child->Kill();
+    second_ok = child->Execute("1", 1000 * 1000, &execution, &reprl_err) &&
+                execution.succeeded() &&
+                child->random_args() == std::vector<std::string>{"-e"};
+  }
+  checker->Check(
+      "test flags: a target that stops on its random flags starts again "
+      "without them",
+      first_ok && second_ok && results.size() == 2 &&
+          results[0].first == std::vector<std::string>{"--bad-sh-option"} &&
+          !results[0].second && results[1].second,
+      reprl_err);
+
+  // A pinned child keeps its flags when a new start fails. The failure is
+  // not a flag failure.
+  bool pinned_ok = false;
+  if (second_ok) {
+    child->Pin(true);
+    child->Kill();
+    std::string write_err;
+    const bool failed_start =
+        WriteStringToFile(fail_file, "", &write_err) &&
+        !child->Execute("1", 1000 * 1000, &execution, &reprl_err);
+    unlink(fail_file.c_str());
+    pinned_ok = failed_start &&
+                child->random_args() == std::vector<std::string>{"-e"} &&
+                child->Execute("1", 1000 * 1000, &execution, &reprl_err) &&
+                execution.succeeded() &&
+                child->random_args() == std::vector<std::string>{"-e"} &&
+                results.size() == 2;
+  }
+  checker->Check(
+      "test flags: a pinned target keeps its random flags after a failed start",
+      pinned_ok, StringPrintf("%zu spawn results", results.size()));
+}
+
+// Tests the compact donor window, the limits of Fuse and Combine and the
+// partner cache. `syntax` is nullptr if V8 did not initialize.
+void RunMaterialCompactChecks(Checker* checker, SyntaxChecker* syntax) {
+  auto v8_accepts = [&](const std::string& source, std::string* message) {
+    return syntax != nullptr && syntax->Accepts(source, message);
+  };
+
+  // 7. `ExtractCompactWindow` keeps large donors below `max_donor_nodes`.
+  {
+    std::string large_src = "function helper_used(v) { return v + 1; }\n";
+    for (int i = 0; i < 160; i++) {
+      large_src += StringPrintf("let unused_%d = %d + %d;\n", i, i, i + 1);
+    }
+    large_src += "let out_val = helper_used(41);\n";
+    std::string iife_src = "(function() { \"use strict\";\n";
+    for (int i = 0; i < 150; i++) {
+      iife_src += StringPrintf("let inner_%d = %d + 1;\n", i, i);
+    }
+    iife_src += "return inner_0; })();\n";
+
+    std::string parse_err;
+    ProgramPtr large_prog = Program::Parse(large_src, Lineage{}, &parse_err);
+    ProgramPtr iife_prog = Program::Parse(iife_src, Lineage{}, &parse_err);
+    Random window_rng(17);
+    std::unique_ptr<fast::Tree> copy1 =
+        large_prog != nullptr ? large_prog->CopyTree() : nullptr;
+    std::unique_ptr<fast::Tree> copy2 =
+        iife_prog != nullptr ? iife_prog->CopyTree() : nullptr;
+    const bool ok1 =
+        copy1 != nullptr &&
+        ExtractCompactWindow(copy1.get(), MaterialMaxDonorNodes(), window_rng);
+    const bool ok2 =
+        copy2 != nullptr &&
+        ExtractCompactWindow(copy2.get(), MaterialMaxDonorNodes(), window_rng);
+    const size_t n1 = copy1 != nullptr ? fast::CountNodes(copy1->root()) : 0;
+    const size_t n2 = copy2 != nullptr ? fast::CountNodes(copy2->root()) : 0;
+    std::string printed1 = ok1 ? fast::Print(copy1->root()) : "";
+    std::string printed2 = ok2 ? fast::Print(copy2->root()) : "";
+    fast::ParseError re1, re2;
+    std::string msg1, msg2;
+    const bool valid1 = ok1 && n1 <= MaterialMaxDonorNodes() &&
+                        fast::Parser::ParseScript(
+                            printed1, fast::ParseOptions(), &re1) != nullptr &&
+                        v8_accepts(printed1, &msg1);
+    const bool valid2 = ok2 && n2 <= MaterialMaxDonorNodes() &&
+                        fast::Parser::ParseScript(
+                            printed2, fast::ParseOptions(), &re2) != nullptr &&
+                        v8_accepts(printed2, &msg2);
+    checker->Check(
+        "material: ExtractCompactWindow extracts a valid bounded window",
+        large_prog != nullptr && large_prog->node_count() > 600 &&
+            iife_prog != nullptr && iife_prog->node_count() > 600 && valid1 &&
+            valid2,
+        StringPrintf("n1=%zu valid1=%d (%s) n2=%zu valid2=%d (%s)", n1, valid1,
+                     msg1.c_str(), n2, valid2, msg2.c_str()));
+
+    ProgramPtr small_prog =
+        Program::Parse("let ok = 1;\n", Lineage{}, &parse_err);
+    ProgramPtr cycle_prog = Program::Parse(
+        "function cyc_a() { return cyc_b(); }\n"
+        "function cyc_b() { return cyc_a(); }\n"
+        "let big_a = cyc_a();\n"
+        "let extra_0 = 1;\nlet extra_1 = 2;\nlet extra_2 = 3;\n",
+        Lineage{}, &parse_err);
+    ProgramPtr dir_only =
+        Program::Parse("\"use strict\";\n", Lineage{}, &parse_err);
+    auto small_copy = small_prog->CopyTree();
+    auto cycle_copy = cycle_prog->CopyTree();
+    auto dir_copy = dir_only->CopyTree();
+    const bool small_kept =
+        ExtractCompactWindow(small_copy.get(), 300, window_rng) &&
+        fast::CountNodes(small_copy->root()) == small_prog->node_count();
+    const bool cycle_ok =
+        ExtractCompactWindow(cycle_copy.get(), 30, window_rng) &&
+        fast::CountNodes(cycle_copy->root()) <= 30;
+    const bool dir_empty = !ExtractCompactWindow(dir_copy.get(), 5, window_rng);
+    checker->Check(
+        "material: ExtractCompactWindow handles small, cyclic and "
+        "directive-only trees",
+        small_kept && cycle_ok && dir_empty,
+        StringPrintf("small=%d cycle=%d dir_empty=%d", small_kept, cycle_ok,
+                     dir_empty));
+  }
+
+  // 8. `FusePrograms` respects `max_fuse_nodes` and emits cross-donor glue.
+  {
+    std::string big_a = "function alpha_fn(x) { return x + 1; }\n";
+    std::string big_b = "class BetaCls { compute(y) { return y * 2; } }\n";
+    for (int i = 0; i < 180; i++) {
+      big_a += StringPrintf("let fill_a_%d = %d + 2;\n", i, i);
+      big_b += StringPrintf("let fill_b_%d = %d + 3;\n", i, i);
+    }
+    big_a += "let res_a = alpha_fn(5);\n";
+    big_b += "let res_b = new BetaCls();\n";
+    std::string parse_err;
+    ProgramPtr pa = Program::Parse(big_a, Lineage{}, &parse_err);
+    ProgramPtr pb = Program::Parse(big_b, Lineage{}, &parse_err);
+    std::shared_ptr<Program> mut_pb =
+        Program::Parse(big_b, Lineage{}, &parse_err);
+    if (mut_pb != nullptr) {
+      mut_pb->flags = {"--maglev"};
+    }
+    Random fuse_rng(23);
+    ProgramPtr big_fused = FusePrograms({pa, pb}, "cap_check", &fuse_rng);
+    std::string v8_big_msg;
+    const bool cap_ok = big_fused != nullptr &&
+                        big_fused->node_count() <= MaterialMaxFuseNodes() &&
+                        v8_accepts(big_fused->source(), &v8_big_msg);
+
+    // Lexical splits expand nodes by more than 2x. Verify that the first
+    // donor obeys `max_fuse_nodes` and excluded donors drop their flags.
+    std::string split_decls;
+    for (int i = 0; i < 32; i++) {
+      split_decls += StringPrintf("let [a_%d, b_%d, c_%d] = x;\n", i, i, i);
+    }
+    std::string multi_decl = "let m0 = 0";
+    for (int i = 1; i < 96; i++) {
+      multi_decl += StringPrintf(", m%d = %d", i, i);
+    }
+    multi_decl += ";\n";
+    ProgramPtr split_prog = Program::Parse(split_decls, Lineage{}, &parse_err);
+    ProgramPtr multi_prog = Program::Parse(multi_decl, Lineage{}, &parse_err);
+    ProgramPtr split_fused =
+        FusePrograms({split_prog, mut_pb}, "split_cap", &fuse_rng);
+    ProgramPtr multi_fused = FusePrograms({multi_prog}, "multi_cap", &fuse_rng);
+    std::string split_v8_msg, multi_v8_msg;
+    const bool split_ok = split_prog != nullptr &&
+                          split_prog->node_count() <= 300 &&
+                          split_fused != nullptr &&
+                          split_fused->node_count() <= MaterialMaxFuseNodes() &&
+                          v8_accepts(split_fused->source(), &split_v8_msg);
+    const bool multi_ok = multi_prog != nullptr &&
+                          multi_prog->node_count() <= 300 &&
+                          multi_fused != nullptr &&
+                          multi_fused->node_count() <= MaterialMaxFuseNodes() &&
+                          v8_accepts(multi_fused->source(), &multi_v8_msg);
+
+    TunableRegistry& tun_reg = TunableRegistry::Instance();
+    std::string tun_err;
+    tun_reg.Set("material.max_fuse_nodes", 200, &tun_err);
+    std::string tight_a;
+    for (int i = 0; i < 45; i++) {
+      tight_a += StringPrintf("let ta_%d = %d;\n", i, i);
+    }
+    std::shared_ptr<Program> tight_pa =
+        Program::Parse(tight_a, Lineage{}, &parse_err);
+    if (tight_pa != nullptr) {
+      tight_pa->flags = {"--turbofan"};
+    }
+    ProgramPtr tight_fused =
+        FusePrograms({tight_pa, mut_pb}, "tight_cap", &fuse_rng);
+    const bool tight_ok =
+        tight_fused != nullptr && tight_fused->node_count() <= 200 &&
+        tight_fused->flags == std::vector<std::string>{"--turbofan"};
+    tun_reg.Reset();
+
+    ProgramPtr ga = Program::Parse("const donor_alpha = x => x + 1;\n",
+                                   Lineage{}, &parse_err);
+    ProgramPtr gb = Program::Parse(
+        "function donor_beta(y) { return y * 2; }\n"
+        "let val_beta = {tag: 7};\n",
+        Lineage{}, &parse_err);
+    Random glue_rng(31);
+    ProgramPtr glue_fused = FusePrograms({ga, gb}, "glue_check", &glue_rng);
+    bool has_cross_try = false;
+    if (glue_fused != nullptr) {
+      for (const fast::Statement* s : glue_fused->tree().root()->body) {
+        if (!s->Is<fast::TryStatement>()) {
+          continue;
+        }
+        bool sees_a = false;
+        bool sees_b = false;
+        fast::Walk(const_cast<fast::Statement*>(s), [&](fast::Node* n) {
+          if (auto* id = n->As<fast::Identifier>()) {
+            if (id->name == "donor_alpha") {
+              sees_a = true;
+            }
+            if (id->name == "donor_beta" || id->name == "val_beta") {
+              sees_b = true;
+            }
+          }
+          return true;
+        });
+        if (sees_a && sees_b) {
+          has_cross_try = true;
+          break;
+        }
+      }
+    }
+    std::string v8_glue_msg;
+    const bool glue_ok = glue_fused != nullptr && has_cross_try &&
+                         v8_accepts(glue_fused->source(), &v8_glue_msg);
+    checker->Check(
+        "material: FusePrograms caps AST nodes and emits cross-donor glue",
+        cap_ok && split_ok && multi_ok && tight_ok && glue_ok,
+        !cap_ok ? v8_big_msg
+                : (!split_ok
+                       ? split_v8_msg
+                       : (!multi_ok
+                              ? multi_v8_msg
+                              : (!tight_ok ? "tight max_fuse_nodes failed"
+                                           : (has_cross_try
+                                                  ? v8_glue_msg
+                                                  : (glue_fused != nullptr
+                                                         ? glue_fused->source()
+                                                         : parse_err))))));
+  }
+
+  // 9. `Combine` caps oversized partner pasting and `Splice` caches partners.
+  {
+    std::string parse_err;
+    ProgramPtr parent =
+        Program::Parse("function host(v) { return v + 1; }\nlet h = host(2);\n",
+                       Lineage{}, &parse_err);
+    std::string partner_src = "function pfn(x) { return x * 2; }\n";
+    for (int i = 0; i < 160; i++) {
+      partner_src += StringPrintf("let pvar_%d = %d + 1;\n", i, i);
+    }
+    partner_src += "let pres = pfn(3);\n";
+    ProgramPtr partner = Program::Parse(partner_src, Lineage{}, &parse_err);
+    auto mutators = MutatorSet::CreateDefault();
+    auto generators = GeneratorSet::CreateDefault();
+    Mutator* combine = mutators->Find("Combine");
+    Mutator* splice = mutators->Find("Splice");
+    Random mut_rng(99);
+    std::string detail;
+    std::unique_ptr<fast::Tree> combined =
+        (parent != nullptr && partner != nullptr && combine != nullptr)
+            ? ApplyMutation(*combine, *parent, partner, mut_rng,
+                            Environment::Default(), *generators, 1, &detail)
+            : nullptr;
+    std::unique_ptr<fast::Tree> spliced =
+        (parent != nullptr && partner != nullptr && splice != nullptr)
+            ? ApplyMutation(*splice, *parent, partner, mut_rng,
+                            Environment::Default(), *generators, 7, &detail)
+            : nullptr;
+    const size_t comb_nodes =
+        combined != nullptr ? fast::CountNodes(combined->root()) : 0;
+    const size_t comb_limit = MaterialMaxCombineNodes() +
+                              (parent != nullptr ? parent->node_count() : 0) +
+                              16;
+    std::string comb_msg, spl_msg;
+    const bool comb_ok = combined != nullptr && comb_nodes <= comb_limit &&
+                         v8_accepts(fast::Print(combined->root()), &comb_msg);
+    const bool spl_ok = spliced != nullptr &&
+                        v8_accepts(fast::Print(spliced->root()), &spl_msg);
+    bool cache_ok = false;
+    if (parent != nullptr && partner != nullptr && splice != nullptr) {
+      auto parent_copy = parent->CopyTree();
+      Random cache_rng(13);
+      Builder b(parent_copy.get(), &cache_rng);
+      MutationContext ctx;
+      ctx.partner = partner;
+      ctx.env = &Environment::Default();
+      ctx.generators = generators.get();
+      splice->Mutate(b, ctx);
+      const void* first_cache = ctx.partner_cache.get();
+      splice->Mutate(b, ctx);
+      const bool reused =
+          first_cache != nullptr && ctx.partner_cache.get() == first_cache;
+      ctx.partner = parent;
+      splice->Mutate(b, ctx);
+      const bool invalidated = ctx.partner_cache != nullptr &&
+                               ctx.partner_cache.get() != first_cache;
+      cache_ok = reused && invalidated;
+    }
+    checker->Check(
+        "material: Combine caps large partners and multi-round Splice succeeds",
+        partner != nullptr && partner->node_count() > 600 && comb_ok &&
+            spl_ok && cache_ok,
+        StringPrintf("comb=%zu/%zu (%s) spl=%s (%zu nodes) cache=%d",
+                     comb_nodes, comb_limit, comb_msg.c_str(), spl_msg.c_str(),
+                     spliced != nullptr ? fast::CountNodes(spliced->root()) : 0,
+                     cache_ok));
+  }
+}
+
+void RunMaterialChecks(Checker* checker) {
+  std::string v8_err;
+  // V8 initializes only once per process. Use the default fuzz flags so that
+  // later checks that need `--allow-natives-syntax` still work.
+  const bool v8_ok = InitializeV8(FuzzConfig().v8_flags, &v8_err);
+  checker->Check("material: initialize V8 syntax checker", v8_ok, v8_err);
+  std::unique_ptr<SyntaxChecker> syntax;
+  if (v8_ok) {
+    syntax = std::make_unique<SyntaxChecker>();
+  }
+  auto v8_accepts = [&](const std::string& source, std::string* message) {
+    return syntax != nullptr && syntax->Accepts(source, message);
+  };
+
+  // 1. Repeatable `--material` flags and JSON config roundtrip.
+  {
+    const char* argv[] = {"redline", "fuzz", "--material=/tmp/m1",
+                          "--material=/tmp/m2,/tmp/m3", "--material-max=42"};
+    Flags flags = Flags::Parse(5, argv, 2);
+    FuzzConfig config;
+    std::string error;
+    const bool loaded =
+        FuzzConfig::Load(flags, &config, &error, /*for_run=*/false);
+    const std::vector<std::string> expected_paths = {"/tmp/m1", "/tmp/m2",
+                                                     "/tmp/m3"};
+    JsonValue json;
+    FuzzConfig reloaded;
+    const bool dumped_ok = loaded &&
+                           JsonValue::Parse(config.ToJson(), &json, &error) &&
+                           FuzzConfig::LoadJsonForTest(json, &reloaded, &error);
+    checker->Check(
+        "material: repeatable --material flags and config keys roundtrip",
+        dumped_ok && config.material_paths == expected_paths &&
+            config.material_max == 42 &&
+            reloaded.material_paths == expected_paths &&
+            reloaded.material_max == 42,
+        error);
+    TunableRegistry::Instance().Reset();
+  }
+
+  // Repeated flags: the last value wins for scalar getters, `ToString` keeps
+  // all values.
+  {
+    const char* argv[] = {"redline",  "fuzz", "--name=a",
+                          "--name=b", "--on", "--no-on"};
+    Flags flags = Flags::Parse(6, argv, 2);
+    const std::string rendered = flags.ToString();
+    checker->Check(
+        "material: repeated flags keep the last value and render all values",
+        flags.GetString("name") == "b" && !flags.GetBool("on", true) &&
+            rendered == "--name=a --name=b --on=true --on=false",
+        rendered);
+  }
+
+  // 2. Loading, ClusterFuzz filters, `128` KB cap, and deterministic reservoir.
+  char dir_template[] = "/tmp/redline-material.XXXXXX";
+  if (mkdtemp(dir_template) == nullptr) {
+    checker->Check("material: create a temporary directory", false,
+                   strerror(errno));
+    return;
+  }
+  const std::string dir = dir_template;
+  std::string err;
+  const bool dirs_ok =
+      MakeDirectories(dir + "/bank/sqlite", &err) &&
+      MakeDirectories(dir + "/bank/embenchen", &err) &&
+      MakeDirectories(dir + "/bank/poppler", &err) &&
+      MakeDirectories(dir + "/bank/test262/safe", &err) &&
+      MakeDirectories(dir + "/bank/test262/early-errors", &err) &&
+      MakeDirectories(dir + "/bank/v8/test/inspector", &err) &&
+      MakeDirectories(dir + "/bank/v8/test/mjsunit/tools", &err) &&
+      MakeDirectories(dir + "/bank/v8/test/mjsunit/d8/cwd", &err) &&
+      MakeDirectories(dir + "/bank/v8/test/message", &err) &&
+      MakeDirectories(dir + "/bank/mozilla/data/e4x", &err) &&
+      MakeDirectories(dir + "/bank/root/test", &err) &&
+      MakeDirectories(dir + "/reservoir", &err);
+
+  const std::string ok_prefix = "var ok = 1;\n";
+  const std::string big_prefix = "var big = 1;\n";
+  const std::string pad_ok(MaterialBank::kMaxFileBytes - 1 - ok_prefix.size(),
+                           ' ');
+  const std::string pad_big(MaterialBank::kMaxFileBytes - big_prefix.size(),
+                            ' ');
+  bool files_ok = dirs_ok;
+  auto write_file = [&](const std::string& rel, const std::string& body) {
+    files_ok = files_ok && WriteStringToFile(dir + rel, body, &err);
+  };
+  // 5 kept files (including a safe `test262` file outside skipped directories).
+  write_file("/bank/keep.js", "var mat_keep = 1;\n");
+  write_file("/bank/size_ok.js", ok_prefix + pad_ok);
+  write_file("/bank/root/test/helper.js",
+             "function helperFromRoot() { return 7; }\n");
+  write_file("/bank/load_user.js",
+             "load(\"test/helper.js\");\nhelperFromRoot();\n");
+  write_file("/bank/good_flags.js",
+             "// Flags: --harmony-shipping --js-staging "
+             "--allow-natives-syntax\nvar flagged = 1;\n");
+  write_file("/bank/test262/safe/a.js", "var t262_safe = 1;\n");
+  // 27 skipped entries (names, directories, size cap, flags, module, empty).
+  write_file("/bank/d8-os.js", "var s = 1;\n");
+  write_file("/bank/unicode-test.js", "var s = 1;\n");
+  write_file("/bank/modules_a.js", "var s = 1;\n");
+  write_file("/bank/regexp-property-a.js", "var s = 1;\n");
+  write_file("/bank/foozzie-a.js", "var s = 1;\n");
+  write_file("/bank/numops-fuzz-part1.js", "var s = 1;\n");
+  write_file("/bank/d8-finalization-registry-quit.js", "var s = 1;\n");
+  write_file("/bank/regress-444805.js", "var s = 1;\n");
+  write_file("/bank/sqlite/a.js", "var s = 1;\n");
+  write_file("/bank/embenchen/a.js", "var s = 1;\n");
+  write_file("/bank/poppler/a.js", "var s = 1;\n");
+  write_file("/bank/test262/early-errors/b.js", "var t262_early = 1;\n");
+  write_file("/bank/v8/test/inspector/a.js", "var s = 1;\n");
+  write_file("/bank/v8/test/mjsunit/tools/a.js", "var s = 1;\n");
+  write_file("/bank/v8/test/mjsunit/d8/cwd/a.js", "var s = 1;\n");
+  write_file("/bank/v8/test/message/a.js", "var s = 1;\n");
+  write_file("/bank/mozilla/data/e4x/a.js", "var s = 1;\n");
+  write_file("/bank/too_big.js", "var big = 1;\n" + pad_big);
+  write_file("/bank/flag_sandbox.js",
+             "// Flags: --sandbox-testing\nvar s = 1;\n");
+  write_file("/bank/flag_fuzzing.js",
+             "// Flags: --sandbox-fuzzing\nvar s = 1;\n");
+  write_file("/bank/flag_trigger.js",
+             "// Flags: --expose-trigger-failure\nvar s = 1;\n");
+  write_file("/bank/flag_harmony.js",
+             "// Flags: --harmony-weak-refs\nvar s = 1;\n");
+  write_file("/bank/flag_js.js", "// Flags: --js-decorators\nvar s = 1;\n");
+  write_file("/bank/module_header.js", "// MODULE\nvar s = 1;\n");
+  write_file("/bank/flag_mjs.js", "// Flags: foo.mjs\nvar s = 1;\n");
+  write_file("/bank/flag_module.js", "// Flags: --module\nvar s = 1;\n");
+  write_file("/bank/empty_body.js", "// Only a comment.\n");
+  // 1 parse error.
+  write_file("/bank/syntax_error.js", "function ( {}\n");
+
+  MaterialBank bank;
+  MaterialBank::Options opts;
+  opts.paths = {dir + "/bank/keep.js",
+                dir + "/bank/size_ok.js",
+                dir + "/bank/load_user.js",
+                dir + "/bank/good_flags.js",
+                dir + "/bank/d8-os.js",
+                dir + "/bank/unicode-test.js",
+                dir + "/bank/modules_a.js",
+                dir + "/bank/regexp-property-a.js",
+                dir + "/bank/foozzie-a.js",
+                dir + "/bank/numops-fuzz-part1.js",
+                dir + "/bank/d8-finalization-registry-quit.js",
+                dir + "/bank/regress-444805.js",
+                dir + "/bank/sqlite",
+                dir + "/bank/embenchen",
+                dir + "/bank/poppler",
+                dir + "/bank/test262",
+                dir + "/bank/v8/test/inspector",
+                dir + "/bank/v8/test/mjsunit/tools",
+                dir + "/bank/v8/test/mjsunit/d8/cwd",
+                dir + "/bank/v8/test/message",
+                dir + "/bank/mozilla/data/e4x",
+                dir + "/bank/too_big.js",
+                dir + "/bank/flag_sandbox.js",
+                dir + "/bank/flag_fuzzing.js",
+                dir + "/bank/flag_trigger.js",
+                dir + "/bank/flag_harmony.js",
+                dir + "/bank/flag_js.js",
+                dir + "/bank/module_header.js",
+                dir + "/bank/flag_mjs.js",
+                dir + "/bank/flag_module.js",
+                dir + "/bank/empty_body.js",
+                dir + "/bank/syntax_error.js"};
+  opts.import_root = dir + "/bank/root";
+  opts.max_programs = 100;
+  opts.seed = 42;
+  const MaterialBank::LoadStats stats = bank.Load(opts);
+  bool inlined_helper = false;
+  bool loaded_safe_t262 = false;
+  bool loaded_early_t262 = false;
+  for (const ProgramPtr& p : bank.programs()) {
+    if (p->source().find("helperFromRoot") != std::string::npos &&
+        p->source().find("return 7") != std::string::npos) {
+      inlined_helper = true;
+    }
+    if (p->source().find("t262_safe") != std::string::npos) {
+      loaded_safe_t262 = true;
+    }
+    if (p->source().find("t262_early") != std::string::npos) {
+      loaded_early_t262 = true;
+    }
+  }
+  Random pick_rng(7);
+  ProgramPtr picked = bank.Pick(pick_rng);
+  checker->Check(
+      "material: MaterialBank applies filters, size cap, flags, and inlining",
+      files_ok && stats.scanned == 33 && stats.loaded == 5 &&
+          stats.skipped == 27 && stats.errors == 1 && bank.size() == 5 &&
+          inlined_helper && loaded_safe_t262 && !loaded_early_t262 &&
+          picked != nullptr,
+      StringPrintf("scanned=%zu loaded=%zu skipped=%zu errors=%zu",
+                   stats.scanned, stats.loaded, stats.skipped, stats.errors));
+
+  // Deterministic reservoir sampling cap.
+  for (int i = 0; i < 10; i++) {
+    write_file(StringPrintf("/reservoir/f%02d.js", i),
+               StringPrintf("let item_%d = %d;\n", i, i));
+  }
+  MaterialBank res_a, res_b, res_c;
+  MaterialBank::Options res_opts;
+  res_opts.paths = {dir + "/reservoir"};
+  res_opts.max_programs = 4;
+  res_opts.seed = 1337;
+  res_a.Load(res_opts);
+  res_b.Load(res_opts);
+  res_opts.seed = 9999;
+  res_c.Load(res_opts);
+  bool match_ab = res_a.size() == 4 && res_b.size() == 4;
+  if (match_ab) {
+    for (size_t i = 0; i < 4; i++) {
+      if (res_a.programs()[i]->source() != res_b.programs()[i]->source()) {
+        match_ab = false;
+      }
+    }
+  }
+  bool diff_ac = res_c.size() == 4;
+  if (diff_ac) {
+    bool same = true;
+    for (size_t i = 0; i < 4; i++) {
+      if (res_a.programs()[i]->source() != res_c.programs()[i]->source()) {
+        same = false;
+      }
+    }
+    diff_ac = !same;
+  }
+  checker->Check("material: reservoir sampling caps and is deterministic",
+                 match_ab && diff_ac, "");
+
+  // 3. IIFE unwrapping of safe and unsafe IIFEs.
+  {
+    std::string safe_src =
+        "outerRef();\n"
+        "(function() { function innerFn() { return 1; } let x = innerFn(); "
+        "function outerRef() {} })();\n"
+        "(() => { const x = 2; })();\n";
+    fast::ParseError perr;
+    std::unique_ptr<fast::Tree> safe_tree =
+        fast::Parser::ParseScript(safe_src, fast::ParseOptions(), &perr);
+    const bool unwrapped =
+        safe_tree != nullptr && UnwrapTopLevelIIFEs(safe_tree.get());
+    bool no_top_call = safe_tree != nullptr;
+    if (safe_tree != nullptr) {
+      for (const fast::Statement* s : safe_tree->root()->body) {
+        if (auto* es = s->As<fast::ExpressionStatement>()) {
+          if (es->expression != nullptr &&
+              es->expression->Is<fast::CallExpression>() &&
+              es->expression->Cast<fast::CallExpression>()->callee != nullptr &&
+              (es->expression->Cast<fast::CallExpression>()
+                   ->callee->Is<fast::FunctionExpression>() ||
+               es->expression->Cast<fast::CallExpression>()
+                   ->callee->Is<fast::ArrowFunctionExpression>())) {
+            no_top_call = false;
+          }
+        }
+      }
+    }
+    const std::string printed =
+        safe_tree != nullptr ? fast::Print(safe_tree->root()) : "";
+    std::string v8_msg;
+    const bool v8_valid = safe_tree != nullptr && v8_accepts(printed, &v8_msg);
+    const bool fast_valid =
+        fast::Parser::ParseScript(printed, fast::ParseOptions(), &perr) !=
+        nullptr;
+    checker->Check("material: UnwrapTopLevelIIFEs unwraps safe IIFEs cleanly",
+                   unwrapped && no_top_call && v8_valid && fast_valid,
+                   v8_valid ? perr.ToString() : v8_msg);
+
+    const char* unsafe_cases[] = {
+        "(function() { return 1; })();",
+        "(function() { arguments[0]; })();",
+        "(function() { this.x = 1; })();",
+        "(() => { this.x = 1; })();",
+        "(function(a) { let x = a; })(1);",
+        "(async function() { let x = 1; })();",
+        "(function*() { yield 1; })();",
+        "(function self() { self; })();",
+        "(function() { \"use strict\"; let z = 1; })();",
+        "(function() { using u = null; })();",
+        "(function() { class C { [new.target] = 1; } })();",
+    };
+    bool all_kept = true;
+    std::string failed_case;
+    for (const char* src : unsafe_cases) {
+      fast::ParseError uerr;
+      std::unique_ptr<fast::Tree> utree =
+          fast::Parser::ParseScript(src, fast::ParseOptions(), &uerr);
+      if (utree == nullptr || UnwrapTopLevelIIFEs(utree.get())) {
+        all_kept = false;
+        failed_case = src;
+        break;
+      }
+    }
+    checker->Check(
+        "material: UnwrapTopLevelIIFEs keeps return, arguments, this, param, "
+        "using and computed new.target IIFEs intact",
+        all_kept, failed_case);
+  }
+
+  // 4. `FusePrograms` merges 2 or 3 colliding donors safely.
+  {
+    std::string parse_err;
+    ProgramPtr d1 = Program::Parse(
+        "(function() { function helper(v) { return v + 1; } "
+        "let x = helper(10); const k = 1; class Box { v() { return x; } } "
+        "throw new Error(\"boom\"); })();\n",
+        Lineage{}, &parse_err);
+    ProgramPtr d2 = Program::Parse(
+        "function helper(z) { return z * 2; }\n"
+        "let x = helper(5);\nconst k = 2;\nclass Box {}\n"
+        "const {a, b: c} = {a: 3, b: 4};\n"
+        "var ok_var = x + k + a + c;\n",
+        Lineage{}, &parse_err);
+    ProgramPtr d3 = Program::Parse(
+        "(() => { let x = 99; const k = 3; function helper() { return x; } "
+        "helper(); })();\n",
+        Lineage{}, &parse_err);
+
+    checker->Check("material: FusePrograms returns nullptr on empty donors",
+                   FusePrograms({}, "") == nullptr, "");
+
+    ProgramPtr fused2 = FusePrograms({d1, d2}, "2 donors");
+    ProgramPtr fused3 = FusePrograms({d1, d2, d3}, "3 donors");
+    bool has_top_fn = false;
+    bool has_top_class = false;
+    bool has_top_let = false;
+    bool has_try = false;
+    if (fused3 != nullptr) {
+      for (const fast::Statement* s : fused3->tree().root()->body) {
+        if (s->Is<fast::FunctionDeclaration>()) {
+          has_top_fn = true;
+        } else if (s->Is<fast::ClassDeclaration>()) {
+          has_top_class = true;
+        } else if (s->Is<fast::VariableDeclaration>() &&
+                   s->Cast<fast::VariableDeclaration>()->declaration_kind ==
+                       fast::VariableKind::kLet) {
+          has_top_let = true;
+        } else if (s->Is<fast::TryStatement>()) {
+          has_try = true;
+        }
+      }
+    }
+    fast::ParseError reerr2, reerr3;
+    std::string v8_msg2, v8_msg3;
+    const bool ok2 =
+        fused2 != nullptr && fused2->lineage().origin == "Fuse" &&
+        fast::Parser::ParseScript(fused2->source(), fast::ParseOptions(),
+                                  &reerr2) != nullptr &&
+        v8_accepts(fused2->source(), &v8_msg2);
+    const bool ok3 =
+        fused3 != nullptr && fused3->lineage().origin == "Fuse" &&
+        fused3->lineage().detail == "3 donors" && has_top_fn && has_top_class &&
+        has_top_let && has_try &&
+        fast::Parser::ParseScript(fused3->source(), fast::ParseOptions(),
+                                  &reerr3) != nullptr &&
+        v8_accepts(fused3->source(), &v8_msg3);
+    checker->Check(
+        "material: FusePrograms merges 2 and 3 donors with valid syntax",
+        ok2 && ok3,
+        !ok2 ? (v8_msg2.empty() ? reerr2.ToString() : v8_msg2)
+             : (v8_msg3.empty() ? reerr3.ToString() : v8_msg3));
+  }
+
+  // 5. `FusePrograms` keeps `using` in a block and runs class definitions that
+  // can throw inside `try {} catch {}`.
+  {
+    std::string parse_err;
+    ProgramPtr using_donor =
+        Program::Parse("(function() { using u = null; let w = 1; })();\n",
+                       Lineage{}, &parse_err);
+    ProgramPtr class_donor = Program::Parse(
+        "class Base {}\n"
+        "class Derived extends Base { static s = missing(); }\n"
+        "class Keyed { [Symbol.iterator]() {} }\n"
+        "class Plain { m() { return Plain; } }\n"
+        "new Derived();\n",
+        Lineage{}, &parse_err);
+    ProgramPtr empty_donor = Program::Parse(";\n", Lineage{}, &parse_err);
+    ProgramPtr fused = FusePrograms({using_donor, class_donor}, "isolation");
+    std::vector<std::string_view> top_classes;
+    bool has_top_using = false;
+    if (fused != nullptr) {
+      for (const fast::Statement* s : fused->tree().root()->body) {
+        if (auto* cls = s->As<fast::ClassDeclaration>()) {
+          top_classes.push_back(cls->name->name);
+        } else if (auto* vd = s->As<fast::VariableDeclaration>()) {
+          has_top_using =
+              has_top_using ||
+              vd->declaration_kind == fast::VariableKind::kUsing ||
+              vd->declaration_kind == fast::VariableKind::kAwaitUsing;
+        }
+      }
+    }
+    std::string v8_msg;
+    const bool valid = fused != nullptr && v8_accepts(fused->source(), &v8_msg);
+    const std::vector<std::string_view> expected_classes = {"Base", "Plain"};
+    const bool ok = valid && !has_top_using &&
+                    top_classes == expected_classes &&
+                    FusePrograms({empty_donor}, "empty") == nullptr;
+    std::string detail;
+    if (!ok) {
+      detail = fused != nullptr ? fused->source() + v8_msg : parse_err;
+    }
+    checker->Check(
+        "material: FusePrograms isolates using and throwing class definitions",
+        ok, detail);
+  }
+
+  // 6. `MaterialBank` keeps the allowed `// Flags:` of a file in
+  // `Program::flags`. `FusePrograms` merges the flags of its donors.
+  {
+    files_ok = files_ok && MakeDirectories(dir + "/flags", &err);
+    write_file("/flags/flagged.js",
+               "// Flags: --turbofan --no-lazy_feedback_allocation\n"
+               "// Flags: --allow-natives-syntax --print-bytecode\n"
+               "var material_flagged = 1;\n");
+    write_file("/flags/plain.js", "var material_plain = 1;\n");
+    MaterialBank flag_bank;
+    MaterialBank::Options flag_opts;
+    flag_opts.paths = {dir + "/flags"};
+    flag_opts.max_programs = 10;
+    flag_opts.seed = 42;
+    flag_bank.Load(flag_opts);
+    std::vector<std::string> flagged_flags;
+    std::vector<std::string> plain_flags = {"--not-loaded"};
+    for (const ProgramPtr& p : flag_bank.programs()) {
+      if (p->source().find("material_flagged") != std::string::npos) {
+        flagged_flags = p->flags;
+      } else if (p->source().find("material_plain") != std::string::npos) {
+        plain_flags = p->flags;
+      }
+    }
+    checker->Check(
+        "material: MaterialBank keeps the allowed `// Flags:` in "
+        "Program::flags",
+        files_ok && flag_bank.size() == 2 &&
+            flagged_flags ==
+                std::vector<std::string>{"--turbofan",
+                                         "--no-lazy-feedback-allocation"} &&
+            plain_flags.empty(),
+        StringPrintf("%zu programs, %zu and %zu flags", flag_bank.size(),
+                     flagged_flags.size(), plain_flags.size()));
+
+    std::string parse_err;
+    std::shared_ptr<Program> donor_a =
+        Program::Parse("var fuse_a = 1;\n", Lineage{}, &parse_err);
+    std::shared_ptr<Program> donor_b =
+        Program::Parse("var fuse_b = 2;\n", Lineage{}, &parse_err);
+    std::shared_ptr<Program> donor_c =
+        Program::Parse("var fuse_c = 3;\n", Lineage{}, &parse_err);
+    ProgramPtr fused;
+    ProgramPtr fused_plain;
+    if (donor_a != nullptr && donor_b != nullptr && donor_c != nullptr) {
+      donor_a->flags = {"--turbofan", "--interrupt-budget=1000"};
+      donor_b->flags = {"--no-turbofan", "--interrupt-budget=50", "--maglev"};
+      fused = FusePrograms({donor_a, donor_b, donor_c}, "flags");
+      fused_plain = FusePrograms({donor_c}, "plain");
+    }
+    const std::vector<std::string> expected_flags = {
+        "--turbofan", "--interrupt-budget=1000", "--maglev"};
+    checker->Check("material: FusePrograms merges the flags of its donors",
+                   fused != nullptr && fused->flags == expected_flags &&
+                       fused_plain != nullptr && fused_plain->flags.empty(),
+                   fused == nullptr
+                       ? parse_err
+                       : StringPrintf("%zu flags", fused->flags.size()));
+  }
+
+  RunMaterialCompactChecks(checker, syntax.get());
+
+  // 10. `RecordMaterialFlags` fills free pool slots without evicting seeds.
+  {
+    files_ok = files_ok && MakeDirectories(dir + "/pool_flags", &err);
+    write_file("/pool_flags/m1.js", "// Flags: --mat-flag-one\nlet m1 = 1;\n");
+    write_file("/pool_flags/m2.js", "// Flags: --mat-flag-two\nlet m2 = 2;\n");
+    MaterialBank pool_bank;
+    MaterialBank::Options pool_opts;
+    pool_opts.paths = {dir + "/pool_flags"};
+    pool_opts.max_programs = 10;
+    pool_opts.seed = 7;
+    pool_bank.Load(pool_opts);
+
+    FuzzConfig cfg_partial;
+    cfg_partial.randomize_d8_flags = true;
+    Fuzzer fuzzer_partial(std::move(cfg_partial));
+    fuzzer_partial.RecordImportedFlags({"--seed-flag-0"});
+    fuzzer_partial.RecordMaterialFlags(pool_bank);
+    const bool added_to_pool = fuzzer_partial.imported_flag_sets() == 3;
+
+    FuzzConfig cfg_full;
+    cfg_full.randomize_d8_flags = true;
+    Fuzzer fuzzer_full(std::move(cfg_full));
+    for (int i = 0; i < 2048; i++) {
+      fuzzer_full.RecordImportedFlags({StringPrintf("--seed-slot-%d", i)});
+    }
+    fuzzer_full.RecordMaterialFlags(pool_bank);
+    TunableRegistry& reg = TunableRegistry::Instance();
+    std::string reg_err;
+    reg.Set("flags.imported_chance", 1.0, &reg_err);
+    Random draw_rng(5);
+    bool saw_material = false;
+    for (int i = 0; i < 20; i++) {
+      for (const std::string& f : fuzzer_full.DrawD8Flags(draw_rng)) {
+        if (f == "--mat-flag-one" || f == "--mat-flag-two") {
+          saw_material = true;
+        }
+      }
+    }
+    reg.Reset();
+    checker->Check(
+        "material: RecordMaterialFlags fills free slots without evicting seeds",
+        files_ok && added_to_pool && fuzzer_full.imported_flag_sets() == 2048 &&
+            !saw_material,
+        StringPrintf("partial=%zu full=%zu saw_mat=%d",
+                     fuzzer_partial.imported_flag_sets(),
+                     fuzzer_full.imported_flag_sets(), saw_material));
+  }
+
+  RemoveTree(dir);
+}
+
 int RunSelftest(const Flags& flags) {
   Checker checker;
   std::string error;
@@ -2427,13 +5049,21 @@ int RunSelftest(const Flags& flags) {
   RunReprlBundleChecks(&checker);
   RunCoverageHeaderChecks(&checker);
   RunFuzzilliCoverageChecks(&checker);
+  RunFuzzilliOptimizedCoverageChecks(&checker);
+  RunRetentionChecks(&checker);
   RunD8FlagProfileChecks(&checker);
+  RunFuzzilliFlagProfileChecks(&checker);
   RunCoverageCounterChecks(&checker);
   RunCoverageBitsChecks(&checker);
   RunCrashSlotChecks(&checker);
   RunCrashMinimizerChecks(&checker);
+  RunCommitCostChecks(&checker);
+  RunCoalesceChecks(&checker);
   RunFlagMinimizerChecks(&checker);
   RunImportChecks(&checker);
+  RunSalvageChecks(&checker);
+  RunTestFlagChecks(&checker);
+  RunMaterialChecks(&checker);
   RunAmplifiedTestChecks(&checker);
   RunBundleStepChecks(&checker);
   RunNodeKindChecks(&checker);
@@ -2538,6 +5168,7 @@ int RunSelftest(const Flags& flags) {
                   result.execution.outcome == Outcome::kFailed,
                   Describe(result.execution));
   }
+  RunSalvageTargetCheck(&checker, runner.get());
 
   // Output channels.
   {
@@ -2862,6 +5493,7 @@ int RunSelftest(const Flags& flags) {
   RunCrashFlagsCheck(&checker, target, fuzzilli_target);
   RunCrashAmplifiedCheck(&checker, target, fuzzilli_target);
   RunCrashBundleCheck(&checker, target, fuzzilli_target);
+  RunImportAllCheck(&checker, target);
 
   printf("selftest: %d passed, %d failed\n", checker.passed(),
          checker.failed());

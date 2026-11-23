@@ -416,7 +416,7 @@ A reducer keeps only what its oracle measures.
 
 `--reducer=NAME,...` runs only these reducers, in this order.
 Without it, `minimize` runs all reducers.
-A session runs only `statements`, `unwrap`, `lists` and `expressions`, unless the configuration key `stages.minimize.reducers` names other reducers.
+A session runs only `dataflow`, `statements`, `unwrap`, `lists` and `expressions`, unless the configuration key `stages.minimize.reducers` names other reducers.
 For a crash, a session runs all reducers, `dataflow` first. The configuration key `crash_minimizer.reducers` sets another list.
 
 ### 5.6 Selection strategies
@@ -459,8 +459,9 @@ cat experimental/redline/presets/maglev.json
 
 - `d8_extra_args` adds flags to the d8 flags, like `--d8-extra-args`.
 - `randomize_d8_flags` gives each new d8 process a random set of extra flags, for example `--maglev-assert`.
-  `d8_flag_profile` selects the list of random flags: `maglev` (the default), `turbolev` or `fuzzilli` (`presets/fuzzilli.json`).
-  The `flags.*` tunables set the probabilities of `maglev` and `turbolev`. The `fuzzilli` profile uses the fixed probabilities of Fuzzilli.
+  `d8_flag_profile` selects the list of random flags: `maglev` (the default), `turbolev`, `runtime`, `fuzzilli` (`presets/fuzzilli.json`) or `fuzzilli-wasm` (`presets/wasm.json`).
+  The `flags.*` tunables set the probabilities of `maglev`, `turbolev` and `runtime`. The `fuzzilli` and `fuzzilli-wasm` profiles use the fixed probabilities of Fuzzilli.
+  `d8_trials` (`--d8-trials=PATH`) also draws the d8 trials of a trials file of ClusterFuzz, for example `tools/clusterfuzz/trials/clusterfuzz_trials_config.json`.
 - `selection` sets the strategies. `weights` sets the base weight of the named generators. The other generators keep their default weights.
 
 `--preset=maglev` loads `presets/maglev.json`. `--preset=FILE.json` loads any file.

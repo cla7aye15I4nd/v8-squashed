@@ -11,9 +11,12 @@
 #include "experimental/redline/base/log.h"
 #include "experimental/redline/core/adaptive_selector.h"
 #include "experimental/redline/core/ast_builder.h"
+#include "experimental/redline/core/swarm.h"
 #include "experimental/redline/core/tunable.h"
 #include "experimental/redline/core/weighted_selector.h"
+#include "experimental/redline/corpus/material.h"
 #include "experimental/redline/fast/printer.h"
+#include "experimental/redline/fast/requirements.h"
 #include "experimental/redline/generators/codegen.h"
 #include "experimental/redline/generators/values_generators.h"
 #include "experimental/redline/mutators/explore.h"
@@ -24,205 +27,21 @@ namespace redline {
 
 using namespace fast;  // NOLINT(build/namespaces)
 
+struct MutationContext::PartnerCache {
+  ProgramPtr partner;
+  std::unique_ptr<Tree> donor_tree;
+  std::unique_ptr<Random> donor_rng;
+  std::unique_ptr<Builder> donor;
+  std::vector<Node*> candidates;
+};
+
+MutationContext::MutationContext() = default;
+MutationContext::~MutationContext() = default;
+
 namespace {
 
 // --- subtree analysis
 // ------------------------------------------------------------
-
-// What a piece of code needs from its surroundings to stay syntactically
-// valid when moved elsewhere.
-struct Requirements {
-  bool needs_function = false;      // `return` outside a nested function
-  bool needs_async = false;         // `await` / for-await outside a nested fn
-  bool needs_generator = false;     // `yield`
-  bool needs_break = false;         // unlabeled `break` outside own loop/switch
-  bool needs_continue = false;      // unlabeled `continue` outside own loop
-  bool needs_sloppy = false;        // `with`, `delete x`, legacy octal
-  bool needs_arguments = false;     // `arguments` outside own non-arrow fn
-  bool needs_super = false;         // `super` outside own method
-  bool needs_new_target = false;    // `new.target` outside own function
-  bool has_external_label = false;  // labeled jump to a label not inside
-  bool has_lexical_declaration = false;  // top-level let/const/class
-  // Labels declared by the node itself (outside nested functions): the
-  // destination must not already be inside a label of the same name.
-  std::vector<std::string_view> declared_labels;
-};
-
-bool IsLegacyOctal(std::string_view raw) {
-  if (raw.size() < 2 || raw[0] != '0') {
-    return false;
-  }
-  return raw[1] >= '0' && raw[1] <= '9';
-}
-
-class RequirementsAnalyzer {
- public:
-  Requirements Analyze(Node* root) {
-    req_ = Requirements();
-    if (root->Is<VariableDeclaration>()) {
-      VariableKind k = root->Cast<VariableDeclaration>()->declaration_kind;
-      req_.has_lexical_declaration = k != VariableKind::kVar;
-    } else if (root->Is<ClassDeclaration>()) {
-      req_.has_lexical_declaration = true;
-    }
-    Visit(root, 0, 0, 0, 0);
-    return req_;
-  }
-
- private:
-  void Visit(Node* node, int fn_depth, int this_fn_depth, int loop_depth,
-             int switch_depth) {
-    if (node == nullptr) {
-      return;
-    }
-    switch (node->kind) {
-      case NodeKind::kReturnStatement:
-        if (fn_depth == 0) {
-          req_.needs_function = true;
-        }
-        break;
-      case NodeKind::kAwaitExpression:
-        if (fn_depth == 0) {
-          req_.needs_async = true;
-        }
-        break;
-      case NodeKind::kYieldExpression:
-        if (fn_depth == 0) {
-          req_.needs_generator = true;
-        }
-        break;
-      case NodeKind::kForOfStatement:
-        if (node->Cast<ForOfStatement>()->is_await && fn_depth == 0) {
-          req_.needs_async = true;
-        }
-        break;
-      case NodeKind::kBreakStatement: {
-        Identifier* label = node->Cast<BreakStatement>()->label;
-        if (label != nullptr) {
-          if (!HasLabel(label->name)) {
-            req_.has_external_label = true;
-          }
-        } else if (loop_depth == 0 && switch_depth == 0) {
-          req_.needs_break = true;
-        }
-        return;
-      }
-      case NodeKind::kContinueStatement: {
-        Identifier* label = node->Cast<ContinueStatement>()->label;
-        if (label != nullptr) {
-          if (!HasLabel(label->name)) {
-            req_.has_external_label = true;
-          }
-        } else if (loop_depth == 0) {
-          req_.needs_continue = true;
-        }
-        return;
-      }
-      case NodeKind::kWithStatement:
-        req_.needs_sloppy = true;
-        break;
-      case NodeKind::kUnaryExpression: {
-        auto* u = node->Cast<UnaryExpression>();
-        if (u->op == UnaryOp::kDelete && u->argument->Is<Identifier>()) {
-          req_.needs_sloppy = true;
-        }
-        break;
-      }
-      case NodeKind::kNumericLiteral:
-        if (IsLegacyOctal(node->Cast<NumericLiteral>()->raw)) {
-          req_.needs_sloppy = true;
-        }
-        return;
-      case NodeKind::kIdentifier:
-        if (node->Cast<Identifier>()->name == "arguments" &&
-            this_fn_depth == 0) {
-          req_.needs_arguments = true;
-        }
-        return;
-      case NodeKind::kSuper:
-        if (this_fn_depth == 0) {
-          req_.needs_super = true;
-        }
-        return;
-      case NodeKind::kMetaProperty:
-        if (node->Cast<MetaProperty>()->meta_kind ==
-                MetaPropertyKind::kNewTarget &&
-            this_fn_depth == 0) {
-          req_.needs_new_target = true;
-        }
-        return;
-      case NodeKind::kFunctionDeclaration:
-      case NodeKind::kFunctionExpression:
-      case NodeKind::kArrowFunctionExpression: {
-        const FunctionData* fn = AsFunctionData(node);
-        int next_this = this_fn_depth + (fn->is_arrow ? 0 : 1);
-        std::vector<std::string_view> saved = std::move(labels_);
-        labels_.clear();
-        ForEachChild(node, [&](Node* child) {
-          Visit(child, fn_depth + 1, next_this, 0, 0);
-        });
-        labels_ = std::move(saved);
-        return;
-      }
-      case NodeKind::kPropertyDefinition:
-      case NodeKind::kStaticBlock: {
-        std::vector<std::string_view> saved = std::move(labels_);
-        labels_.clear();
-        ForEachChild(node, [&](Node* child) {
-          Visit(child, fn_depth + 1, this_fn_depth + 1, 0, 0);
-        });
-        labels_ = std::move(saved);
-        return;
-      }
-      case NodeKind::kLabeledStatement: {
-        auto* l = node->Cast<LabeledStatement>();
-        if (fn_depth == 0) {
-          req_.declared_labels.push_back(l->label->name);
-        }
-        labels_.push_back(l->label->name);
-        Visit(l->body, fn_depth, this_fn_depth, loop_depth, switch_depth);
-        labels_.pop_back();
-        return;
-      }
-      case NodeKind::kWhileStatement:
-      case NodeKind::kDoWhileStatement:
-      case NodeKind::kForStatement:
-      case NodeKind::kForInStatement:
-        ForEachChild(node, [&](Node* child) {
-          Visit(child, fn_depth, this_fn_depth, loop_depth + 1, switch_depth);
-        });
-        return;
-      case NodeKind::kSwitchStatement:
-        ForEachChild(node, [&](Node* child) {
-          Visit(child, fn_depth, this_fn_depth, loop_depth, switch_depth + 1);
-        });
-        return;
-      default:
-        break;
-    }
-    if (node->Is<ForOfStatement>()) {
-      ForEachChild(node, [&](Node* child) {
-        Visit(child, fn_depth, this_fn_depth, loop_depth + 1, switch_depth);
-      });
-      return;
-    }
-    ForEachChild(node, [&](Node* child) {
-      Visit(child, fn_depth, this_fn_depth, loop_depth, switch_depth);
-    });
-  }
-
-  bool HasLabel(std::string_view name) const {
-    return std::find(labels_.begin(), labels_.end(), name) != labels_.end();
-  }
-
-  Requirements req_;
-  std::vector<std::string_view> labels_;
-};
-
-Requirements AnalyzeRequirements(Node* node) {
-  RequirementsAnalyzer analyzer;
-  return analyzer.Analyze(node);
-}
 
 bool Compatible(const Requirements& req, const Builder::Context& ctx) {
   if (req.has_external_label) {
@@ -837,7 +656,7 @@ class InputMutator final : public Mutator {
       std::vector<Variable> visible = b.VisibleAt(id);
       Binding* binding = scopes.BindingOf(id);
       JsType type =
-          binding != nullptr ? b.GuessType(binding) : JsType::kUnknown;
+          binding != nullptr ? b.GuessType(binding) : Builder::GuessType(id);
       std::vector<const Variable*> options;
       for (const Variable& v : visible) {
         if (v.name == id->name) {
@@ -1149,8 +968,9 @@ class InsertMutator final : public Mutator {
       }
       return g.Applicable(gen);
     };
-    size_t index =
-        set.selector().Pick(set.candidates(), gen.builder.rng(), eligible);
+    size_t index = PickWithMask<Generator>(set.selector(), set.candidates(),
+                                           gen.builder.rng(), eligible,
+                                           ActiveGeneratorMask());
     return index == Selector<Generator>::kNoChoice ? nullptr
                                                    : set.candidates()[index];
   }
@@ -2069,41 +1889,50 @@ class SpliceMutator final : public Mutator {
       return false;
     }
     Random& r = b.rng();
-    std::unique_ptr<Tree> donor_tree = ctx.partner->CopyTree();
-    Random donor_rng = r.Fork();
-    Builder donor(donor_tree.get(), &donor_rng);
-    std::vector<Node*> candidates = donor.Collect([&](Node* n) {
-      if (!n->IsStatement()) {
-        return false;
-      }
-      auto* s = n->Cast<Statement>();
-      if (IsDirective(s) || s->Is<EmptyStatement>() ||
-          s->Is<BreakStatement>() || s->Is<ContinueStatement>() ||
-          s->Is<ReturnStatement>() || s->Is<DebuggerStatement>()) {
-        return false;
-      }
-      // Loop heads (`for (const e of ...)`) are declarations without
-      // initializers: not statements on their own.
-      if (s->Is<VariableDeclaration>()) {
-        Node* parent = donor.ParentOf(n);
-        if (parent != nullptr &&
-            (parent->Is<ForStatement>() || parent->Is<ForInStatement>() ||
-             parent->Is<ForOfStatement>())) {
+    if (ctx.partner_cache == nullptr ||
+        ctx.partner_cache->partner.get() != ctx.partner.get()) {
+      auto cache = std::make_unique<MutationContext::PartnerCache>();
+      cache->partner = ctx.partner;
+      cache->donor_tree = ctx.partner->CopyTree();
+      cache->donor_rng = std::make_unique<Random>(r.Fork());
+      cache->donor = std::make_unique<Builder>(cache->donor_tree.get(),
+                                               cache->donor_rng.get());
+      cache->candidates = cache->donor->Collect([&](Node* n) {
+        if (!n->IsStatement()) {
           return false;
         }
-      }
-      // Code using a private name of its class cannot leave it.
-      if (UsesPrivateNameOfEnclosingClass(n)) {
-        return false;
-      }
-      size_t size = CountNodes(n);
-      size_t min_nodes = static_cast<size_t>(kSpliceMinDonorNodes.AsInt());
-      size_t max_nodes = static_cast<size_t>(kSpliceMaxDonorNodes.AsInt());
-      return size >= min_nodes && size <= max_nodes;
-    });
-    if (candidates.empty()) {
+        auto* s = n->Cast<Statement>();
+        if (IsDirective(s) || s->Is<EmptyStatement>() ||
+            s->Is<BreakStatement>() || s->Is<ContinueStatement>() ||
+            s->Is<ReturnStatement>() || s->Is<DebuggerStatement>()) {
+          return false;
+        }
+        // Loop heads (`for (const e of ...)`) are declarations without
+        // initializers: not statements on their own.
+        if (s->Is<VariableDeclaration>()) {
+          Node* parent = cache->donor->ParentOf(n);
+          if (parent != nullptr &&
+              (parent->Is<ForStatement>() || parent->Is<ForInStatement>() ||
+               parent->Is<ForOfStatement>())) {
+            return false;
+          }
+        }
+        // Code using a private name of its class cannot leave it.
+        if (UsesPrivateNameOfEnclosingClass(n)) {
+          return false;
+        }
+        size_t size = CountNodes(n);
+        size_t min_nodes = static_cast<size_t>(kSpliceMinDonorNodes.AsInt());
+        size_t max_nodes = static_cast<size_t>(kSpliceMaxDonorNodes.AsInt());
+        return size >= min_nodes && size <= max_nodes;
+      });
+      ctx.partner_cache = std::move(cache);
+    }
+    if (ctx.partner_cache->candidates.empty()) {
       return false;
     }
+    Builder& donor = *ctx.partner_cache->donor;
+    const std::vector<Node*>& candidates = ctx.partner_cache->candidates;
     for (int attempt = 0; attempt < kSpliceMaxAttempts.AsInt(); attempt++) {
       Node* donor_node = candidates[r.Index(candidates.size())];
       Requirements req = AnalyzeRequirements(donor_node);
@@ -2390,6 +2219,15 @@ class CombineMutator final : public Mutator {
     Random& r = b.rng();
     std::unique_ptr<Tree> donor_tree = ctx.partner->CopyTree();
     Random donor_rng = r.Fork();
+    const size_t max_combine_nodes = MaterialMaxCombineNodes();
+    if (ctx.partner->node_count() > max_combine_nodes) {
+      UnwrapTopLevelIIFEs(donor_tree.get());
+      if (CountNodes(donor_tree->root()) > max_combine_nodes &&
+          !ExtractCompactWindow(donor_tree.get(), max_combine_nodes,
+                                donor_rng)) {
+        return false;
+      }
+    }
     Builder donor(donor_tree.get(), &donor_rng);
     fast::Program* donor_root = donor.root();
     if (donor_root->body.empty()) {
@@ -2397,12 +2235,13 @@ class CombineMutator final : public Mutator {
     }
     Requirements req = AnalyzeRequirements(donor_root);
     Tree* t = b.tree();
-    if (r.Chance(kCombineIifeChance())) {
+    if (b.focus_subtree() != nullptr || r.Chance(kCombineIifeChance())) {
       // IIFE: `(function() { <donor> })();` at a random insertion slot.
       Builder::Slot slot;
       bool found = false;
       for (int i = 0; i < kCombineSlotAttempts.AsInt(); i++) {
-        slot = r.Chance(kCombineIifeAtEndChance())
+        slot = (b.focus_subtree() == nullptr &&
+                r.Chance(kCombineIifeAtEndChance()))
                    ? Builder::Slot{&b.root()->body, b.root()->body.size(),
                                    b.root()}
                    : b.RandomInsertionSlot();
@@ -2584,11 +2423,19 @@ std::vector<std::string> MutatorSet::Names() const {
 }
 
 Mutator* MutatorSet::Pick(Random& rng, bool has_partner) const {
-  size_t index =
-      selector_->Pick(candidates_, rng, [has_partner](const Mutator& m) {
+  size_t index = PickWithMask<Mutator>(
+      *selector_, candidates_, rng,
+      [has_partner](const Mutator& m) {
         return has_partner || !m.needs_partner();
-      });
+      },
+      ActiveMutatorMask());
   return index == Selector<Mutator>::kNoChoice ? nullptr : candidates_[index];
+}
+
+const std::vector<std::string>& SwarmStructuralMutators() {
+  static const std::vector<std::string>* names =
+      new std::vector<std::string>{"Wrap", "Duplicate", "Reorder", "JitStress"};
+  return *names;
 }
 
 // --- selection strategies for mutators -------------------------------------
@@ -2643,15 +2490,306 @@ std::vector<const Component*> MutatorSet::Components() const {
   return components;
 }
 
-MutationContext::MutationContext() = default;
-MutationContext::~MutationContext() = default;
+namespace {
+
+bool IsLoopNodeKind(NodeKind kind) {
+  return kind == NodeKind::kForStatement || kind == NodeKind::kWhileStatement ||
+         kind == NodeKind::kDoWhileStatement ||
+         kind == NodeKind::kForInStatement || kind == NodeKind::kForOfStatement;
+}
+
+struct FocusScanState {
+  struct RawCandidate {
+    uint32_t body_id = 0;
+    std::string_view name;
+    bool is_method = false;
+    bool is_top_level_decl = false;
+    bool is_generator = false;
+    bool body_has_loop = false;
+    bool body_has_osr = false;
+  };
+
+  fast::Program* root = nullptr;
+  std::vector<RawCandidate> candidates;
+  std::vector<size_t> fn_stack;
+  absl::flat_hash_set<std::string_view> prepared_or_opt_names;
+  absl::flat_hash_set<std::string_view> tiered_up_names;
+  absl::flat_hash_set<std::string_view> loop_called_names;
+  absl::flat_hash_set<std::string_view> loop_called_methods;
+
+  void Scan(Node* node, Node* parent, int loop_depth) {
+    if (node == nullptr) {
+      return;
+    }
+    if (auto* native = node->As<NativeCallExpression>()) {
+      if (native->name == "PrepareFunctionForOptimization" ||
+          native->name == "OptimizeFunctionOnNextCall" ||
+          native->name == "OptimizeMaglevOnNextCall") {
+        if (!native->arguments.empty()) {
+          if (auto* id = native->arguments[0]->As<Identifier>()) {
+            prepared_or_opt_names.insert(id->name);
+            if (native->name != "PrepareFunctionForOptimization") {
+              tiered_up_names.insert(id->name);
+            }
+          }
+        }
+      } else if (native->name == "OptimizeOsr" ||
+                 native->name == "BaselineOsr") {
+        if (!fn_stack.empty()) {
+          candidates[fn_stack.back()].body_has_osr = true;
+        }
+      }
+    }
+    if (loop_depth > 0) {
+      if (auto* call = node->As<CallExpression>()) {
+        if (auto* id = call->callee->As<Identifier>()) {
+          loop_called_names.insert(id->name);
+        } else if (auto* mem = call->callee->As<MemberExpression>();
+                   mem != nullptr && !mem->computed) {
+          if (auto* prop = mem->property->As<Identifier>()) {
+            loop_called_methods.insert(prop->name);
+          }
+        }
+      } else if (auto* construct = node->As<NewExpression>()) {
+        if (auto* id = construct->callee->As<Identifier>()) {
+          loop_called_names.insert(id->name);
+        }
+      }
+    }
+    if (FunctionData* fn = AsFunctionData(node)) {
+      if (fn->body != nullptr) {
+        RawCandidate cand;
+        cand.body_id = fn->body->id;
+        cand.is_generator = fn->is_generator;
+        if (node->Is<FunctionDeclaration>()) {
+          if (fn->name != nullptr) {
+            cand.name = fn->name->name;
+            cand.is_top_level_decl = (parent == root);
+          }
+        } else if (parent != nullptr && parent->Is<MethodDefinition>() &&
+                   parent->Cast<MethodDefinition>()->value == node) {
+          auto* m = parent->Cast<MethodDefinition>();
+          cand.is_method = true;
+          if (!m->computed && m->key != nullptr) {
+            if (auto* id = m->key->As<Identifier>()) {
+              cand.name = id->name;
+            }
+          }
+        } else if (parent != nullptr && parent->Is<Property>() &&
+                   parent->Cast<Property>()->value == node &&
+                   (parent->Cast<Property>()->method ||
+                    parent->Cast<Property>()->property_kind !=
+                        PropertyKind::kInit)) {
+          auto* p = parent->Cast<Property>();
+          cand.is_method = true;
+          if (!p->computed && p->key != nullptr) {
+            if (auto* id = p->key->As<Identifier>()) {
+              cand.name = id->name;
+            }
+          }
+        } else if (parent != nullptr && parent->Is<VariableDeclarator>() &&
+                   parent->Cast<VariableDeclarator>()->init == node &&
+                   parent->Cast<VariableDeclarator>()->target != nullptr &&
+                   parent->Cast<VariableDeclarator>()
+                       ->target->Is<Identifier>()) {
+          cand.name = parent->Cast<VariableDeclarator>()
+                          ->target->Cast<Identifier>()
+                          ->name;
+        } else if (parent != nullptr && parent->Is<AssignmentExpression>() &&
+                   parent->Cast<AssignmentExpression>()->right == node &&
+                   parent->Cast<AssignmentExpression>()->left != nullptr &&
+                   parent->Cast<AssignmentExpression>()
+                       ->left->Is<Identifier>()) {
+          cand.name = parent->Cast<AssignmentExpression>()
+                          ->left->Cast<Identifier>()
+                          ->name;
+        } else if (fn->name != nullptr) {
+          cand.name = fn->name->name;
+        }
+        const size_t idx = candidates.size();
+        candidates.push_back(cand);
+        for (Expression* param : fn->params) {
+          Scan(param, node, 0);
+        }
+        fn_stack.push_back(idx);
+        Scan(fn->body, node, 0);
+        fn_stack.pop_back();
+        return;
+      }
+      // Concise arrow function: scan children so nested block functions appear.
+      ForEachChild(node, [&](Node* child) { Scan(child, node, 0); });
+      return;
+    }
+    int child_loop_depth = loop_depth;
+    if (IsLoopNodeKind(node->kind)) {
+      child_loop_depth++;
+      if (!fn_stack.empty()) {
+        candidates[fn_stack.back()].body_has_loop = true;
+      }
+    }
+    ForEachChild(node,
+                 [&](Node* child) { Scan(child, node, child_loop_depth); });
+  }
+};
+
+}  // namespace
+
+bool PickFocusTarget(const fast::Tree& tree, Random& rng, FocusTarget* out) {
+  if (tree.root() == nullptr) {
+    return false;
+  }
+  FocusScanState state;
+  state.root = tree.root();
+  state.Scan(tree.root(), nullptr, 0);
+  if (state.candidates.empty()) {
+    return false;
+  }
+  std::vector<FocusTarget> hot;
+  std::vector<FocusTarget> all;
+  all.reserve(state.candidates.size());
+  for (const FocusScanState::RawCandidate& c : state.candidates) {
+    FocusTarget target;
+    target.body_id = c.body_id;
+    target.name = std::string(c.name);
+    target.is_top_level_decl = c.is_top_level_decl;
+    target.is_generator = c.is_generator;
+    const bool named = !c.name.empty();
+    const bool in_opt =
+        named && !c.is_method && state.prepared_or_opt_names.count(c.name) > 0;
+    const bool tiered =
+        named && !c.is_method && state.tiered_up_names.count(c.name) > 0;
+    const bool in_loop_call =
+        named && (c.is_method ? state.loop_called_methods.count(c.name) > 0
+                              : state.loop_called_names.count(c.name) > 0);
+    target.is_hot = c.body_has_osr || c.body_has_loop || in_opt || in_loop_call;
+    target.has_tier_up = c.body_has_osr || tiered || in_loop_call;
+    if (target.is_hot) {
+      hot.push_back(target);
+    }
+    all.push_back(std::move(target));
+  }
+  const std::vector<FocusTarget>& pool = hot.empty() ? all : hot;
+  *out = pool[rng.Index(pool.size())];
+  return true;
+}
+
+std::unique_ptr<fast::Tree> ApplyFocusTierUp(const redline::Program& parent,
+                                             const FocusTarget& target,
+                                             Random& rng,
+                                             const Environment& env,
+                                             const GeneratorSet& generators,
+                                             std::string* detail) {
+  Generator* jit_opt = generators.Find("JitOptimize");
+  if (jit_opt == nullptr || generators.WeightOf(jit_opt) <= 0.0) {
+    return nullptr;
+  }
+  std::unique_ptr<Tree> tree = parent.CopyTree();
+  Builder builder(tree.get(), &rng);
+  Tree* t = builder.tree();
+  // Append warm-up and optimization calls for a top-level function declaration.
+  if (target.is_top_level_decl && !target.name.empty()) {
+    Builder::Slot end_slot{&t->root()->body, t->root()->body.size(), t->root()};
+    GenContext gen = MakeGenContext(builder, end_slot, generators, env);
+    bool visible_as_fn = false;
+    for (const Variable& v : gen.visible) {
+      if (v.name == target.name && v.type == JsType::kFunction) {
+        visible_as_fn = true;
+        break;
+      }
+    }
+    if (visible_as_fn) {
+      CodeGen cg(gen);
+      std::string_view name = t->Intern(target.name);
+      CallExpression* template_call = cg.CallWithArguments(mk::Id(t, name));
+      auto make_call = [&]() -> Statement* {
+        std::vector<Expression*> args;
+        args.reserve(template_call->arguments.size());
+        for (const Expression* arg : template_call->arguments) {
+          args.push_back(t->Clone(arg));
+        }
+        CallExpression* call = mk::Call(t, mk::Id(t, name), std::move(args));
+        if (target.is_generator) {
+          return cg.Stmt(mk::CallMethod(t, call, "next", {}));
+        }
+        return cg.Stmt(call);
+      };
+      std::vector<Statement*> stmts;
+      stmts.push_back(cg.Stmt(
+          mk::Native(t, "PrepareFunctionForOptimization", {mk::Id(t, name)})));
+      stmts.push_back(make_call());
+      stmts.push_back(make_call());
+      const char* tier = rng.Coin() ? "OptimizeFunctionOnNextCall"
+                                    : "OptimizeMaglevOnNextCall";
+      stmts.push_back(cg.Stmt(mk::Native(t, tier, {mk::Id(t, name)})));
+      stmts.push_back(make_call());
+      builder.InsertAll(end_slot, stmts);
+      jit_opt->stats().invocations++;
+      jit_opt->stats().produced++;
+      NoteGeneratorUsed(jit_opt);
+      if (detail != nullptr) {
+        *detail = "focus tier-up " + target.name;
+      }
+      return tree;
+    }
+  }
+  // Run `JitOptimize` once for other function kinds outside the target body.
+  auto inside_target_body = [&](Node* node) {
+    for (Node* n = node; n != nullptr; n = builder.ParentOf(n)) {
+      if (n->id == target.body_id) {
+        return true;
+      }
+    }
+    return false;
+  };
+  Builder::Slot slot;
+  for (int attempt = 0; attempt < 6; attempt++) {
+    Builder::Slot candidate = builder.RandomInsertionSlot();
+    if (!candidate.valid()) {
+      return nullptr;
+    }
+    if (inside_target_body(candidate.owner)) {
+      continue;
+    }
+    slot = candidate;
+    if (!Builder::OfType(builder.VisibleAtSlot(slot), JsType::kFunction)
+             .empty()) {
+      break;
+    }
+  }
+  if (!slot.valid()) {
+    slot = Builder::Slot{&t->root()->body, t->root()->body.size(), t->root()};
+  }
+  GenContext gen = MakeGenContext(builder, slot, generators, env);
+  if (!jit_opt->Applicable(gen)) {
+    return nullptr;
+  }
+  std::vector<Statement*> out;
+  gen.out = &out;
+  jit_opt->stats().invocations++;
+  if (!jit_opt->Generate(gen, &out) || out.empty()) {
+    return nullptr;
+  }
+  jit_opt->stats().produced++;
+  NoteGeneratorUsed(jit_opt);
+  builder.InsertAll(slot, out);
+  if (detail != nullptr) {
+    *detail = "focus JitOptimize";
+  }
+  return tree;
+}
 
 std::unique_ptr<fast::Tree> ApplyMutation(
     Mutator& mutator, const redline::Program& parent, const ProgramPtr& partner,
     Random& rng, const Environment& env, const GeneratorSet& generators,
-    int rounds, std::string* detail, std::vector<ExploreProbe>* probes) {
+    int rounds, std::string* detail, std::vector<ExploreProbe>* probes,
+    std::optional<uint32_t> focus_node_id) {
   std::unique_ptr<Tree> tree = parent.CopyTree();
   Builder builder(tree.get(), &rng);
+  Node* focus_node =
+      focus_node_id.has_value() ? tree->FindNode(*focus_node_id) : nullptr;
+  if (focus_node != nullptr) {
+    builder.SetFocusSubtree(focus_node);
+  }
   MutationContext ctx;
   ctx.partner = partner;
   ctx.env = &env;
@@ -2663,16 +2801,26 @@ std::unique_ptr<fast::Tree> ApplyMutation(
   if (mutator.runtime_assisted()) {
     rounds = 1;
   }
-  for (int i = 0; i < rounds; i++) {
-    ctx.detail.clear();
-    mutator.stats().invocations++;
-    if (mutator.Mutate(builder, ctx)) {
-      applied++;
-      if (!all.empty()) {
-        all += "; ";
+  auto run_rounds = [&](bool count_invocations) {
+    for (int i = 0; i < rounds; i++) {
+      ctx.detail.clear();
+      if (count_invocations) {
+        mutator.stats().invocations++;
       }
-      all += ctx.detail;
+      if (mutator.Mutate(builder, ctx)) {
+        applied++;
+        if (!all.empty()) {
+          all += "; ";
+        }
+        all += ctx.detail;
+      }
     }
+  };
+  run_rounds(/*count_invocations=*/true);
+  if (applied == 0 && focus_node != nullptr) {
+    // Retry on the full tree when the focused subtree has no valid candidate.
+    builder.SetFocusSubtree(nullptr);
+    run_rounds(/*count_invocations=*/false);
   }
   if (applied == 0) {
     return nullptr;

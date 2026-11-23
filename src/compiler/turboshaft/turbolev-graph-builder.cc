@@ -2472,6 +2472,40 @@ class GraphBuildingNodeProcessor {
     return maglev::ProcessResult::kContinue;
   }
 
+  maglev::ProcessResult Process(maglev::MapPrototypeHas* node,
+                                const maglev::ProcessingState& state) {
+    V<Object> table = Map(node->TableInput());
+    V<Smi> key = Map(node->KeyInput());
+
+    V<Smi> entry = __ FindOrderedHashMapEntry(table, key);
+    ScopedVar<Object, AssemblerT> result(
+        this, __ HeapConstant(local_factory_->true_value()));
+
+    IF (__ TaggedEqual(entry, __ SmiConstant(Smi::FromInt(-1)))) {
+      result = __ HeapConstant(local_factory_->false_value());
+    }
+    SetMap(node, result);
+
+    return maglev::ProcessResult::kContinue;
+  }
+
+  maglev::ProcessResult Process(maglev::MapPrototypeHasInt32Key* node,
+                                const maglev::ProcessingState& state) {
+    V<Object> table = Map(node->TableInput());
+    V<Word32> key = Map(node->KeyInput());
+
+    V<WordPtr> entry = __ FindOrderedHashMapEntryForInt32Key(table, key);
+    ScopedVar<Object, AssemblerT> result(
+        this, __ HeapConstant(local_factory_->true_value()));
+
+    IF (__ Word32Equal(__ TruncateWordPtrToWord32(entry), -1)) {
+      result = __ HeapConstant(local_factory_->false_value());
+    }
+    SetMap(node, result);
+
+    return maglev::ProcessResult::kContinue;
+  }
+
   maglev::ProcessResult Process(maglev::SetPrototypeHas* node,
                                 const maglev::ProcessingState& state) {
     V<Object> table = Map(node->TableInput());
@@ -4371,9 +4405,7 @@ class GraphBuildingNodeProcessor {
 
   maglev::ProcessResult Process(maglev::BranchIfIntPtrToBooleanTrue* node,
                                 const maglev::ProcessingState& state) {
-    V<Word32> condition =
-        __ Equal(Map(node->ConditionInput()), __ IntPtrConstant(0),
-                 RegisterRepresentation::WordPtr());
+    V<Word32> condition = __ WordPtrEqual(Map(node->ConditionInput()), 0);
     __ Branch(condition, Map(node->if_false()), Map(node->if_true()));
     return maglev::ProcessResult::kContinue;
   }
@@ -4669,7 +4701,7 @@ class GraphBuildingNodeProcessor {
     ScopedVar<Word32, AssemblerT> result(this);
     IF (UNLIKELY(__ Word32Equal(rhs, 0))) {
       // Truncated value of anything divided by 0 is 0.
-      result = __ Word32Constant(0);
+      result = 0;
     } ELSE IF (UNLIKELY(__ Word32Equal(rhs, -1))) {
       // Return -left if right = -1.
       // This avoids a hardware exception if left = INT32_MIN.
@@ -5614,11 +5646,11 @@ class GraphBuildingNodeProcessor {
   V<Word32> Int32ToUint8Clamped(V<Word32> value) {
     ScopedVar<Word32, AssemblerT> result(this);
     IF (__ Int32LessThan(value, kMinClampedUint8)) {
-      result = __ Word32Constant(kMinClampedUint8);
+      result = kMinClampedUint8;
     } ELSE IF (__ Int32LessThan(value, kMaxClampedUint8)) {
       result = value;
     } ELSE {
-      result = __ Word32Constant(kMaxClampedUint8);
+      result = kMaxClampedUint8;
     }
     return result;
   }
@@ -5636,9 +5668,9 @@ class GraphBuildingNodeProcessor {
     // branchy sequence; use an explicit comparison chain instead.
     ScopedVar<Word32, AssemblerT> result(this);
     IF (__ Float64LessThan(value, kMinClampedUint8)) {
-      result = __ Word32Constant(kMinClampedUint8);
+      result = kMinClampedUint8;
     } ELSE IF (__ Float64LessThan(kMaxClampedUint8, value)) {
-      result = __ Word32Constant(kMaxClampedUint8);
+      result = kMaxClampedUint8;
     } ELSE {
       // Note that this case handles values that are in range of Clamped Uint8
       // and NaN. The order of the IF/ELSE-IF/ELSE in this function is so that
@@ -5660,7 +5692,7 @@ class GraphBuildingNodeProcessor {
     IF (__ Uint32LessThan(value, kMaxClampedUint8)) {
       result = value;
     } ELSE {
-      result = __ Word32Constant(kMaxClampedUint8);
+      result = kMaxClampedUint8;
     }
     SetMap(node, result);
     return maglev::ProcessResult::kContinue;

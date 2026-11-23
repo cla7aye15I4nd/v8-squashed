@@ -136,6 +136,13 @@ class Builder {
   // own primitives.
   void Invalidate();
 
+  // Restricts slot and node queries to `focus_root` when non-null.
+  // Pass nullptr to query the full tree.
+  void SetFocusSubtree(const fast::Node* focus_root) {
+    focus_root_ = focus_root;
+  }
+  const fast::Node* focus_subtree() const { return focus_root_; }
+
   // --- statement lists ------------------------------------------------------
 
   // A position in a statement list: `index` may equal list->size() for an
@@ -283,14 +290,22 @@ class Builder {
   void EnsureUsedNames();
   // The entry of `name` in binding_info_, derived from the tree if new.
   BindingInfo& InfoEntry(std::string_view name);
+  JsType GuessBindingType(const fast::Binding* binding, int depth);
+  static JsType GuessExpression(Builder* builder,
+                                const fast::Expression* expression, int depth);
+  static JsType GuessFunctionReturnType(Builder* builder,
+                                        const fast::FunctionData* fn,
+                                        int depth);
   Variable ToVariable(fast::Binding* binding);
   static int LeadingDirectives(const std::vector<fast::Statement*>& list);
   fast::Node* AnchorNodeFor(const Slot& slot, int32_t* position);
+  fast::Node* ResolveFocusRoot();
   template <typename F>
-  void ForEachStatementList(F&& f);
+  void ForEachStatementList(fast::Node* start, F&& f);
 
   fast::Tree* tree_;
   Random* rng_;
+  const fast::Node* focus_root_ = nullptr;
   std::unique_ptr<fast::ScopeAnalysis> scopes_;
   // Parent of each node, indexed by Node::id (nullptr for the root and for
   // nodes created after the map was built).

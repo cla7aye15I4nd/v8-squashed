@@ -185,7 +185,7 @@ deps = {
     'condition': 'checkout_agents_internal',
   },
   'build':
-    Var('chromium_url') + '/chromium/src/build.git' + '@' + '61cb17bb9d95a7ddef8e0f871fa8701fb09b4a2e',
+    Var('chromium_url') + '/chromium/src/build.git' + '@' + '0fc55fc15b4a55c0380102ca4784c526ba2d4ba7',
   'buildtools':
     Var('chromium_url') + '/chromium/src/buildtools.git' + '@' + '09120017bb5dad1bb6c429be4233d020e1b51dbe',
   'buildtools/linux64': {
@@ -306,7 +306,7 @@ deps = {
     'condition': 'checkout_android',
   },
   'third_party/depot_tools':
-    Var('chromium_url') + '/chromium/tools/depot_tools.git' + '@' + '1b0972d3d5e5b1e78055147cb3576361e274b9ed',
+    Var('chromium_url') + '/chromium/tools/depot_tools.git' + '@' + '7344fe3c023a587c55b3af9639dce2573c88b153',
   'third_party/dragonbox/src':
     Var('chromium_url') + '/external/github.com/jk-jeon/dragonbox.git' + '@' + 'beeeef91cf6fef89a4d4ba5e95d47ca64ccb3a44',
   'third_party/fp16/src':
@@ -372,7 +372,7 @@ deps = {
   'third_party/libunwind/src':
     Var('chromium_url') + '/external/github.com/llvm/llvm-project/libunwind.git' + '@' + '9e44ea2ff4f53a60c2a3d2b6f511d7bab9ab12f0',
   'third_party/llvm-libc/src':
-    Var('chromium_url') + '/external/github.com/llvm/llvm-project/libc.git' + '@' + '9ea186e620f61979cf28bae2d35b83e3ffa813b7',
+    Var('chromium_url') + '/external/github.com/llvm/llvm-project/libc.git' + '@' + '2524304cb8459aece9974605d52856d901d709e0',
   'third_party/llvm-build/Release+Asserts': {
     'dep_type': 'gcs',
     'bucket': 'chromium-browser-clang',
@@ -559,7 +559,7 @@ deps = {
     'condition': 'not build_with_chromium',
   },
   'third_party/perfetto':
-    Var('chromium_url') + '/external/github.com/google/perfetto.git' + '@' + 'aeb44770ffcb6e33bc1c2bb6bec85ced58f7f862',
+    Var('chromium_url') + '/external/github.com/google/perfetto.git' + '@' + '06996a03bcf7b3df866eef1fafc74a37d5103152',
   'third_party/protobuf':
     Var('chromium_url') + '/chromium/src/third_party/protobuf.git' + '@' + '3813fd5b3029807583e5d2549a40d78fa499c3e8',
   'third_party/re2/src':

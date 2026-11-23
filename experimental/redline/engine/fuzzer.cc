@@ -7,11 +7,13 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <functional>
 #include <iterator>
+#include <optional>
 #include <thread>
 
 #include "experimental/redline/base/file_util.h"
@@ -23,6 +25,7 @@
 #include "experimental/redline/engine/flag_minimizer.h"
 #include "experimental/redline/engine/importer.h"
 #include "experimental/redline/engine/prelude.h"
+#include "experimental/redline/engine/salvage.h"
 #include "experimental/redline/exec/process_run.h"
 #include "experimental/redline/exec/runner.h"
 #include "experimental/redline/fast/parser.h"
@@ -35,6 +38,8 @@ namespace {
 
 constexpr char kLog[] = "fuzz";
 constexpr size_t kMaxSavedOutput = static_cast<size_t>(64) * 1024;
+// Retries of a round of a mutation chain whose mutator could not apply.
+constexpr int kMaxNoopRetries = 3;
 
 // Keeps the random d8 flags of a target while it lives: a new target
 // process gets the flags of the last one. The reruns, the minimization and
@@ -110,6 +115,268 @@ std::string AbsolutePath(const std::string& path) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
+// Minimizer probe timeouts and hit edges.
+
+uint64_t CrashRerunTimeout(const FuzzConfig& config) {
+  return static_cast<uint64_t>(config.crash_rerun_timeout_factor *
+                               static_cast<double>(config.target.timeout_us));
+}
+
+int OptimizedAdmitWorkers(double fraction, int jobs) {
+  if (fraction <= 0.0 || jobs <= 0) {
+    return 0;
+  }
+  return std::min(jobs, static_cast<int>(std::ceil(fraction * jobs - 1e-9)));
+}
+
+std::string CrashProbeScript(bool fuzzilli_target, int kind) {
+  return StringPrintf(fuzzilli_target ? "fuzzilli('FUZZILLI_CRASH', %d)"
+                                      : "redline('REDLINE_CRASH', %d)",
+                      kind);
+}
+
+bool FiltersCrashProbes(const std::vector<std::string>& args) {
+  return std::any_of(args.begin(), args.end(), [](const std::string& arg) {
+    std::string name(D8FlagName(arg));
+    std::replace(name.begin(), name.end(), '_', '-');
+    return name == "--hole-fuzzing" || name == "--sandbox-fuzzing" ||
+           name == "--sandbox-trap-fuzzing" || name == "--sandbox-testing";
+  });
+}
+
+uint64_t MinimizerProbeTimeout(const FuzzConfig& config,
+                               uint64_t exec_time_us) {
+  auto probe = static_cast<uint64_t>(config.probe_timeout_factor *
+                                         static_cast<double>(exec_time_us) +
+                                     config.probe_timeout_extra_ms * 1000.0);
+  probe = std::max(probe,
+                   static_cast<uint64_t>(config.probe_timeout_min_ms * 1000.0));
+  return std::min(probe, config.target.timeout_us);
+}
+
+uint64_t TightenedProbeTimeout(const FuzzConfig& config,
+                               uint64_t first_timeout_us,
+                               uint64_t accepted_exec_us) {
+  if (config.probe_timeout_tighten_factor <= 0.0) {
+    return first_timeout_us;
+  }
+  auto probe =
+      static_cast<uint64_t>(config.probe_timeout_tighten_factor *
+                                static_cast<double>(accepted_exec_us) +
+                            config.probe_timeout_tighten_extra_ms * 1000.0);
+  probe = std::max(probe,
+                   static_cast<uint64_t>(config.probe_timeout_min_ms * 1000.0));
+  return std::min(probe, first_timeout_us);
+}
+
+void HitEdges::Intersect(std::vector<uint32_t> edges) {
+  std::sort(edges.begin(), edges.end());
+  edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+  if (runs_ == 0) {
+    edges_.swap(edges);
+  } else {
+    std::vector<uint32_t> both;
+    std::set_intersection(edges_.begin(), edges_.end(), edges.begin(),
+                          edges.end(), std::back_inserter(both));
+    edges_.swap(both);
+  }
+  runs_++;
+}
+
+void HitEdges::RecordRun(std::vector<uint32_t> edges) {
+  Intersect(std::move(edges));
+}
+
+void HitEdges::RecordProbe(std::vector<uint32_t> edges) {
+  probe_ = std::move(edges);
+  has_probe_ = true;
+}
+
+void HitEdges::RecordVerifiedRun(std::vector<uint32_t> edges) {
+  edges_.clear();
+  runs_ = 0;
+  if (has_probe_) {
+    Intersect(std::move(probe_));
+  }
+  probe_.clear();
+  has_probe_ = false;
+  Intersect(std::move(edges));
+}
+
+void HitEdges::Clear() {
+  edges_.clear();
+  runs_ = 0;
+  probe_.clear();
+  has_probe_ = false;
+}
+
+std::vector<uint32_t> HitEdges::Take() {
+  std::vector<uint32_t> edges = std::move(edges_);
+  Clear();
+  return edges;
+}
+
+// ---------------------------------------------------------------------------
+// Determinism check and coalesced commit.
+
+CheckResult RunDeterminismCheck(
+    SharedCoverage& shared, const CheckRules& rules,
+    std::vector<uint32_t> claimed, bool pending_held,
+    const std::function<bool(const std::vector<uint32_t>& edges,
+                             CheckRun* run)>& rerun) {
+  CheckResult result;
+  result.pending_held = pending_held;
+  const bool claimed_was_empty = claimed.empty();
+  std::vector<uint32_t>& edges = result.edges;
+  edges = std::move(claimed);
+  // Only edges of the candidate go here, never edges of a pending commit.
+  std::vector<uint32_t> release;
+  auto drop = [&](const std::vector<uint32_t>& dropped) {
+    for (uint32_t edge : dropped) {
+      if (!shared.RecordFlaky(edge, rules.flaky_threshold)) {
+        release.push_back(edge);
+      }
+    }
+  };
+  // An edge that failed a check before, or an edge that a rerun loses, makes
+  // the check run min_reruns times.
+  bool full = shared.AnyFlaky(edges);
+  const int clean_reruns = std::min(rules.min_reruns, rules.clean_min_reruns);
+  int stable = 0;
+  // Fuzzilli's processMaybeInteresting: each kept edge must be in all
+  // reruns. An edge that a rerun does not reach leaves the set. The loop
+  // stops when the set did not change for min_stable_reruns reruns. A
+  // candidate that still loses edges after max_reruns reruns did not
+  // converge and is dropped. A program of --import-all can have no new
+  // edges. It also runs again, so that only reliable programs are published.
+  while (result.deterministic && (!edges.empty() || claimed_was_empty)) {
+    const int required = full ? rules.min_reruns : clean_reruns;
+    if (stable >= rules.min_stable_reruns && result.reruns >= required) {
+      result.converged = true;
+      result.clean = !full && required < rules.min_reruns;
+      break;
+    }
+    if (result.reruns >= rules.max_reruns) {
+      break;
+    }
+    CheckRun run;
+    if (!rerun(edges, &run)) {
+      result.deterministic = false;
+      break;
+    }
+    result.reruns++;
+    if (!run.succeeded) {
+      result.deterministic = false;
+      break;
+    }
+    result.pending_held = result.pending_held && run.pending_held;
+    if (run.missing.empty()) {
+      stable++;
+      continue;
+    }
+    full = true;
+    stable = 0;
+    result.dropped += run.missing.size();
+    drop(run.missing);
+    std::vector<uint32_t> kept;
+    std::set_difference(edges.begin(), edges.end(), run.missing.begin(),
+                        run.missing.end(), std::back_inserter(kept));
+    edges.swap(kept);
+  }
+  // Only --import-all publishes a program without new edges. It must still
+  // run reliably.
+  const bool keep_without_edges =
+      edges.empty() && claimed_was_empty && rules.keep_without_edges;
+  result.survived = result.deterministic && result.converged &&
+                    (!edges.empty() || keep_without_edges);
+  if (!result.survived) {
+    // All runs reached these edges. A rerun that timed out or crashed, or a
+    // check that did not converge, does not make them flaky.
+    release.insert(release.end(), edges.begin(), edges.end());
+  }
+  shared.Release(release);
+  return result;
+}
+
+std::vector<uint64_t> SplitByEdges(uint64_t executions,
+                                   const std::vector<size_t>& edges) {
+  std::vector<uint64_t> parts(edges.size(), 0);
+  if (edges.empty()) {
+    return parts;
+  }
+  uint64_t total = 0;
+  for (size_t count : edges) {
+    total += count;
+  }
+  uint64_t given = 0;
+  for (size_t i = 0; i < edges.size(); i++) {
+    parts[i] =
+        total == 0 ? executions / edges.size() : executions * edges[i] / total;
+    given += parts[i];
+  }
+  // The remainder of the integer division goes to the first candidate.
+  parts[0] += executions - given;
+  return parts;
+}
+
+ChainCommits::~ChainCommits() {
+  Flush();
+  if (pending_ != nullptr) {
+    Fatal("ChainCommits destroyed with pending commit");
+  }
+}
+
+bool ChainCommits::CanMerge(const CheckedCandidate& candidate,
+                            bool pending_held) const {
+  return pending_ != nullptr && pending_held &&
+         pending_->merges < limits_.max_merges &&
+         pending_->candidate.edges.size() + candidate.edges.size() <=
+             limits_.max_edges &&
+         candidate.program->node_count() <= limits_.max_nodes;
+}
+
+ChainCommits::Offered ChainCommits::Offer(CheckedCandidate candidate,
+                                          bool pending_held) {
+  if (pending_ == nullptr) {
+    pending_ = std::make_unique<PendingCommit>();
+    pending_->credits.push_back(std::move(candidate.credit));
+    pending_->candidate = std::move(candidate);
+    return Offered::kStarted;
+  }
+  if (CanMerge(candidate, pending_held)) {
+    std::vector<uint32_t>& pending_edges = pending_->candidate.edges;
+    // The new candidate reached the pending edges in each run. Its
+    // minimization keeps the edges of both.
+    std::vector<uint32_t> both;
+    std::set_union(pending_edges.begin(), pending_edges.end(),
+                   candidate.edges.begin(), candidate.edges.end(),
+                   std::back_inserter(both));
+    const int reruns = pending_->candidate.reruns + candidate.reruns;
+    const size_t dropped = pending_->candidate.dropped + candidate.dropped;
+    pending_->credits.push_back(std::move(candidate.credit));
+    pending_->candidate = std::move(candidate);
+    pending_->candidate.edges = std::move(both);
+    pending_->candidate.reruns = reruns;
+    pending_->candidate.dropped = dropped;
+    pending_->merges++;
+    return Offered::kMerged;
+  }
+  Flush();
+  pending_ = std::make_unique<PendingCommit>();
+  pending_->credits.push_back(std::move(candidate.credit));
+  pending_->candidate = std::move(candidate);
+  return Offered::kReplaced;
+}
+
+void ChainCommits::Flush() {
+  if (pending_ == nullptr) {
+    return;
+  }
+  std::unique_ptr<PendingCommit> pending = std::move(pending_);
+  finalize_(std::move(*pending));
+}
+
+// ---------------------------------------------------------------------------
 // Worker: one thread, one target process.
 
 class Worker {
@@ -121,7 +388,8 @@ class Worker {
              static_cast<uint64_t>(id) + 1),
         flags_rng_((fuzzer->config().seed * 0x9E3779B97F4A7C15ull +
                     static_cast<uint64_t>(id) + 1) ^
-                   kFlagsSeedSalt) {}
+                   kFlagsSeedSalt),
+        prelude_lines_(PreludeLineCount(fuzzer->config().prelude)) {}
 
   int id() const { return id_; }
 
@@ -135,10 +403,20 @@ class Worker {
         if (!fuzzer_->targets_.empty() && child_execs_ > 0) {
           fuzzer_->RecordTargetChild(child_target_hits_ > 0);
         }
+        // The flags of the last target process are still in the runner.
+        if (fuzzer_->targets_.empty() && child_execs_ > 0) {
+          fuzzer_->RecordProductiveFlags(runner_->child().random_args(),
+                                         child_new_edges_, child_execs_);
+        }
         child_target_buckets_.assign(fuzzer_->targets_.size(), 0);
         child_target_hits_ = 0;
         child_execs_ = 0;
+        child_new_edges_ = 0;
         return fuzzer_->DrawD8Flags(flags_rng_);
+      };
+      target.spawn_result = [this](const std::vector<std::string>& args,
+                                   bool started) {
+        fuzzer_->RecordSpawn(args, started);
       };
     }
     runner_ = ScriptRunner::Create(target, id_, error);
@@ -155,6 +433,25 @@ class Worker {
   }
 
   const CoverageMap& coverage() const { return runner_->coverage(); }
+
+  // The coverage map for KeepFocused if this worker admits programs for new
+  // optimized code features alone (OptimizedAdmitWorkers), else nullptr.
+  const CoverageMap* AdmitOptimized() const {
+    return id_ < fuzzer_->optimized_admit_workers_ ? &runner_->coverage()
+                                                   : nullptr;
+  }
+
+  // Runs CrashProbeScript(kind) in the target (Fuzzer::CheckTargetCrashes).
+  bool ProbeCrash(int kind, bool* crashed, std::string* error) {
+    Execution execution;
+    if (!runner_->RunWithoutEvaluation(
+            CrashProbeScript(runner_->coverage().is_fuzzilli(), kind),
+            config().target.timeout_us, &execution, error)) {
+      return false;
+    }
+    *crashed = execution.crashed();
+    return true;
+  }
 
   void Launch() {
     thread_ = std::thread([this] { Run(); });
@@ -199,8 +496,10 @@ class Worker {
     checker_ = std::make_unique<SyntaxChecker>();
     ImportPhase();
     while (!stopping()) {
+      UpdateSwarmMask();
       FuzzOne();
     }
+    SetActiveSwarmMask(nullptr);
     if (config().randomize_d8_flags && !fuzzer_->targets_.empty() &&
         child_execs_ > 0) {
       fuzzer_->RecordTargetChild(child_target_hits_ > 0);
@@ -381,37 +680,39 @@ class Worker {
   // enough for JIT-tier variance, short enough that a probe which runs
   // forever is cheap.
   uint64_t ProbeTimeout(uint64_t exec_time_us) const {
-    const FuzzConfig& c = config();
-    auto probe = static_cast<uint64_t>(c.probe_timeout_factor *
-                                           static_cast<double>(exec_time_us) +
-                                       c.probe_timeout_extra_ms * 1000.0);
-    probe =
-        std::max(probe, static_cast<uint64_t>(c.probe_timeout_min_ms * 1000.0));
-    return std::min(probe, c.target.timeout_us);
+    return MinimizerProbeTimeout(config(), exec_time_us);
   }
 
   // Bookkeeping for a mutant that is not valid JavaScript: per-mutator and
   // global counters, the verbose event, the capture and the mutant event.
   // Without the in-process syntax check the verdict comes from the target
   // (Execution::IsParseError()).
-  void CountInvalid(Mutator& mutator, const std::string& detail,
-                    uint32_t ancestor_id, const Program* parent,
-                    const std::string& source, const std::string& message) {
-    mutator.stats().invalid++;
+  void CountInvalid(ComponentStats& comp_stats, std::string_view origin,
+                    const std::string& detail, uint32_t ancestor_id,
+                    const Program* parent, const std::string& source,
+                    const std::string& message) {
+    comp_stats.invalid++;
     stats().invalid++;
     if (GetLogLevel() == LogLevel::kVerbose) {
       JsonObject event;
       event.Add("event", "invalid")
-          .Add("mutator", mutator.name())
+          .Add("mutator", origin)
           .Add("detail", detail);
       event.Add("error", message).Add("parent", ancestor_id).Add("worker", id_);
       fuzzer_->LogEvent(event);
     }
     JsonObject why;
     why.Add("error", message);
-    Capture(Stage::kMutate, CaptureTrigger::kInvalid, mutator.name(), parent,
-            source, why);
-    LogMutant(mutator, detail, ancestor_id, "invalid", nullptr, 0);
+    Capture(Stage::kMutate, CaptureTrigger::kInvalid, origin, parent, source,
+            why);
+    LogMutant(origin, detail, ancestor_id, "invalid", nullptr, 0);
+  }
+
+  void CountInvalid(Mutator& mutator, const std::string& detail,
+                    uint32_t ancestor_id, const Program* parent,
+                    const std::string& source, const std::string& message) {
+    CountInvalid(mutator.stats(), mutator.name(), detail, ancestor_id, parent,
+                 source, message);
   }
 
   // Feedback for the mutator strategy (core/selection.h). "interesting"
@@ -458,6 +759,7 @@ class Worker {
 
   void AccountFuzzExecution(const Execution& execution) {
     stats().fuzz_executions++;
+    swarm_execs_++;
     switch (execution.outcome) {
       case Outcome::kSucceeded:
         stats().succeeded++;
@@ -488,6 +790,7 @@ class Worker {
       ImportFile(fuzzer_->import_files_[index], options);
     }
     fuzzer_->workers_importing_--;
+    fuzzer_->FinishImportWorker();
   }
 
   void ImportFile(const std::string& path, const ImportOptions& options) {
@@ -515,18 +818,39 @@ class Worker {
     if (!info.dropped.empty()) {
       event.AddArray("dropped_loads", info.dropped);
     }
+    if (!info.flags.empty()) {
+      event.AddArray("flags", info.flags);
+    }
+    if (!info.program_flags.empty()) {
+      event.AddArray("program_flags", info.program_flags);
+    }
+    if (!info.rejected_flags.empty()) {
+      event.AddArray("rejected_flags", info.rejected_flags);
+    }
     Lineage lineage;
     lineage.origin = "import";
     lineage.detail = path;
     lineage.worker = id_;
     std::shared_ptr<Program> program =
         Program::FromTree(std::move(tree), lineage);
+    program->flags = std::move(info.flags);
     std::string message;
     if (!checker_->Accepts(program->source(), &message)) {
       stats().imports_failed++;
       fuzzer_->LogEvent(
           event.Add("result", "syntax_error").Add("error", message));
       return;
+    }
+    if (config().randomize_d8_flags) {
+      fuzzer_->RecordImportedFlags(program->flags);
+    }
+    // The flags of a corpus file that Redline saved apply to the program, but
+    // they are not imported flags.
+    for (std::string& flag : info.program_flags) {
+      if (std::find(program->flags.begin(), program->flags.end(), flag) ==
+          program->flags.end()) {
+        program->flags.push_back(std::move(flag));
+      }
     }
     Execution execution;
     if (!Execute(program->source(), &execution)) {
@@ -553,15 +877,18 @@ class Worker {
     }
     std::vector<uint32_t> claimed =
         fuzzer_->coverage_.ClaimNewEdges(runner_->coverage().bitmap());
-    fuzzer_->KeepFocused(&claimed);
+    fuzzer_->KeepFocused(&claimed, AdmitOptimized());
     if (claimed.empty() && !config().import_all) {
       stats().imports_redundant++;
       fuzzer_->LogEvent(event.Add("result", "redundant"));
       return;
     }
-    ProgramPtr added = Commit(program, std::move(claimed), execution,
-                              config().minimize_imports,
-                              /*mutator=*/nullptr);
+    // With import_all, the imports are usually the corpus of an earlier
+    // session. They passed the check there, so fewer reruns are sufficient.
+    ProgramPtr added = CommitNow(
+        program, std::move(claimed), execution, config().minimize_imports,
+        config().import_all ? config().import_reruns : config().min_reruns,
+        /*credit_stats=*/nullptr);
     if (added == nullptr) {
       stats().imports_failed++;
       fuzzer_->LogEvent(event.Add("result", "flaky"));
@@ -587,24 +914,26 @@ class Worker {
     return out;
   }
 
-  // --- fuzzing ----------------------------------------------------------
-
-  void FuzzOne() {
-    MaybeRespawnForTargets();
-    Corpus& corpus = fuzzer_->corpus();
-    Stopwatch pick_time;
-    ProgramPtr parent = corpus.Pick(rng_);
-    bool from_empty = false;
-    if (parent == nullptr ||
+  // Builds and executes a `Fuse` root merging 2 or 3 donors. Returns true when
+  // execution succeeded so the chain can continue from `*parent_out`.
+  bool RunFuseRoot(Corpus& corpus, SeedLease* lease_out, ProgramPtr* parent_out,
+                   ProgramPtr* ancestor_out, int* chain_out) {
+    Stopwatch pick_timer;
+    *lease_out = PickSeed(corpus);
+    ProgramPtr seed = lease_out->program();
+    bool from_empty =
+        seed == nullptr ||
         (corpus.size() < static_cast<size_t>(config().initial_programs) &&
-         rng_.Coin())) {
-      parent = fuzzer_->empty_program_;
-      from_empty = true;
+         rng_.Coin());
+    if (from_empty) {
+      lease_out->Release();
     }
+    ProgramPtr parent = from_empty ? fuzzer_->empty_program_ : seed;
+    const uint32_t ancestor_id = parent->id;
     {
       StageStats& st = stage(Stage::kPick);
       st.invocations++;
-      st.time_us += pick_time.ElapsedUs();
+      st.time_us += pick_timer.ElapsedUs();
       if (!from_empty) {
         st.successes++;
       }
@@ -616,64 +945,323 @@ class Worker {
         fuzzer_->LogEvent(event);
       }
     }
-    // The corpus program the chain of consecutive mutations started from
-    // (the scheduler's feedback and the lineage refer to it), and the
-    // number of mutations applied since.
-    ProgramPtr ancestor = parent;
+
+    const size_t donor_count = rng_.Coin() ? 2u : 3u;
+    std::vector<ProgramPtr> donors;
+    donors.reserve(donor_count);
+    if (!from_empty) {
+      donors.push_back(seed);
+    }
+    const MaterialBank& bank = fuzzer_->material();
+    const size_t need_material = donor_count - (from_empty ? 0u : 1u);
+    while (donors.size() < donor_count) {
+      ProgramPtr picked;
+      for (int attempt = 0; attempt < 4; attempt++) {
+        ProgramPtr cand = bank.Pick(rng_);
+        if (cand == nullptr) {
+          break;
+        }
+        bool seen = std::any_of(donors.begin(), donors.end(),
+                                [&](const ProgramPtr& existing) {
+                                  return existing.get() == cand.get();
+                                });
+        if (!seen || bank.size() < need_material) {
+          picked = std::move(cand);
+          break;
+        }
+      }
+      if (picked == nullptr) {
+        picked = bank.Pick(rng_);
+      }
+      if (picked == nullptr) {
+        break;
+      }
+      donors.push_back(std::move(picked));
+    }
+    if (donors.empty()) {
+      return false;
+    }
+
+    const size_t mat_count = donors.size() - (from_empty ? 0u : 1u);
+    std::string detail =
+        StringPrintf("%zu donors (%zu material)", donors.size(), mat_count);
+    Lineage lineage;
+    lineage.origin = "Fuse";
+    lineage.detail = detail;
+    lineage.parent_hash = parent->hash();
+    lineage.parent_id = ancestor_id;
+    lineage.chain = ancestor_id != 0 ? 1 : 0;
+    lineage.generation = parent->lineage().generation + 1;
+    lineage.worker = id_;
+
+    Stopwatch mutation_timer;
+    Stopwatch stage_timer;
+    StageStats& mutate_stage = stage(Stage::kMutate);
+    mutate_stage.invocations++;
+    ComponentStats& fuse_stats = fuzzer_->fuse_component().stats();
+    fuse_stats.invocations++;
+    // Finalize() gives its executions to the credit itself.
+    const uint64_t spent_before = executions_;
+    const uint64_t finalized_before = finalized_executions_;
+    const ScopeExit credit_spent([&] {
+      fuse_stats.spent += (executions_ - spent_before) -
+                          (finalized_executions_ - finalized_before);
+    });
+    std::shared_ptr<Program> fused =
+        FusePrograms(donors, std::move(lineage), &rng_);
+    stats().mutation_time_us += mutation_timer.ElapsedUs();
+    if (fused == nullptr) {
+      stats().noop++;
+      mutate_stage.time_us += stage_timer.ElapsedUs();
+      Capture(Stage::kMutate, CaptureTrigger::kNoop, "Fuse", parent.get(), "",
+              JsonObject());
+      LogMutant("Fuse", detail, ancestor_id, "noop", nullptr, 0);
+      return false;
+    }
+    fuse_stats.produced++;
+
+    std::string message;
+    if (config().syntax_check &&
+        !checker_->Accepts(fused->source(), &message)) {
+      CountInvalid(fuse_stats, "Fuse", detail, ancestor_id, parent.get(),
+                   fused->source(), message);
+      mutate_stage.time_us += stage_timer.ElapsedUs();
+      return false;
+    }
+    Execution exec;
+    if (!Execute(fused->source(), &exec)) {
+      return false;
+    }
+    if (!config().syntax_check && exec.IsParseError()) {
+      CountInvalid(fuse_stats, "Fuse", detail, ancestor_id, parent.get(),
+                   fused->source(), exec.ExceptionSignature());
+      mutate_stage.time_us += stage_timer.ElapsedUs();
+      return false;
+    }
+    Account(fuse_stats, exec);
+    AccountFuzzExecution(exec);
+    stats().fuzz_nodes += fused->node_count();
+    mutate_stage.executions++;
+    mutate_stage.exec_time_us += exec.exec_time_us;
+    mutate_stage.time_us += stage_timer.ElapsedUs();
+    if (exec.outcome == Outcome::kTimedOut) {
+      mutate_stage.timeouts++;
+      Capture(Stage::kMutate, CaptureTrigger::kTimeout, "Fuse", parent.get(),
+              fused->source(), JsonObject());
+    } else if (exec.outcome == Outcome::kFailed) {
+      Capture(Stage::kMutate, CaptureTrigger::kFailed, "Fuse", parent.get(),
+              fused->source(), JsonObject());
+    } else if (exec.outcome == Outcome::kCrashed) {
+      Capture(Stage::kMutate, CaptureTrigger::kCrash, "Fuse", parent.get(),
+              fused->source(), JsonObject());
+    }
+
+    switch (exec.outcome) {
+      case Outcome::kSucceeded: {
+        std::vector<uint32_t> claimed =
+            fuzzer_->coverage_.ClaimNewEdges(runner_->coverage().bitmap());
+        fuzzer_->KeepFocused(&claimed, AdmitOptimized());
+        ProgramPtr added;
+        size_t new_edges = claimed.size();
+        if (!claimed.empty()) {
+          stats().candidates++;
+          mutate_stage.successes++;
+          JsonObject why;
+          why.Add("new_edges", static_cast<uint64_t>(new_edges));
+          Capture(Stage::kMutate, CaptureTrigger::kInteresting, "Fuse",
+                  parent.get(), fused->source(), why);
+          // A Fuse root never joins a coalesced commit.
+          added = CommitNow(fused, std::move(claimed), exec, config().minimize,
+                            config().min_reruns, &fuse_stats);
+          if (added != nullptr) {
+            child_new_edges_ += added->edges.size();
+          }
+        }
+        LogMutant("Fuse", detail, ancestor_id, OutcomeName(exec.outcome), &exec,
+                  new_edges);
+        if (ancestor_id != 0) {
+          corpus.OnResult(*parent, added != nullptr);
+        }
+        if (added != nullptr) {
+          *parent_out = added;
+          *ancestor_out = added;
+          *chain_out = 0;
+        } else {
+          *parent_out = fused;
+          *ancestor_out = std::move(parent);
+          *chain_out = ancestor_id != 0 ? 1 : 0;
+        }
+        return true;
+      }
+      case Outcome::kCrashed: {
+        LogMutant("Fuse", detail, ancestor_id, OutcomeName(exec.outcome), &exec,
+                  0);
+        ProcessCrash(fused->source(), *fused, exec, fused->lineage());
+        return false;
+      }
+      case Outcome::kFailed:
+      case Outcome::kTimedOut:
+        LogMutant("Fuse", detail, ancestor_id, OutcomeName(exec.outcome), &exec,
+                  0);
+        if (ancestor_id != 0) {
+          corpus.OnResult(*parent, false);
+        }
+        return false;
+    }
+    return false;
+  }
+
+  // --- fuzzing ----------------------------------------------------------
+
+  void FuzzOne() {
+    MaybeRespawnForTargets();
+    Corpus& corpus = fuzzer_->corpus();
+    const bool has_material = !fuzzer_->material().empty();
+    SeedLease seed_lease;
+    ProgramPtr parent;
+    ProgramPtr ancestor;
     int chain = 0;
     const Environment& env = *fuzzer_->env_;
     MutatorSet& mutators = fuzzer_->mutators();
     GeneratorSet& generators = fuzzer_->generators();
+    int scratch_links = 0;
+    // Coalesced commit (stages.mutate.coalesce): the chain keeps at most one
+    // checked candidate pending. While it waits, the random d8 flags stay
+    // pinned, thus a respawn does not change them before its minimization.
+    // `commits` is destroyed before `chain_pin`. Its destructor finalizes
+    // the pending commit on each exit of the chain.
+    std::optional<FlagPin> chain_pin;
+    ChainCommits commits(
+        CoalesceLimits{config().max_coalesce_merges,
+                       static_cast<size_t>(config().max_coalesce_edges),
+                       static_cast<size_t>(config().max_coalesce_nodes)},
+        [&](PendingCommit commit) {
+          ProgramPtr added = Finalize(std::move(commit));
+          child_new_edges_ += added->edges.size();
+          ancestor = std::move(added);
+          chain = 0;
+        });
+    const Program* focus_source = nullptr;
 
-    // Fresh values at the top of the parent give every mutation of the chain
-    // something new to work with (Fuzzilli's buildPrefix()). The prefix is
-    // not a mutation of its own: it is only executed as part of the first
-    // child, and the minimizer drops whatever ends up unused. The empty
-    // program gets a prefix too, unless `prefix_from_scratch` is false.
-    if ((!from_empty || config().prefix_from_scratch) &&
-        config().value_prefix && fuzzer_->prefix_mutator_ != nullptr) {
-      Stopwatch prefix_time;
-      std::string detail;
-      std::unique_ptr<fast::Tree> prefixed =
-          ApplyMutation(*fuzzer_->prefix_mutator_, *parent, nullptr, rng_, env,
-                        generators, 1, &detail);
-      StageStats& st = stage(Stage::kPrefix);
-      st.invocations++;
-      st.time_us += prefix_time.ElapsedUs();
-      if (prefixed != nullptr) {
-        st.successes++;
-        parent = Program::FromTree(std::move(prefixed), parent->lineage());
-      } else {
-        Capture(Stage::kPrefix, CaptureTrigger::kNoop, "Prefix", parent.get(),
-                "", JsonObject());
+    if (has_material && rng_.Chance(MaterialFuseChance())) {
+      if (!RunFuseRoot(corpus, &seed_lease, &parent, &ancestor, &chain)) {
+        return;
       }
-      if (config().stage(Stage::kPrefix).events) {
-        JsonObject event;
-        event.Add("event", "prefix")
-            .Add("worker", id_)
-            .Add("program", ancestor->id);
-        event.Add("applied", prefixed != nullptr).Add("detail", detail);
-        fuzzer_->LogEvent(event);
+      focus_source = parent.get();
+    } else {
+      Stopwatch pick_time;
+      seed_lease = PickSeed(corpus);
+      parent = seed_lease.program();
+      bool from_empty = false;
+      if (parent == nullptr ||
+          (corpus.size() < static_cast<size_t>(config().initial_programs) &&
+           rng_.Coin())) {
+        seed_lease.Release();
+        parent = fuzzer_->empty_program_;
+        from_empty = true;
+      }
+      {
+        StageStats& st = stage(Stage::kPick);
+        st.invocations++;
+        st.time_us += pick_time.ElapsedUs();
+        if (!from_empty) {
+          st.successes++;
+        }
+        if (config().stage(Stage::kPick).events) {
+          JsonObject event;
+          event.Add("event", "pick")
+              .Add("worker", id_)
+              .Add("program", from_empty ? 0u : parent->id);
+          fuzzer_->LogEvent(event);
+        }
+      }
+      // Track the starting corpus seed for scheduler feedback and lineage.
+      ancestor = parent;
+      focus_source = ancestor.get();
+
+      // Prepend non-throwing value declarations to seed the mutation chain.
+      if ((!from_empty || config().prefix_from_scratch) &&
+          config().value_prefix && fuzzer_->prefix_mutator_ != nullptr) {
+        Stopwatch prefix_time;
+        std::string detail;
+        std::unique_ptr<fast::Tree> prefixed =
+            ApplyMutation(*fuzzer_->prefix_mutator_, *parent, nullptr, rng_,
+                          env, generators, 1, &detail);
+        StageStats& st = stage(Stage::kPrefix);
+        st.invocations++;
+        st.time_us += prefix_time.ElapsedUs();
+        if (prefixed != nullptr) {
+          st.successes++;
+          std::shared_ptr<Program> with_prefix =
+              Program::FromTree(std::move(prefixed), parent->lineage());
+          with_prefix->flags = parent->flags;
+          parent = std::move(with_prefix);
+        } else {
+          Capture(Stage::kPrefix, CaptureTrigger::kNoop, "Prefix", parent.get(),
+                  "", JsonObject());
+        }
+        if (config().stage(Stage::kPrefix).events) {
+          JsonObject event;
+          event.Add("event", "prefix")
+              .Add("worker", id_)
+              .Add("program", ancestor->id);
+          event.Add("applied", prefixed != nullptr).Add("detail", detail);
+          fuzzer_->LogEvent(event);
+        }
+      }
+
+      if (from_empty) {
+        scratch_links = config().scratch_codegen_links;
       }
     }
 
-    // A chain from the empty program uses only CodeGen for its first
-    // `scratch_codegen_links` links that run without an error.
-    int scratch_links = from_empty ? config().scratch_codegen_links : 0;
+    FocusTarget focus_target;
+    bool focus_active = false;
+    bool focus_needs_tier_up = false;
+    if (config().focus_chain > 0.0 && scratch_links == 0 &&
+        rng_.Chance(config().focus_chain)) {
+      const Program& seed = focus_source != nullptr ? *focus_source : *parent;
+      if (PickFocusTarget(seed.tree(), rng_, &focus_target) &&
+          parent->tree().FindNode(focus_target.body_id) != nullptr) {
+        focus_active = true;
+        focus_needs_tier_up = !focus_target.has_tier_up;
+        stats().focus_chains++;
+      }
+    }
+
+    int noop_retries = 0;  // retries of the current round after a no-op
     for (int round = 0; round < config().consecutive_mutations && !stopping();
          round++) {
-      Mutator* mutator = scratch_links > 0
-                             ? fuzzer_->codegen_mutator_
-                             : mutators.Pick(rng_, corpus.size() >= 2);
+      if (focus_active &&
+          parent->tree().FindNode(focus_target.body_id) == nullptr) {
+        focus_active = false;
+        focus_needs_tier_up = false;
+      }
+      const bool do_focus_tier_up = focus_active && focus_needs_tier_up;
+      Mutator* mutator =
+          (scratch_links > 0 || do_focus_tier_up)
+              ? fuzzer_->codegen_mutator_
+              : mutators.Pick(rng_, corpus.size() >= 2 || has_material);
       if (mutator == nullptr) {
         return;
       }
       ProgramPtr partner;
       if (mutator->needs_partner()) {
-        partner = corpus.PickPartner(*parent, rng_);
+        if (has_material &&
+            (corpus.size() < 2 || rng_.Chance(MaterialPartnerChance()))) {
+          partner = fuzzer_->material().Pick(rng_);
+        } else {
+          partner = corpus.PickPartner(*parent, rng_);
+        }
         if (partner == nullptr) {
           continue;
         }
+      }
+      if (mutator->name() == "Combine") {
+        // Combine adds an other whole program. Its edges must not join the
+        // property of the pending commit.
+        commits.Flush();
+        chain_pin.reset();
       }
       Stopwatch mutation_time;
       Stopwatch
@@ -692,16 +1280,36 @@ class Worker {
       }
       BeginGeneratorUsage();
       const uint64_t spent_before = executions_;
-      std::unique_ptr<fast::Tree> tree =
-          ApplyMutation(*mutator, *parent, partner, rng_, env, generators,
-                        rounds, &detail, &probes);
+      const uint64_t finalized_before = finalized_executions_;
+      std::unique_ptr<fast::Tree> tree;
+      if (do_focus_tier_up) {
+        focus_needs_tier_up = false;
+        tree = ApplyFocusTierUp(*parent, focus_target, rng_, env, generators,
+                                &detail);
+        if (tree != nullptr) {
+          mutator->stats().invocations++;
+          mutator->stats().produced++;
+        } else {
+          tree =
+              ApplyMutation(*mutator, *parent, partner, rng_, env, generators,
+                            rounds, &detail, &probes, focus_target.body_id);
+        }
+      } else {
+        const std::optional<uint32_t> focus_id =
+            focus_active ? std::optional<uint32_t>(focus_target.body_id)
+                         : std::nullopt;
+        tree = ApplyMutation(*mutator, *parent, partner, rng_, env, generators,
+                             rounds, &detail, &probes, focus_id);
+      }
       // The generators this mutation used share the credit for its result.
       const std::vector<Generator*> used_generators = GeneratorsUsed();
       // Every target execution of this step (the mutant, instrumented
       // probe runs, determinism reruns, minimizer runs, crash triage)
       // counts as spent by the mutator and by the generators it used.
+      // Finalize() gives its executions to the credits of its commit.
       const ScopeExit credit_spent([&] {
-        const uint64_t spent = executions_ - spent_before;
+        const uint64_t spent = (executions_ - spent_before) -
+                               (finalized_executions_ - finalized_before);
         mutator->stats().spent += spent;
         for (Generator* g : used_generators) {
           g->stats().spent += spent;
@@ -714,8 +1322,18 @@ class Worker {
         Capture(Stage::kMutate, CaptureTrigger::kNoop, mutator->name(),
                 parent.get(), "", JsonObject());
         LogMutant(*mutator, detail, ancestor->id, "noop", nullptr, 0);
+        // Like Fuzzilli's MutationEngine: a mutator that cannot apply does
+        // not use up the round. The next draw can pick another mutator.
+        if (noop_retries < kMaxNoopRetries) {
+          noop_retries++;
+          stats().noop_retries++;
+          round--;
+        } else {
+          noop_retries = 0;
+        }
         continue;
       }
+      noop_retries = 0;
       if (mutator->runtime_assisted()) {
         bool crashed = false;
         if (!CompleteRuntimeAssisted(*mutator, tree.get(), probes, &detail,
@@ -753,6 +1371,59 @@ class Worker {
         mutate_stage.time_us += stage_time.ElapsedUs();
         continue;
       }
+      mutate_stage.executions++;
+      mutate_stage.exec_time_us += execution.exec_time_us;
+      if (execution.outcome == Outcome::kFailed &&
+          rng_.Chance(SalvageChance())) {
+        // Wrap the throwing statement once and rerun the mutant.
+        const ExceptionLines lines =
+            ExtractExceptionLines(execution, prelude_lines_);
+        // A throw directly in the last top-level statement leaves no code
+        // for a wrap to run. Without new edges in the failed run, the
+        // worker does not run the retry.
+        const bool skip_tail =
+            !lines.empty() &&
+            !fuzzer_->coverage_.HasNewEdges(runner_->coverage().bitmap()) &&
+            ThrowsInLastTopLevelStatement(tree.get(), lines);
+        if (skip_tail) {
+          stats().salvage_skipped_tail++;
+        } else if (!lines.empty()) {
+          std::unique_ptr<fast::Tree> salvaged_tree = tree->Copy();
+          if (SalvageException(salvaged_tree.get(), lines,
+                               rng_.Chance(SalvageToplevelChance()))) {
+            std::string salvaged_source = fast::Print(salvaged_tree->root());
+            std::string salvaged_error;
+            const bool syntax_ok =
+                !config().syntax_check ||
+                checker_->Accepts(salvaged_source, &salvaged_error);
+            if (syntax_ok) {
+              stats().salvage_attempted++;
+              Execution salvaged_exec;
+              if (!Execute(salvaged_source, &salvaged_exec)) {
+                if (fuzzer_->failed_.load()) {
+                  mutate_stage.time_us += stage_time.ElapsedUs();
+                  return;
+                }
+              } else {
+                mutate_stage.executions++;
+                mutate_stage.exec_time_us += salvaged_exec.exec_time_us;
+                if (salvaged_exec.outcome == Outcome::kTimedOut) {
+                  mutate_stage.timeouts++;
+                }
+                if (salvaged_exec.succeeded() || salvaged_exec.crashed()) {
+                  if (salvaged_exec.succeeded()) {
+                    stats().salvage_succeeded++;
+                  }
+                  tree = std::move(salvaged_tree);
+                  source = std::move(salvaged_source);
+                  execution = std::move(salvaged_exec);
+                  detail += " [salvaged]";
+                }
+              }
+            }
+          }
+        }
+      }
       Account(mutator->stats(), execution);
       for (Generator* g : used_generators) {
         Account(g->stats(), execution);
@@ -760,8 +1431,6 @@ class Worker {
       AccountFuzzExecution(execution);
       ReportToSelector(*mutator, execution);
       stats().fuzz_nodes += fast::CountNodes(tree->root());
-      mutate_stage.executions++;
-      mutate_stage.exec_time_us += execution.exec_time_us;
       mutate_stage.time_us += stage_time.ElapsedUs();
       if (execution.outcome == Outcome::kTimedOut) {
         mutate_stage.timeouts++;
@@ -789,10 +1458,11 @@ class Worker {
         case Outcome::kSucceeded: {
           std::vector<uint32_t> claimed =
               fuzzer_->coverage_.ClaimNewEdges(runner_->coverage().bitmap());
-          fuzzer_->KeepFocused(&claimed);
+          fuzzer_->KeepFocused(&claimed, AdmitOptimized());
           std::shared_ptr<Program> child =
               Program::FromTree(std::move(tree), lineage, source);
-          ProgramPtr added;
+          child->flags = ChildFlags(*parent, partner.get());
+          bool admitted = false;
           size_t new_edges = claimed.size();
           if (!claimed.empty()) {
             stats().candidates++;
@@ -801,22 +1471,46 @@ class Worker {
             why.Add("new_edges", static_cast<uint64_t>(new_edges));
             Capture(Stage::kMutate, CaptureTrigger::kInteresting,
                     mutator->name(), parent.get(), source, why);
-            added = Commit(child, std::move(claimed), execution,
-                           config().minimize, mutator);
-            if (added != nullptr) {
-              // Each generator the mutant used gets the full credit.
-              const uint64_t targets = TargetFeatures(added->edges);
-              for (Generator* g : used_generators) {
-                g->stats().interesting++;
-                g->stats().new_edges += added->edges.size();
-                g->stats().new_targets += targets;
+            if (!chain_pin.has_value()) {
+              chain_pin.emplace(runner_->child());
+            }
+            bool pending_held = false;
+            std::optional<CheckedCandidate> checked =
+                Check(child, std::move(claimed), execution, config().min_reruns,
+                      commits.pending_edges(), &pending_held);
+            if (checked.has_value()) {
+              admitted = true;
+              // A candidate that cannot merge first publishes the pending
+              // commit. Then its seed is the program that was published.
+              if (commits.has_pending() &&
+                  !commits.CanMerge(*checked, pending_held)) {
+                commits.Flush();
+                stats().coalesce_breaks++;
               }
+              checked->minimize = config().minimize;
+              checked->credit.stats = &mutator->stats();
+              checked->credit.generators = used_generators;
+              if (ancestor->id != 0) {
+                checked->credit.seed = ancestor;
+              }
+              checked->credit.edges = checked->edges;
+              if (commits.Offer(std::move(*checked), pending_held) ==
+                  ChainCommits::Offered::kMerged) {
+                stats().coalesce_merges++;
+              }
+              if (!config().coalesce) {
+                commits.Flush();
+              }
+            }
+            if (!commits.has_pending()) {
+              chain_pin.reset();
             }
           }
           LogMutant(*mutator, detail, ancestor->id,
                     OutcomeName(execution.outcome), &execution, new_edges);
-          if (ancestor->id != 0) {
-            corpus.OnResult(*ancestor, added != nullptr);
+          // Finalize() gives the result of an admitted candidate to its seed.
+          if (!admitted && ancestor->id != 0) {
+            corpus.OnResult(*ancestor, false);
           }
           // The chain continues from the child as it ran, not from its
           // minimized copy. Minimization can remove material that the next
@@ -824,10 +1518,9 @@ class Worker {
           // minimizes on the side. The lineage of the next links has the id
           // of the published program.
           parent = child;
-          if (added != nullptr) {
-            ancestor = added;
-            chain = 0;
-          } else {
+          // A finalized commit set `ancestor` and `chain`. A pending
+          // candidate is not in the corpus yet.
+          if (!admitted || commits.has_pending()) {
             chain++;
           }
           if (scratch_links > 0) {
@@ -840,6 +1533,7 @@ class Worker {
                     OutcomeName(execution.outcome), &execution, 0);
           std::shared_ptr<Program> child =
               Program::FromTree(std::move(tree), lineage, source);
+          child->flags = ChildFlags(*parent, partner.get());
           ProcessCrash(source, *child, execution, lineage);
           return;
         }
@@ -855,13 +1549,38 @@ class Worker {
     }
   }
 
+  // Leases the seed of a mutation chain. If the target process has random
+  // flags, prefers a program that shares a flag with them. Inspects up to
+  // `flags.seed_affinity_tries` candidates under one lock without aging
+  // rejected seeds.
+  SeedLease PickSeed(Corpus& corpus) {
+    const int tries = SeedAffinityTries();
+    const std::vector<std::string>& active = runner_->child().random_args();
+    if (tries <= 1 || active.empty() ||
+        fuzzer_->flagged_programs_.load(std::memory_order_relaxed) == 0) {
+      return corpus.Lease(rng_);
+    }
+    return corpus.LeasePreferred(rng_, tries, [&active](const Program& p) {
+      return SharesD8Flag(p.flags, active);
+    });
+  }
+
+  // The flags of a mutant of `parent` and `partner` (nullptr: no partner).
+  static std::vector<std::string> ChildFlags(const Program& parent,
+                                             const Program* partner) {
+    if (partner == nullptr || partner->flags.empty()) {
+      return MergeProgramFlags(parent.flags, {});
+    }
+    return MergeProgramFlags(parent.flags, partner->flags);
+  }
+
   // --- stages: statistics, events and captures ---------------------------
 
   StageStats& stage(Stage s) { return fuzzer_->stages_[s]; }
 
   // One "mutant" event per executed (or dropped) mutation result when the
   // mutate stage logs events.
-  void LogMutant(const Mutator& mutator, const std::string& detail,
+  void LogMutant(std::string_view origin, const std::string& detail,
                  uint32_t parent_id, const char* outcome,
                  const Execution* execution, size_t new_edges) {
     if (!config().stage(Stage::kMutate).events) {
@@ -870,7 +1589,7 @@ class Worker {
     JsonObject event;
     event.Add("event", "mutant")
         .Add("worker", id_)
-        .Add("origin", mutator.name())
+        .Add("origin", origin)
         .Add("detail", detail);
     event.Add("parent", parent_id).Add("outcome", outcome);
     if (execution != nullptr) {
@@ -879,6 +1598,12 @@ class Worker {
     }
     event.Add("new_edges", static_cast<uint64_t>(new_edges));
     fuzzer_->LogEvent(event);
+  }
+
+  void LogMutant(const Mutator& mutator, const std::string& detail,
+                 uint32_t parent_id, const char* outcome,
+                 const Execution* execution, size_t new_edges) {
+    LogMutant(mutator.name(), detail, parent_id, outcome, execution, new_edges);
   }
 
   // Saves `parent` (if any) and `child` (if not empty) under
@@ -959,61 +1684,54 @@ class Worker {
     return applied > 0;
   }
 
-  // Determinism check, minimization and publication of a program that
-  // reached `claimed` new edges. Returns the published program, or nullptr
-  // if the program was dropped (edges released or suppressed as flaky).
-  ProgramPtr Commit(std::shared_ptr<Program> program,
-                    std::vector<uint32_t> claimed,
-                    const Execution& first_execution, bool minimize,
-                    Mutator* mutator) {
-    FlagPin pin(runner_->child());
-    SharedCoverage& shared = fuzzer_->coverage_;
-    const bool claimed_was_empty = claimed.empty();
-    std::vector<uint32_t> edges = std::move(claimed);
-    std::vector<uint32_t> release;
-    auto drop = [&](const std::vector<uint32_t>& dropped) {
-      for (uint32_t edge : dropped) {
-        if (!shared.RecordFlaky(edge, config().flaky_threshold)) {
-          release.push_back(edge);
-        }
-      }
-    };
+  // The rules of the determinism check of a program that runs `min_reruns`
+  // times again.
+  CheckRules MakeCheckRules(int min_reruns) const {
+    CheckRules rules;
+    rules.min_reruns = min_reruns;
+    rules.clean_min_reruns = config().clean_min_reruns;
+    rules.min_stable_reruns = config().min_stable_reruns;
+    rules.max_reruns = config().max_reruns;
+    rules.flaky_threshold = config().flaky_threshold;
+    rules.keep_without_edges = config().import_all;
+    return rules;
+  }
 
-    // 1. Determinism (Fuzzilli's processMaybeInteresting): every edge that
-    //    is kept must be reached by all of the re-executions; edges that
-    //    disappear are dropped from the set. There are at least min_reruns
-    //    re-executions, and the loop ends once the set survived
-    //    min_stable_reruns re-runs unchanged. A candidate that still loses
-    //    edges after max_reruns re-executions has not converged and is
-    //    dropped.
-    int stable = 0;
-    int reruns = 0;
-    size_t dropped = 0;
-    bool deterministic = true;
-    bool converged = false;
+  // The determinism check of a program that reached `claimed` new edges
+  // (RunDeterminismCheck). The coverage map must still hold the first run.
+  // With `pending_edges`, each run also tests the edges of the pending
+  // commit of the chain. `*pending_held` tells if all runs reached them.
+  // The check does not change the state of these edges. Returns the
+  // candidate, or nothing if the program was dropped (edges released or
+  // suppressed as flaky).
+  std::optional<CheckedCandidate> Check(
+      std::shared_ptr<Program> program, std::vector<uint32_t> claimed,
+      const Execution& first_execution, int min_reruns,
+      const std::vector<uint32_t>* pending_edges = nullptr,
+      bool* pending_held = nullptr) {
+    FlagPin pin(runner_->child());
+    const CoverageMap& coverage = runner_->coverage();
+    auto holds_pending = [&] {
+      return pending_edges == nullptr || coverage.AllEdgesSet(*pending_edges);
+    };
+    CheckedCandidate candidate;
+    candidate.exec_time_us = first_execution.exec_time_us;
+    candidate.edges_hit = coverage.CountCurrentEdges();
+    // The edges of the runs below, for a seed strategy that wants them.
+    const bool wants_hit_edges = fuzzer_->corpus().WantsHitEdges();
+    if (wants_hit_edges) {
+      candidate.hit_edges.RecordRun(coverage.CurrentEdges());
+    }
+    const bool first_held = holds_pending();
     bool rerun_timeout = false;
-    uint64_t exec_time_us = first_execution.exec_time_us;
-    uint32_t edges_hit = runner_->coverage().CountCurrentEdges();
     Stopwatch check_time;
     StageStats& check_stage = stage(Stage::kCheck);
     check_stage.invocations++;
-    // (A program imported with --import-all may have no new edges at all;
-    // it is still re-run so that only reliable programs are published.)
-    while (deterministic && (!edges.empty() || claimed_was_empty)) {
-      if (stable >= config().min_stable_reruns &&
-          reruns >= config().min_reruns) {
-        converged = true;
-        break;
-      }
-      if (reruns >= config().max_reruns) {
-        break;
-      }
+    auto rerun = [&](const std::vector<uint32_t>& edges, CheckRun* run) {
       Execution execution;
       if (!Execute(program->source(), &execution)) {
-        deterministic = false;
-        break;
+        return false;
       }
-      reruns++;
       stats().rerun_executions++;
       check_stage.executions++;
       check_stage.exec_time_us += execution.exec_time_us;
@@ -1025,70 +1743,115 @@ class Worker {
         HarvestCrash(program->source(), execution, program->lineage(),
                      "determinism rerun");
       }
-      if (!execution.succeeded()) {
-        deterministic = false;
-        break;
+      run->succeeded = execution.succeeded();
+      if (!run->succeeded) {
+        return true;
       }
-      exec_time_us = std::min(exec_time_us, execution.exec_time_us);
-      std::vector<uint32_t> missing = runner_->coverage().MissingEdges(edges);
-      if (missing.empty()) {
-        stable++;
-        continue;
+      candidate.exec_time_us =
+          std::min(candidate.exec_time_us, execution.exec_time_us);
+      if (wants_hit_edges) {
+        candidate.hit_edges.RecordRun(coverage.CurrentEdges());
       }
-      stable = 0;
-      dropped += missing.size();
-      drop(missing);
-      std::vector<uint32_t> kept;
-      std::set_difference(edges.begin(), edges.end(), missing.begin(),
-                          missing.end(), std::back_inserter(kept));
-      edges.swap(kept);
+      run->missing = coverage.MissingEdges(edges);
+      run->pending_held = holds_pending();
+      return true;
+    };
+    CheckResult result =
+        RunDeterminismCheck(fuzzer_->coverage_, MakeCheckRules(min_reruns),
+                            std::move(claimed), first_held, rerun);
+    if (pending_held != nullptr) {
+      *pending_held = result.pending_held;
     }
-    // A program without new edges is only published for --import-all; it
-    // still had to run reliably.
-    const bool keep_without_edges =
-        edges.empty() && claimed_was_empty && config().import_all;
-    const bool survived =
-        deterministic && converged && (!edges.empty() || keep_without_edges);
     check_stage.time_us += check_time.ElapsedUs();
-    if (survived) {
+    if (result.survived) {
       check_stage.successes++;
+    }
+    if (result.clean) {
+      stats().clean_checks++;
     }
     if (config().stage(Stage::kCheck).events) {
       JsonObject event;
       event.Add("event", "check")
           .Add("worker", id_)
           .Add("origin", program->lineage().origin);
-      event.Add("reruns", reruns)
-          .Add("dropped_edges", static_cast<uint64_t>(dropped));
-      event.Add("kept_edges", static_cast<uint64_t>(edges.size()))
-          .Add("survived", survived);
-      event.Add("deterministic_outcome", deterministic)
-          .Add("converged", converged);
+      event.Add("reruns", result.reruns)
+          .Add("dropped_edges", static_cast<uint64_t>(result.dropped));
+      event.Add("kept_edges", static_cast<uint64_t>(result.edges.size()))
+          .Add("survived", result.survived);
+      event.Add("deterministic_outcome", result.deterministic)
+          .Add("converged", result.converged);
+      event.Add("clean", result.clean);
+      if (pending_edges != nullptr) {
+        event.Add("pending_held", result.pending_held);
+      }
       fuzzer_->LogEvent(event);
     }
-    if (!survived || rerun_timeout) {
+    if (!result.survived || rerun_timeout) {
       JsonObject why;
-      why.Add("reruns", reruns)
-          .Add("dropped_edges", static_cast<uint64_t>(dropped));
-      why.Add("deterministic_outcome", deterministic)
-          .Add("converged", converged);
+      why.Add("reruns", result.reruns)
+          .Add("dropped_edges", static_cast<uint64_t>(result.dropped));
+      why.Add("deterministic_outcome", result.deterministic)
+          .Add("converged", result.converged);
       Capture(Stage::kCheck,
               rerun_timeout ? CaptureTrigger::kTimeout : CaptureTrigger::kFlaky,
               program->lineage().origin, nullptr, program->source(), why);
     }
-    if (!survived) {
-      drop(edges);
-      shared.Release(release);
+    if (!result.survived) {
       stats().flaky++;
       JsonObject event;
       event.Add("event", "flaky").Add("origin", program->lineage().origin);
-      event.Add("deterministic_outcome", deterministic).Add("worker", id_);
-      event.Add("reruns", reruns)
-          .Add("dropped_edges", static_cast<uint64_t>(dropped));
+      event.Add("deterministic_outcome", result.deterministic)
+          .Add("worker", id_);
+      event.Add("reruns", result.reruns)
+          .Add("dropped_edges", static_cast<uint64_t>(result.dropped));
       fuzzer_->LogEvent(event);
+      return std::nullopt;
+    }
+    candidate.program = std::move(program);
+    candidate.edges = std::move(result.edges);
+    candidate.reruns = result.reruns;
+    candidate.dropped = result.dropped;
+    return candidate;
+  }
+
+  // Check() and Finalize() of one program without a chain (imports and Fuse
+  // roots). Returns the published program, or nullptr if the check dropped
+  // the program.
+  ProgramPtr CommitNow(std::shared_ptr<Program> program,
+                       std::vector<uint32_t> claimed,
+                       const Execution& first_execution, bool minimize,
+                       int min_reruns, ComponentStats* credit_stats) {
+    FlagPin pin(runner_->child());
+    std::optional<CheckedCandidate> checked = Check(
+        std::move(program), std::move(claimed), first_execution, min_reruns);
+    if (!checked.has_value()) {
       return nullptr;
     }
-    shared.Release(release);
+    checked->minimize = minimize;
+    checked->credit.stats = credit_stats;
+    checked->credit.edges = checked->edges;
+    PendingCommit commit;
+    commit.credits.push_back(std::move(checked->credit));
+    commit.candidate = std::move(*checked);
+    return Finalize(std::move(commit));
+  }
+
+  // Minimizes and publishes a checked commit. It always publishes, also
+  // when a stop request skips the minimization. The executions of this
+  // function go to the credits of the commit, in proportion to their new
+  // edges. Returns the published program.
+  ProgramPtr Finalize(PendingCommit commit) {
+    FlagPin pin(runner_->child());
+    const uint64_t executions_before = executions_;
+    SharedCoverage& shared = fuzzer_->coverage_;
+    CheckedCandidate& checked = commit.candidate;
+    std::shared_ptr<Program> program = std::move(checked.program);
+    const std::vector<uint32_t>& edges = checked.edges;
+    HitEdges& hit_edges = checked.hit_edges;
+    uint64_t exec_time_us = checked.exec_time_us;
+    uint32_t edges_hit = checked.edges_hit;
+    const bool minimize = checked.minimize;
+    const bool wants_hit_edges = fuzzer_->corpus().WantsHitEdges();
 
     // 2. Minimization against the surviving edges.
     MinimizationResult minimization;
@@ -1101,7 +1864,9 @@ class Worker {
       std::unique_ptr<fast::Tree> work = program->CopyTree();
       // A reduction can turn a terminating loop into an infinite one; such
       // probes must not pay the full target timeout (plus a child respawn).
-      const uint64_t probe_timeout_us = ProbeTimeout(exec_time_us);
+      // Each kept reduction sets the timeout from the run time of its probe.
+      const uint64_t first_probe_timeout_us = ProbeTimeout(exec_time_us);
+      uint64_t probe_timeout_us = first_probe_timeout_us;
       // The property that the minimizer keeps (see MinimizationProperty).
       bool fragile_only = false;
       const std::vector<uint32_t> property =
@@ -1127,8 +1892,17 @@ class Worker {
                        "minimizer probe");
           return false;
         }
-        return execution.succeeded() &&
-               runner_->coverage().AllEdgesSet(property);
+        if (!execution.succeeded() ||
+            !runner_->coverage().AllEdgesSet(property)) {
+          return false;
+        }
+        // The minimizer keeps this reduction.
+        probe_timeout_us = TightenedProbeTimeout(
+            config(), first_probe_timeout_us, execution.exec_time_us);
+        if (wants_hit_edges) {
+          hit_edges.RecordProbe(runner_->coverage().CurrentEdges());
+        }
+        return true;
       };
       MinimizerOptions budget = config().minimizer.ForProgram(exec_time_us);
       if (fragile_only) {
@@ -1145,6 +1919,7 @@ class Worker {
         // an edge that is reached deterministically otherwise.
         std::shared_ptr<Program> candidate =
             Program::FromTree(std::move(work), program->lineage());
+        candidate->flags = program->flags;
         for (int attempt = 0; attempt < config().verify_attempts && !stopping();
              attempt++) {
           Execution execution;
@@ -1164,6 +1939,9 @@ class Worker {
               candidate;  // a copy: `candidate` is reported below if rejected
           exec_time_us = execution.exec_time_us;
           edges_hit = runner_->coverage().CountCurrentEdges();
+          if (wants_hit_edges) {
+            hit_edges.RecordVerifiedRun(runner_->coverage().CurrentEdges());
+          }
           minimized = true;
           break;
         }
@@ -1202,38 +1980,34 @@ class Worker {
     program->edges = edges;
     program->edges_hit = edges_hit;
     program->exec_time_us = exec_time_us;
-    if (fuzzer_->corpus().WantsHitEdges() && !stopping()) {
-      // Every edge the final program reaches in two runs (Fuzzilli's
-      // RarityCorpus does the same two executions).
-      std::vector<uint32_t> hit;
-      for (int run = 0; run < 2; run++) {
+    if (wants_hit_edges) {
+      // Every edge that the final program reaches in all recorded runs, and
+      // in at least two runs (Fuzzilli's RarityCorpus uses two runs). The
+      // check and the minimization usually recorded enough runs. Otherwise
+      // run the program again.
+      while (hit_edges.runs() < kHitEdgeRuns && !stopping()) {
         Execution execution;
         if (!Execute(program->source(), &execution) || !execution.succeeded()) {
-          hit.clear();
+          hit_edges.Clear();
           break;
         }
         stats().rerun_executions++;
-        std::vector<uint32_t> current = runner_->coverage().CurrentEdges();
-        std::sort(current.begin(), current.end());
-        if (run == 0) {
-          hit.swap(current);
-          continue;
-        }
-        std::vector<uint32_t> both;
-        std::set_intersection(hit.begin(), hit.end(), current.begin(),
-                              current.end(), std::back_inserter(both));
-        hit.swap(both);
+        stats().hit_edge_executions++;
+        hit_edges.RecordRun(runner_->coverage().CurrentEdges());
       }
-      program->hit_edges = std::move(hit);
+      if (hit_edges.runs() >= kHitEdgeRuns) {
+        program->hit_edges = hit_edges.Take();
+        // A suppressed flaky edge is not a deterministic edge of the program.
+        shared.RemoveSuppressed(&program->hit_edges);
+      }
     }
     ProgramPtr added = fuzzer_->corpus().Add(program);
+    if (!added->flags.empty()) {
+      fuzzer_->flagged_programs_.fetch_add(1, std::memory_order_relaxed);
+    }
     stats().corpus_added++;
     stats().corpus_nodes += program->node_count();
-    if (mutator != nullptr) {
-      mutator->stats().interesting++;
-      mutator->stats().new_edges += added->edges.size();
-      mutator->stats().new_targets += TargetFeatures(added->edges);
-    }
+    CreditCommit(commit.credits, executions_ - executions_before);
     if (config().save_corpus) {
       fuzzer_->SaveCorpusProgram(*added);
     }
@@ -1249,8 +2023,9 @@ class Worker {
         .Add("chain", added->lineage().chain);
     event.Add("generation", added->lineage().generation);
     event.Add("nodes", static_cast<uint64_t>(added->node_count()));
-    event.Add("reruns", reruns)
-        .Add("dropped_edges", static_cast<uint64_t>(dropped));
+    event.Add("reruns", checked.reruns)
+        .Add("dropped_edges", static_cast<uint64_t>(checked.dropped));
+    event.Add("coalesced", commit.merges);
     event.Add("exec_time_ms", static_cast<double>(exec_time_us) / 1000.0);
     event.Add("worker", id_);
     if (config().randomize_d8_flags) {
@@ -1268,6 +2043,40 @@ class Worker {
     event.Add("coverage", shared.coverage_fraction());
     fuzzer_->LogEvent(event);
     return added;
+  }
+
+  // Gives the result of a published commit to its credits. Each credit gets
+  // a part of `executions` (the executions of Finalize) in proportion to its
+  // new edges. It also gets its new edges, and its seed gets a success.
+  void CreditCommit(const std::vector<CommitCredit>& credits,
+                    uint64_t executions) {
+    finalized_executions_ += executions;
+    std::vector<size_t> edge_counts;
+    edge_counts.reserve(credits.size());
+    for (const CommitCredit& credit : credits) {
+      edge_counts.push_back(credit.edges.size());
+    }
+    const std::vector<uint64_t> parts = SplitByEdges(executions, edge_counts);
+    for (size_t i = 0; i < credits.size(); i++) {
+      const CommitCredit& credit = credits[i];
+      const uint64_t targets = TargetFeatures(credit.edges);
+      auto give = [&](ComponentStats& stats) {
+        stats.spent += parts[i];
+        stats.interesting++;
+        stats.new_edges += credit.edges.size();
+        stats.new_targets += targets;
+      };
+      if (credit.stats != nullptr) {
+        give(*credit.stats);
+      }
+      // Each generator that the candidate used gets the full credit.
+      for (Generator* g : credit.generators) {
+        give(g->stats());
+      }
+      if (credit.seed != nullptr) {
+        fuzzer_->corpus().OnResult(*credit.seed, true);
+      }
+    }
   }
 
   // --- crashes ----------------------------------------------------------
@@ -1327,6 +2136,7 @@ class Worker {
     int reruns = 0;                // fresh-target re-executions
     int reproduced = 0;            // ... that crashed again
     int same_signature = 0;        // ... with the same signature
+    int rerun_timeouts = 0;        // ... that timed out
     bool replayed = false;         // the history replay was attempted
     bool state_dependent = false;  // crashes only behind (part of) the history
     size_t history_needed = 0;     // shortest history suffix that reproduces it
@@ -1609,6 +2419,8 @@ class Worker {
 
   // The test budget of a minimization that keeps only fragile features.
   static constexpr int kFragileMinimizerTests = 60;
+  // Program::hit_edges needs the edges of at least this many runs.
+  static constexpr int kHitEdgeRuns = 2;
 
   // The features that the minimizer must keep. By default, all new features
   // of the program. With --minimize-code-edges, only the new code edges, the
@@ -2396,15 +3208,21 @@ class Worker {
     // 1. Does it reproduce in a fresh target? The crash killed the target,
     //    so the first re-execution already runs in a new process.
     //    crash_reruns_stop_after crashes are deterministic enough to stop
-    //    early.
+    //    early. The reruns get a longer timeout (CrashRerunTimeout), thus a
+    //    crash near the timeout is not lost.
     uint64_t exec_time_us = execution.exec_time_us;
+    const uint64_t rerun_timeout_us = CrashRerunTimeout(config());
     for (; info.reruns < config().crash_reruns && !stopping(); info.reruns++) {
       Execution again;
-      if (!Execute(source, &again)) {
+      if (!Execute(source, &again, rerun_timeout_us)) {
         break;
       }
       stats().rerun_executions++;
       exec_time_us = std::max(exec_time_us, again.exec_time_us);
+      if (again.timed_out()) {
+        info.rerun_timeouts++;
+        stats().crash_rerun_timeouts++;
+      }
       if (!again.crashed()) {
         continue;
       }
@@ -2566,6 +3384,7 @@ class Worker {
     event.Add("reproducible", info.reproducible()).Add("reruns", info.reruns);
     event.Add("reproduced", info.reproduced)
         .Add("same_signature", info.same_signature);
+    event.Add("rerun_timeouts", info.rerun_timeouts);
     event.Add("child_age", info.child_age).Add("replayed", info.replayed);
     event.Add("state_dependent", info.state_dependent);
     event.Add("history_needed", static_cast<uint64_t>(info.history_needed));
@@ -2754,6 +3573,36 @@ class Worker {
     return path;
   }
 
+  // Swarm testing (core/swarm.h). At the start of an epoch, this function
+  // draws the mask of this worker. The picks on this thread then use it.
+  // Worker 0 and sessions without selection.swarm use no mask.
+  void UpdateSwarmMask() {
+    if (!config().selection.swarm || id_ == 0) {
+      return;
+    }
+    const SwarmSettings& settings = fuzzer_->swarm_settings_;
+    const uint64_t epoch =
+        swarm_execs_ / static_cast<uint64_t>(settings.epoch_execs);
+    if (ActiveSwarmMask() == &swarm_mask_ && swarm_mask_.epoch == epoch) {
+      return;
+    }
+    swarm_mask_ =
+        DrawSwarmMask(settings, fuzzer_->swarm_generators_,
+                      fuzzer_->swarm_mutators_, config().seed, id_, epoch);
+    SetActiveSwarmMask(&swarm_mask_);
+    stats().swarm_epochs++;
+    const int enabled = swarm_mask_.enabled_mutator;
+    JsonObject event;
+    event.Add("event", "swarm").Add("worker", id_).Add("epoch", epoch);
+    event.Add("kept_generators", swarm_mask_.kept_generators)
+        .Add("enabled_mutator",
+             enabled < 0 ? std::string()
+                         : fuzzer_->mutators()
+                               .candidates()[static_cast<size_t>(enabled)]
+                               ->name());
+    fuzzer_->LogEvent(event);
+  }
+
   // Separates the random flags from the other random decisions: a change
   // of the flags does not change the programs.
   static constexpr uint64_t kFlagsSeedSalt = 0x5DEECE66Dull;
@@ -2762,16 +3611,26 @@ class Worker {
   int id_;
   Random rng_;
   Random flags_rng_;  // random d8 flags (randomize_d8_flags)
+  int prelude_lines_ = 0;
   std::unique_ptr<ScriptRunner> runner_;
   std::unique_ptr<SyntaxChecker> checker_;
   std::thread thread_;
   int consecutive_failures_ = 0;
   uint64_t executions_ = 0;  // target executions of this worker
+  // The executions of Finalize(). CreditCommit() gives them to the credits
+  // of the commit, thus the credit of a mutation step does not count them.
+  uint64_t finalized_executions_ = 0;
+  // Swarm testing: the fuzz executions of this worker and its mask.
+  uint64_t swarm_execs_ = 0;
+  SwarmMask swarm_mask_;
   std::deque<std::string> history_;
   size_t history_bytes_ = 0;
   std::vector<uint8_t> child_target_buckets_;
   uint32_t child_target_hits_ = 0;
   uint32_t child_execs_ = 0;
+  // New corpus edges that the mutants of this worker found since the last
+  // draw of random flags.
+  uint64_t child_new_edges_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -2877,6 +3736,13 @@ bool Fuzzer::Initialize(std::string* error) {
     return false;
   }
   prefix_mutator_ = mutators_->Find("Prefix");
+  if (config_.selection.swarm) {
+    swarm_settings_ = SwarmSettings::FromTunables();
+    if (!BuildSwarmCandidates(*generators_, *mutators_, &swarm_generators_,
+                              &swarm_mutators_, error)) {
+      return false;
+    }
+  }
   Lineage empty;
   empty.origin = "empty";
   empty_program_ = Program::Parse("", empty, error);
@@ -2885,6 +3751,24 @@ bool Fuzzer::Initialize(std::string* error) {
   }
 
   CollectImports();
+  material_ = std::make_unique<MaterialBank>();
+  if (!config_.material_paths.empty()) {
+    MaterialBank::Options material_opts;
+    material_opts.paths = config_.material_paths;
+    material_opts.import_root = config_.import_root;
+    material_opts.max_programs =
+        static_cast<size_t>(std::max(0, config_.material_max));
+    material_opts.seed = config_.seed;
+    material_stats_ = material_->Load(material_opts);
+    // Record material flags now if no seed imports wait to populate the pool.
+    if (import_files_.empty()) {
+      RecordMaterialFlags(*material_);
+    }
+    REDLINE_LOG(kLog,
+                "material: %zu loaded, %zu skipped, %zu error(s) in %.1f ms",
+                material_stats_.loaded, material_stats_.skipped,
+                material_stats_.errors, material_stats_.elapsed_ms);
+  }
 
   // Coverage counters and change-based fuzzing: the targets become watched
   // edges.
@@ -2904,6 +3788,7 @@ bool Fuzzer::Initialize(std::string* error) {
     }
   }
 
+  import_workers_pending_.store(config_.jobs, std::memory_order_release);
   for (int i = 0; i < config_.jobs; i++) {
     auto worker = std::make_unique<Worker>(this, i);
     if (!worker->Start(error)) {
@@ -2922,6 +3807,11 @@ bool Fuzzer::Initialize(std::string* error) {
   }
 
   if (!InitializeFeatureWeights(targets_code_edges, error)) {
+    return false;
+  }
+  optimized_admit_workers_ =
+      OptimizedAdmitWorkers(config_.opt_admit_workers_fraction, config_.jobs);
+  if (!CheckTargetCrashes(error)) {
     return false;
   }
 
@@ -2994,17 +3884,58 @@ bool Fuzzer::InitializeFeatureWeights(uint32_t targets_code_edges,
   return true;
 }
 
-bool Fuzzer::KeepFocused(std::vector<uint32_t>* claimed) {
+bool Fuzzer::CheckTargetCrashes(std::string* error) {
+  if (FiltersCrashProbes(config_.target.args)) {
+    REDLINE_LOG(kLog,
+                "crash probes skipped: with a d8 flag of the target, a failed "
+                "CHECK or DCHECK does not crash");
+    return true;
+  }
+  bool check_crashed = false;
+  bool dcheck_crashed = false;
+  if (!workers_[0]->ProbeCrash(1, &check_crashed, error) ||
+      !workers_[0]->ProbeCrash(2, &dcheck_crashed, error)) {
+    *error = "crash probe: " + *error;
+    return false;
+  }
+  if (!check_crashed) {
+    *error = StringPrintf(
+        "the target does not crash on a failed CHECK (%s)",
+        CrashProbeScript(workers_[0]->coverage().is_fuzzilli(), 1).c_str());
+    return false;
+  }
+  if (!dcheck_crashed) {
+    const std::string message = StringPrintf(
+        "the target does not crash on a failed DCHECK (%s): it cannot find "
+        "DCHECK bugs. Use a d8 with DCHECKs (v8_enable_debugging_features "
+        "or dcheck_always_on)",
+        CrashProbeScript(workers_[0]->coverage().is_fuzzilli(), 2).c_str());
+    if (!config_.allow_no_dcheck) {
+      *error = message + ", or pass --allow-no-dcheck";
+      return false;
+    }
+    REDLINE_WARN(kLog, "%s", message.c_str());
+  }
+  return true;
+}
+
+bool Fuzzer::KeepFocused(std::vector<uint32_t>* claimed,
+                         const CoverageMap* admit_optimized) {
   const FeatureWeights* weights = feature_weights_.get();
   if (claimed->empty() || weights == nullptr || !weights->filters_admission()) {
     return !claimed->empty();
   }
+  auto keep = [weights, admit_optimized](uint32_t feature) {
+    return weights->InFocus(feature) ||
+           (admit_optimized != nullptr &&
+            admit_optimized->KindOf(admit_optimized->EdgeOf(feature)) ==
+                CoverageMap::FeatureKind::kOptimized);
+  };
   const size_t before = claimed->size();
-  claimed->erase(std::remove_if(claimed->begin(), claimed->end(),
-                                [weights](uint32_t feature) {
-                                  return !weights->InFocus(feature);
-                                }),
-                 claimed->end());
+  claimed->erase(
+      std::remove_if(claimed->begin(), claimed->end(),
+                     [&keep](uint32_t feature) { return !keep(feature); }),
+      claimed->end());
   unfocused_features_.fetch_add(before - claimed->size(),
                                 std::memory_order_relaxed);
   if (claimed->empty()) {
@@ -3016,29 +3947,7 @@ bool Fuzzer::KeepFocused(std::vector<uint32_t>* claimed) {
 
 void Fuzzer::RecordTargetFlags(const std::vector<std::string>& args,
                                double score) {
-  if (score <= 0) {
-    return;
-  }
-  std::scoped_lock<std::mutex> lock(target_flags_mutex_);
-  for (TargetFlagEntry& entry : target_flags_) {
-    if (entry.args == args) {
-      entry.score = std::max(entry.score, score);
-      return;
-    }
-  }
-  if (target_flags_.size() < 64) {
-    target_flags_.push_back(TargetFlagEntry{args, score});
-  } else {
-    auto worst = std::min_element(
-        target_flags_.begin(), target_flags_.end(),
-        [](const TargetFlagEntry& a, const TargetFlagEntry& b) {
-          return a.score < b.score;
-        });
-    if (score > worst->score) {
-      *worst = TargetFlagEntry{args, score};
-    }
-  }
-  has_target_flags_.store(true, std::memory_order_relaxed);
+  target_flags_.Record(args, score);
 }
 
 void Fuzzer::RecordTargetChild(bool hit) {
@@ -3048,12 +3957,113 @@ void Fuzzer::RecordTargetChild(bool hit) {
   target_children_completed_.fetch_add(1, std::memory_order_release);
 }
 
+void Fuzzer::RecordImportedFlags(const std::vector<std::string>& flags,
+                                 double score) {
+  imported_flags_.Record(flags, score);
+}
+
+void Fuzzer::RecordMaterialFlags(const MaterialBank& bank) {
+  if (!config_.randomize_d8_flags) {
+    return;
+  }
+  const size_t cap = imported_flags_.capacity();
+  for (const ProgramPtr& prog : bank.programs()) {
+    if (imported_flags_.size() >= cap) {
+      break;
+    }
+    if (!prog->flags.empty()) {
+      imported_flags_.Record(prog->flags, 0.5);
+    }
+  }
+}
+
+void Fuzzer::FinishImportWorker() {
+  if (!import_files_.empty() &&
+      import_workers_pending_.fetch_sub(1, std::memory_order_acq_rel) == 1 &&
+      material_ != nullptr) {
+    RecordMaterialFlags(*material_);
+  }
+}
+
+void Fuzzer::RecordProductiveFlags(const std::vector<std::string>& flags,
+                                   uint64_t new_edges, uint64_t executions) {
+  if (executions == 0) {
+    return;
+  }
+  // New edges per 1000 executions. A process that a crash stopped early
+  // counts as a process with kMinExecutions executions.
+  constexpr uint64_t kMinExecutions = 100;
+  constexpr double kMeanWeight = 0.1;
+  constexpr double kDecay = 0.99;
+  const double rate = static_cast<double>(new_edges) * 1000.0 /
+                      static_cast<double>(std::max(executions, kMinExecutions));
+  double mean = 0;
+  {
+    std::scoped_lock<std::mutex> lock(productive_mutex_);
+    mean = productive_processes_ == 0 ? rate : productive_mean_;
+    productive_mean_ = mean + kMeanWeight * (rate - mean);
+    productive_processes_++;
+  }
+  // Old sets lose their score, so that the pool follows the session.
+  productive_flags_.Decay(kDecay);
+  if (rate > mean) {
+    productive_flags_.Record(flags, rate / (mean + 1.0));
+  }
+}
+
+void Fuzzer::RecordSpawn(const std::vector<std::string>& args, bool started) {
+  if (flag_blacklist_.RecordSpawn(args, started)) {
+    std::string blocked;
+    for (const std::string& name : flag_blacklist_.Blocked()) {
+      blocked += blocked.empty() ? name : " " + name;
+    }
+    REDLINE_WARN(kLog, "blocked d8 flags for the session: %s", blocked.c_str());
+  }
+}
+
 std::vector<std::string> Fuzzer::DrawD8Flags(Random& rng) {
   D8FlagProfile profile = D8FlagProfile::kMaglev;
   ParseD8FlagProfile(config_.d8_flag_profile, &profile);
   const std::vector<std::string>& fixed = config_.target.args;
   std::vector<std::string> fresh = RandomD8Flags(rng, profile, fixed);
-  if (targets_.empty() || !has_target_flags_.load(std::memory_order_relaxed)) {
+  if (!config_.d8_trial_list.empty()) {
+    AddD8Trials(rng, config_.d8_trial_list, fixed, &fresh);
+  }
+  std::vector<std::string> flags = targets_.empty()
+                                       ? DrawNormalModeFlags(rng, fresh)
+                                       : DrawTargetFlags(rng, fresh);
+  flag_blacklist_.Filter(&flags);
+  RemoveFixedD8Flags(&flags, fixed);
+  flag_draws_.fetch_add(1, std::memory_order_relaxed);
+  {
+    std::scoped_lock<std::mutex> lock(drawn_names_mutex_);
+    for (const std::string& flag : flags) {
+      drawn_names_.emplace(D8FlagName(flag));
+    }
+  }
+  return flags;
+}
+
+std::vector<std::string> Fuzzer::DrawNormalModeFlags(
+    Random& rng, std::vector<std::string> fresh) {
+  const std::vector<std::string>& fixed = config_.target.args;
+  std::vector<std::string> base;
+  if (!imported_flags_.empty() && rng.Chance(ImportedFlagsChance()) &&
+      imported_flags_.Pick(rng, 1, &base)) {
+    imported_flag_draws_.fetch_add(1, std::memory_order_relaxed);
+    return CombineD8Flags(base, fresh, rng, fixed);
+  }
+  if (!productive_flags_.empty() && rng.Chance(FlagAffinityChance()) &&
+      productive_flags_.Pick(rng, TargetTournament(), &base)) {
+    affinity_flag_draws_.fetch_add(1, std::memory_order_relaxed);
+    return CombineD8Flags(base, fresh, rng, fixed);
+  }
+  return fresh;
+}
+
+std::vector<std::string> Fuzzer::DrawTargetFlags(
+    Random& rng, std::vector<std::string> fresh) {
+  if (target_flags_.empty()) {
     return fresh;
   }
   // When most children reach target edges, `EffectiveTargetGuidedChance` lowers
@@ -3067,23 +4077,11 @@ std::vector<std::string> Fuzzer::DrawD8Flags(Random& rng) {
     return fresh;
   }
   std::vector<std::string> base;
-  {
-    std::scoped_lock<std::mutex> lock(target_flags_mutex_);
-    if (target_flags_.empty()) {
-      return fresh;
-    }
-    size_t best = rng.Index(target_flags_.size());
-    const int k = TargetTournament();
-    for (int i = 1; i < k; i++) {
-      size_t candidate = rng.Index(target_flags_.size());
-      if (target_flags_[candidate].score > target_flags_[best].score) {
-        best = candidate;
-      }
-    }
-    base = target_flags_[best].args;
+  if (!target_flags_.Pick(rng, TargetTournament(), &base)) {
+    return fresh;
   }
   if (rng.Chance(TargetMutateChance())) {
-    return CombineD8Flags(base, fresh, rng, fixed);
+    return CombineD8Flags(base, fresh, rng, config_.target.args);
   }
   return base;
 }
@@ -3290,20 +4288,56 @@ void Fuzzer::WriteSignatureSummary() {
   }
 }
 
-bool Fuzzer::SaveCorpusProgram(const Program& program) {
+std::string EscapeCommentLine(std::string_view text) {
+  std::string out;
+  out.reserve(text.size());
+  for (size_t i = 0; i < text.size(); i++) {
+    const char c = text[i];
+    if (c == '\n') {
+      out += "\\n";
+    } else if (c == '\r') {
+      out += "\\r";
+    } else if (c == '\xE2' && i + 2 < text.size() && text[i + 1] == '\x80' &&
+               (text[i + 2] == '\xA8' || text[i + 2] == '\xA9')) {
+      // U+2028 and U+2029 (UTF-8 E2 80 A8 and E2 80 A9).
+      out += text[i + 2] == '\xA8' ? "\\u2028" : "\\u2029";
+      i += 2;
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+std::string CorpusFileHeader(const Program& program) {
   const Lineage& lineage = program.lineage();
-  std::string header = StringPrintf(
+  std::string header = EscapeCommentLine(StringPrintf(
       "// redline corpus #%u | origin %s | parent #%u +%d | generation %d | "
       "%zu new edges | "
-      "%zu nodes | worker %d%s%s\n",
+      "%zu nodes | worker %d%s%s",
       program.id, lineage.origin.c_str(), lineage.parent_id, lineage.chain,
       lineage.generation, program.edges.size(), program.node_count(),
       lineage.worker, lineage.detail.empty() ? "" : " | ",
-      lineage.detail.c_str());
+      lineage.detail.c_str()));
+  header += '\n';
+  if (!program.flags.empty()) {
+    std::string flags = kRedlineFlagsPrefix;
+    for (const std::string& flag : program.flags) {
+      flags += ' ';
+      flags += flag;
+    }
+    header += EscapeCommentLine(flags);
+    header += '\n';
+  }
+  return header;
+}
+
+bool Fuzzer::SaveCorpusProgram(const Program& program) {
   std::string path =
       StringPrintf("%s/corpus/%06u.js", config_.out_dir.c_str(), program.id);
   std::string error;
-  if (!WriteStringToFile(path, header + program.source(), &error)) {
+  if (!WriteStringToFile(path, CorpusFileHeader(program) + program.source(),
+                         &error)) {
     REDLINE_WARN(kLog, "%s", error.c_str());
     return false;
   }
@@ -3388,6 +4422,15 @@ std::string Fuzzer::StatusLine() const {
           ? 0.0
           : static_cast<double>(stats_.corpus_nodes.load()) /
                 static_cast<double>(stats_.corpus_added.load()));
+  uint64_t salvage_ok = stats_.salvage_succeeded.load();
+  uint64_t salvage_att = stats_.salvage_attempted.load();
+  if (salvage_att > 0) {
+    salvage_ok = std::min(salvage_ok, salvage_att);
+    line += StringPrintf(" | salvage %llu/%llu (%.1f%%)",
+                         static_cast<unsigned long long>(salvage_ok),
+                         static_cast<unsigned long long>(salvage_att),
+                         Percent(salvage_ok, salvage_att));
+  }
   return line;
 }
 
@@ -3400,10 +4443,46 @@ std::string Fuzzer::ComponentTables(bool include_generators) const {
   }
   out += stages_.Format(enabled);
   out += FormatStatsTable("seeds", {&corpus_->seed_stats()});
+  if (material_ != nullptr &&
+      (!material_->empty() || fuse_component_.stats().invocations.load() > 0)) {
+    out += FormatStatsTable("material", {&fuse_component_});
+  }
   if (include_generators) {
     out += FormatStatsTable("generators", generators_->Components());
   }
   return out;
+}
+
+bool BuildSwarmCandidates(const GeneratorSet& generators,
+                          const MutatorSet& mutators,
+                          SwarmCandidates* swarm_generators,
+                          SwarmCandidates* swarm_mutators, std::string* error) {
+  auto mark = [error](const std::vector<std::string>& names,
+                      const std::vector<std::string>& candidates,
+                      std::string_view kind, std::vector<bool>* out) {
+    out->assign(candidates.size(), false);
+    for (const std::string& name : names) {
+      auto found = std::find(candidates.begin(), candidates.end(), name);
+      if (found == candidates.end()) {
+        *error = "swarm: unknown " + std::string(kind) + " " + name;
+        return false;
+      }
+      (*out)[static_cast<size_t>(found - candidates.begin())] = true;
+    }
+    return true;
+  };
+  *swarm_generators = SwarmCandidates();
+  for (const Generator* g : generators.candidates()) {
+    swarm_generators->weights.push_back(generators.WeightOf(g));
+  }
+  *swarm_mutators = SwarmCandidates();
+  for (const Mutator* m : mutators.candidates()) {
+    swarm_mutators->weights.push_back(mutators.WeightOf(m));
+  }
+  return mark(SwarmCoreGenerators(), generators.Names(), "generator",
+              &swarm_generators->core) &&
+         mark(SwarmStructuralMutators(), mutators.Names(), "mutator",
+              &swarm_mutators->structural);
 }
 
 void Fuzzer::WriteStatsEvent() {
@@ -3447,15 +4526,63 @@ void Fuzzer::WriteStatsEvent() {
   event.Add("minimizer_nodes_removed", stats_.minimizer_nodes_removed.load());
   event.Add("minimizer_rejected", stats_.minimizer_rejected.load());
   event.Add("rerun_executions", stats_.rerun_executions.load());
+  event.Add("crash_rerun_timeouts", stats_.crash_rerun_timeouts.load());
+  event.Add("hit_edge_executions", stats_.hit_edge_executions.load());
   event.Add("explore_executions", stats_.explore_executions.load());
   event.Add("explore_applied", stats_.explore_applied.load());
+  event.Add("noop_retries", stats_.noop_retries.load());
   event.Add("explore_timeouts", stats_.explore_timeouts.load());
+  uint64_t salvage_ok = stats_.salvage_succeeded.load();
+  uint64_t salvage_att = stats_.salvage_attempted.load();
+  event.Add("salvage_attempted", salvage_att);
+  event.Add("salvage_succeeded", std::min(salvage_ok, salvage_att));
+  event.Add("salvage_skipped_tail", stats_.salvage_skipped_tail.load());
+  event.Add("clean_checks", stats_.clean_checks.load());
+  event.Add("coalesce_merges", stats_.coalesce_merges.load());
+  event.Add("coalesce_breaks", stats_.coalesce_breaks.load());
+  event.Add("focus_chains", stats_.focus_chains.load());
   event.Add("exec_time_us", stats_.exec_time_us.load());
   event.Add("fuzz_nodes", stats_.fuzz_nodes.load());
   event.Add("corpus_nodes", stats_.corpus_nodes.load());
   event.Add("mutation_time_us", stats_.mutation_time_us.load());
   event.Add("infrastructure_failures", stats_.infrastructure_failures.load());
+  if (config_.selection.swarm) {
+    event.Add("swarm_epochs", stats_.swarm_epochs.load());
+  }
+  if (config_.randomize_d8_flags) {
+    event.Add("flag_draws", flag_draws_.load());
+    event.Add("imported_flag_draws", imported_flag_draws_.load())
+        .Add("affinity_flag_draws", affinity_flag_draws_.load());
+    event
+        .Add("imported_flag_sets",
+             static_cast<uint64_t>(imported_flags_.size()))
+        .Add("productive_flag_sets",
+             static_cast<uint64_t>(productive_flags_.size()));
+    event.Add("flagged_programs", flagged_programs_.load());
+    {
+      std::scoped_lock<std::mutex> lock(drawn_names_mutex_);
+      event.Add("drawn_flag_names", static_cast<uint64_t>(drawn_names_.size()));
+    }
+    event.Add("failed_flag_spawns", flag_blacklist_.failed_spawns());
+    event.AddArray("blocked_flags", flag_blacklist_.Blocked());
+  }
   event.AddRaw("stages", stages_.ToJson());
+  if (material_ != nullptr && !material_->empty()) {
+    ComponentStats::Snapshot fs = fuse_component_.stats().snapshot();
+    JsonObject fuse;
+    fuse.Add("invocations", fs.invocations)
+        .Add("produced", fs.produced)
+        .Add("invalid", fs.invalid)
+        .Add("executed", fs.executed)
+        .Add("succeeded", fs.succeeded)
+        .Add("failed", fs.failed)
+        .Add("timed_out", fs.timed_out)
+        .Add("crashed", fs.crashed)
+        .Add("interesting", fs.interesting)
+        .Add("new_edges", fs.new_edges)
+        .Add("spent", fs.spent);
+    event.AddRaw("fuse", fuse.ToString());
+  }
   LogEvent(event);
 }
 
@@ -3561,6 +4688,16 @@ int Fuzzer::Run() {
     } else if (geometry_.optimized_count != 0) {
       event.Add("optimized_features", geometry_.optimized_count);
     }
+    LogEvent(event);
+  }
+  if (!config_.material_paths.empty()) {
+    JsonObject event;
+    event.Add("event", "material_loaded")
+        .Add("scanned", static_cast<uint64_t>(material_stats_.scanned))
+        .Add("loaded", static_cast<uint64_t>(material_stats_.loaded))
+        .Add("skipped", static_cast<uint64_t>(material_stats_.skipped))
+        .Add("errors", static_cast<uint64_t>(material_stats_.errors))
+        .Add("elapsed_ms", material_stats_.elapsed_ms);
     LogEvent(event);
   }
   REDLINE_LOG(

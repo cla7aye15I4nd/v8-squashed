@@ -222,13 +222,17 @@ bool ReadCoverageConfig(const JsonValue& coverage, FuzzConfig* c,
   for (const auto& [key, value] : coverage.as_object()) {
     if (key != "targets" && key != "watch_optimized" && key != "focus" &&
         key != "focus_optimized" && key != "drop_unfocused" &&
-        key != "target_boost" && key != "weights") {
+        key != "target_boost" && key != "weights" &&
+        key != "opt_admit_workers_fraction") {
       *error = "config: unknown key \"" + key +
                "\" in \"coverage\" (known: targets, watch_optimized, focus, "
-               "focus_optimized, drop_unfocused, target_boost, weights)";
+               "focus_optimized, drop_unfocused, target_boost, weights, "
+               "opt_admit_workers_fraction)";
       return false;
     }
   }
+  c->opt_admit_workers_fraction = coverage.GetNumber(
+      "opt_admit_workers_fraction", c->opt_admit_workers_fraction);
   c->targets_file = coverage.GetString("targets", c->targets_file);
   c->watch_optimized = coverage.GetBool("watch_optimized", c->watch_optimized);
   c->focus = coverage.GetBool("focus", c->focus);
@@ -421,6 +425,8 @@ void ReadMinimizerOptions(const JsonValue& object, MinimizerOptions* m) {
   m->target_time_ms = static_cast<uint64_t>(
       object.GetInt("target_time_ms", static_cast<int64_t>(m->target_time_ms)));
   m->min_tests = static_cast<int>(object.GetInt("min_tests", m->min_tests));
+  m->expressions_share =
+      object.GetNumber("expressions_share", m->expressions_share);
 }
 
 // Reads the "reducers" list of `object` into `names`, if the list is there.
@@ -459,6 +465,7 @@ std::string MinimizerOptionsJson(
   o.Add("max_rounds", m.max_rounds);
   o.Add("target_time_ms", static_cast<uint64_t>(m.target_time_ms));
   o.Add("min_tests", m.min_tests);
+  o.Add("expressions_share", m.expressions_share);
   std::vector<std::string> order = reducers;
   if (order.empty()) {
     order.assign(default_order.begin(), default_order.end());
@@ -520,13 +527,17 @@ bool ReadStages(const JsonValue& json, FuzzConfig* c, std::string* error) {
   static constexpr std::initializer_list<std::string_view> kKeys[kNumStages] = {
       {},                                                         // pick
       {"enabled", "min_values", "extra_values", "from_scratch"},  // prefix
-      {"consecutive", "rounds", "scratch_codegen"},               // mutate
-      {"min_reruns", "min_stable_reruns", "max_reruns",
-       "flaky_threshold"},  // check
+      {"consecutive", "rounds", "scratch_codegen", "coalesce",
+       "max_coalesce_merges", "max_coalesce_edges", "max_coalesce_nodes",
+       "focus_chain"},  // mutate
+      {"min_reruns", "min_stable_reruns", "max_reruns", "clean_min_reruns",
+       "import_reruns", "flaky_threshold"},  // check
       {"enabled", "max_tests", "max_time_ms", "max_rounds", "target_time_ms",
-       "min_tests", "probe_timeout_factor", "probe_timeout_extra_ms",
-       "probe_timeout_min_ms", "verify_attempts", "reducers"},  // minimize
-      {"save_corpus"},                                          // publish
+       "min_tests", "expressions_share", "probe_timeout_factor",
+       "probe_timeout_extra_ms", "probe_timeout_min_ms",
+       "probe_timeout_tighten_factor", "probe_timeout_tighten_extra_ms",
+       "verify_attempts", "reducers"},  // minimize
+      {"save_corpus"},                  // publish
   };
   for (const auto& [stage_name, object] : stages.as_object()) {
     Stage stage;
@@ -580,6 +591,23 @@ bool ReadStages(const JsonValue& json, FuzzConfig* c, std::string* error) {
             static_cast<int>(object.GetInt("rounds", c->mutation_rounds));
         c->scratch_codegen_links = static_cast<int>(
             object.GetInt("scratch_codegen", c->scratch_codegen_links));
+        c->coalesce = object.GetBool("coalesce", c->coalesce);
+        c->max_coalesce_merges = static_cast<int>(
+            object.GetInt("max_coalesce_merges", c->max_coalesce_merges));
+        c->max_coalesce_edges = static_cast<int>(
+            object.GetInt("max_coalesce_edges", c->max_coalesce_edges));
+        c->max_coalesce_nodes = static_cast<int>(
+            object.GetInt("max_coalesce_nodes", c->max_coalesce_nodes));
+        if (object.Has("focus_chain")) {
+          const JsonValue& value = object.Get("focus_chain");
+          if (!value.is_number() || !std::isfinite(value.as_number()) ||
+              value.as_number() < 0.0 || value.as_number() > 1.0) {
+            *error =
+                "config: stages.mutate.focus_chain must be a number in [0, 1]";
+            return false;
+          }
+          c->focus_chain = value.as_number();
+        }
         break;
       case Stage::kCheck:
         c->min_reruns =
@@ -588,6 +616,10 @@ bool ReadStages(const JsonValue& json, FuzzConfig* c, std::string* error) {
             object.GetInt("min_stable_reruns", c->min_stable_reruns));
         c->max_reruns =
             static_cast<int>(object.GetInt("max_reruns", c->max_reruns));
+        c->clean_min_reruns = static_cast<int>(
+            object.GetInt("clean_min_reruns", c->clean_min_reruns));
+        c->import_reruns =
+            static_cast<int>(object.GetInt("import_reruns", c->import_reruns));
         c->flaky_threshold = static_cast<int>(
             object.GetInt("flaky_threshold", c->flaky_threshold));
         break;
@@ -600,6 +632,11 @@ bool ReadStages(const JsonValue& json, FuzzConfig* c, std::string* error) {
                                                      c->probe_timeout_extra_ms);
         c->probe_timeout_min_ms =
             object.GetNumber("probe_timeout_min_ms", c->probe_timeout_min_ms);
+        c->probe_timeout_tighten_factor = object.GetNumber(
+            "probe_timeout_tighten_factor", c->probe_timeout_tighten_factor);
+        c->probe_timeout_tighten_extra_ms =
+            object.GetNumber("probe_timeout_tighten_extra_ms",
+                             c->probe_timeout_tighten_extra_ms);
         c->verify_attempts = static_cast<int>(
             object.GetInt("verify_attempts", c->verify_attempts));
         if (!ReadReducerList(object, "stages.minimize.reducers",
@@ -641,7 +678,12 @@ std::string StagesJson(const FuzzConfig& c) {
     JsonObject o;
     o.Add("consecutive", c.consecutive_mutations)
         .Add("rounds", c.mutation_rounds)
-        .Add("scratch_codegen", c.scratch_codegen_links);
+        .Add("scratch_codegen", c.scratch_codegen_links)
+        .Add("focus_chain", c.focus_chain);
+    o.Add("coalesce", c.coalesce)
+        .Add("max_coalesce_merges", c.max_coalesce_merges);
+    o.Add("max_coalesce_edges", c.max_coalesce_edges)
+        .Add("max_coalesce_nodes", c.max_coalesce_nodes);
     common(Stage::kMutate, &o);
     stages.AddRaw("mutate", o.ToString());
   }
@@ -649,7 +691,9 @@ std::string StagesJson(const FuzzConfig& c) {
     JsonObject o;
     o.Add("min_reruns", c.min_reruns)
         .Add("min_stable_reruns", c.min_stable_reruns);
-    o.Add("max_reruns", c.max_reruns).Add("flaky_threshold", c.flaky_threshold);
+    o.Add("max_reruns", c.max_reruns).Add("import_reruns", c.import_reruns);
+    o.Add("clean_min_reruns", c.clean_min_reruns);
+    o.Add("flaky_threshold", c.flaky_threshold);
     common(Stage::kCheck, &o);
     stages.AddRaw("check", o.ToString());
   }
@@ -660,11 +704,15 @@ std::string StagesJson(const FuzzConfig& c) {
         .Add("max_time_ms", c.minimizer.max_time_ms);
     o.Add("max_rounds", c.minimizer.max_rounds)
         .Add("target_time_ms", c.minimizer.target_time_ms);
-    o.Add("min_tests", c.minimizer.min_tests);
+    o.Add("min_tests", c.minimizer.min_tests)
+        .Add("expressions_share", c.minimizer.expressions_share);
     o.Add("probe_timeout_factor", c.probe_timeout_factor)
         .Add("probe_timeout_extra_ms", c.probe_timeout_extra_ms);
-    o.Add("probe_timeout_min_ms", c.probe_timeout_min_ms)
-        .Add("verify_attempts", c.verify_attempts);
+    o.Add("probe_timeout_min_ms", c.probe_timeout_min_ms);
+    o.Add("probe_timeout_tighten_factor", c.probe_timeout_tighten_factor)
+        .Add("probe_timeout_tighten_extra_ms",
+             c.probe_timeout_tighten_extra_ms);
+    o.Add("verify_attempts", c.verify_attempts);
     {
       // The effective order: without a configured list, the default one.
       std::vector<std::string> reducers = c.minimizer_reducers;
@@ -700,6 +748,8 @@ bool ApplyJson(const JsonValue& json, FuzzConfig* c, std::string* error,
       static_cast<uint64_t>(json.GetInt("seed", static_cast<int64_t>(c->seed)));
   c->out_dir = json.GetString("out_dir", c->out_dir);
   c->import_root = json.GetString("import_root", c->import_root);
+  c->material_max =
+      static_cast<int>(json.GetInt("material_max", c->material_max));
   c->duration_sec = json.GetNumber("duration_sec", c->duration_sec);
   c->max_execs = static_cast<uint64_t>(
       json.GetInt("max_execs", static_cast<int64_t>(c->max_execs)));
@@ -726,9 +776,11 @@ bool ApplyJson(const JsonValue& json, FuzzConfig* c, std::string* error,
   c->minimize = json.GetBool("minimize", c->minimize);
   c->minimize_crashes = json.GetBool("minimize_crashes", c->minimize_crashes);
   c->harvest_crashes = json.GetBool("harvest_crashes", c->harvest_crashes);
+  c->allow_no_dcheck = json.GetBool("allow_no_dcheck", c->allow_no_dcheck);
   c->randomize_d8_flags =
       json.GetBool("randomize_d8_flags", c->randomize_d8_flags);
   c->d8_flag_profile = json.GetString("d8_flag_profile", c->d8_flag_profile);
+  c->d8_trials = json.GetString("d8_trials", c->d8_trials);
   c->minimize_code_edges =
       json.GetBool("minimize_code_edges", c->minimize_code_edges);
   c->minimize_imports = json.GetBool("minimize_imports", c->minimize_imports);
@@ -743,6 +795,8 @@ bool ApplyJson(const JsonValue& json, FuzzConfig* c, std::string* error,
       static_cast<int>(json.GetInt("crash_reruns", c->crash_reruns));
   c->crash_reruns_stop_after = static_cast<int>(
       json.GetInt("crash_reruns_stop_after", c->crash_reruns_stop_after));
+  c->crash_rerun_timeout_factor = json.GetNumber("crash_rerun_timeout_factor",
+                                                 c->crash_rerun_timeout_factor);
   c->max_crashes_per_signature = static_cast<int>(
       json.GetInt("max_crashes_per_signature", c->max_crashes_per_signature));
   c->minimize_crashes_per_signature = static_cast<int>(json.GetInt(
@@ -820,6 +874,15 @@ bool ApplyJson(const JsonValue& json, FuzzConfig* c, std::string* error,
       }
     }
   }
+  const JsonValue& material_paths = json.Get("material_paths");
+  if (material_paths.is_array()) {
+    c->material_paths.clear();
+    for (const JsonValue& path : material_paths.as_array()) {
+      if (path.is_string()) {
+        c->material_paths.push_back(path.as_string());
+      }
+    }
+  }
   if (json.Has("prelude")) {
     c->prelude_source = json.GetString("prelude", "default");
   }
@@ -851,6 +914,14 @@ bool ApplyJson(const JsonValue& json, FuzzConfig* c, std::string* error,
       !ReadSelectionConfig(selection, "generators", &c->selection.generators,
                            error)) {
     return false;
+  }
+  const JsonValue& swarm = selection.Get("swarm");
+  if (!swarm.is_null()) {
+    if (!swarm.is_bool()) {
+      *error = "config: \"selection.swarm\" must be true or false";
+      return false;
+    }
+    c->selection.swarm = swarm.as_bool();
   }
   // Legacy shorthands: {"mutators": {"Name": weight}}, same for generators.
   std::vector<std::pair<std::string, double>> pairs;
@@ -1020,9 +1091,12 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
   c->jobs = static_cast<int>(flags.GetInt("jobs", c->jobs));
   c->seed = static_cast<uint64_t>(
       flags.GetInt("seed", static_cast<int64_t>(c->seed)));
+  c->selection.swarm = flags.GetBool("swarm", c->selection.swarm);
   // Coverage counters and change-based fuzzing.
   c->targets_file = flags.GetString("targets", c->targets_file);
   c->watch_optimized = flags.GetBool("watch-optimized", c->watch_optimized);
+  c->opt_admit_workers_fraction = flags.GetDouble(
+      "opt-admit-workers-fraction", c->opt_admit_workers_fraction);
   c->focus = flags.GetBool("focus", c->focus);
   {
     FeatureWeights::Params& w = c->feature_weights;
@@ -1061,14 +1135,18 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
   c->min_stable_reruns =
       static_cast<int>(flags.GetInt("min-stable-reruns", c->min_stable_reruns));
   c->max_reruns = static_cast<int>(flags.GetInt("max-reruns", c->max_reruns));
+  c->import_reruns =
+      static_cast<int>(flags.GetInt("import-reruns", c->import_reruns));
   c->flaky_threshold =
       static_cast<int>(flags.GetInt("flaky-threshold", c->flaky_threshold));
   c->value_prefix = flags.GetBool("value-prefix", c->value_prefix);
   c->minimize = flags.GetBool("minimize", c->minimize);
   c->harvest_crashes = flags.GetBool("harvest-crashes", c->harvest_crashes);
+  c->allow_no_dcheck = flags.GetBool("allow-no-dcheck", c->allow_no_dcheck);
   c->randomize_d8_flags =
       flags.GetBool("randomize-d8-flags", c->randomize_d8_flags);
   c->d8_flag_profile = flags.GetString("d8-flag-profile", c->d8_flag_profile);
+  c->d8_trials = flags.GetString("d8-trials", c->d8_trials);
   c->minimize_code_edges =
       flags.GetBool("minimize-code-edges", c->minimize_code_edges);
   c->minimize_crashes = flags.GetBool("minimize-crashes", c->minimize_crashes);
@@ -1085,6 +1163,8 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
                    static_cast<int64_t>(c->minimizer.target_time_ms)));
   c->crash_reruns =
       static_cast<int>(flags.GetInt("crash-reruns", c->crash_reruns));
+  c->crash_rerun_timeout_factor = flags.GetDouble(
+      "crash-rerun-timeout-factor", c->crash_rerun_timeout_factor);
   c->max_crashes_per_signature = static_cast<int>(
       flags.GetInt("max-crashes-per-signature", c->max_crashes_per_signature));
   c->minimize_crashes_per_signature = static_cast<int>(flags.GetInt(
@@ -1111,6 +1191,11 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
   for (const std::string& path : flags.GetList("import")) {
     c->imports.push_back(path);
   }
+  for (const std::string& path : flags.GetList("material")) {
+    c->material_paths.push_back(path);
+  }
+  c->material_max =
+      static_cast<int>(flags.GetInt("material-max", c->material_max));
   std::vector<std::pair<std::string, double>> pairs;
   if (!ParseWeightList(flags.GetList("mutator-weights"), &pairs, error)) {
     return false;
@@ -1182,10 +1267,31 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
   D8FlagProfile flag_profile;
   if (!ParseD8FlagProfile(c->d8_flag_profile, &flag_profile)) {
     *error =
-        "d8_flag_profile must be \"maglev\", \"turbolev\" or \"fuzzilli\", "
-        "not \"" +
+        "d8_flag_profile must be \"maglev\", \"turbolev\", \"runtime\", "
+        "\"fuzzilli\" or \"fuzzilli-wasm\", not \"" +
         c->d8_flag_profile + "\"";
     return false;
+  }
+  c->d8_trial_list.clear();
+  if (!c->d8_trials.empty()) {
+    std::string text;
+    size_t dropped = 0;
+    if (!ReadFileToString(c->d8_trials, &text, error) ||
+        !ParseD8Trials(text, &c->d8_trial_list, error, &dropped)) {
+      *error = "d8_trials " + c->d8_trials + ": " + *error;
+      return false;
+    }
+    if (c->d8_trial_list.empty()) {
+      *error = "d8_trials " + c->d8_trials + ": no d8 trial";
+      return false;
+    }
+    if (!c->randomize_d8_flags) {
+      REDLINE_WARN("config",
+                   "d8_trials has no effect without "
+                   "randomize_d8_flags");
+    }
+    REDLINE_VLOG("config", "d8_trials: %zu trials, %zu dropped",
+                 c->d8_trial_list.size(), dropped);
   }
   // The run seed is drawn only when there is a run; --dump-config shows 0
   // (= from the clock) like the configuration said.
@@ -1207,6 +1313,11 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
   if (c->scratch_codegen_links < 1) {
     c->scratch_codegen_links = 1;
   }
+  if (!std::isfinite(c->focus_chain) || c->focus_chain < 0.0 ||
+      c->focus_chain > 1.0) {
+    *error = "stages.mutate.focus_chain must be in [0, 1]";
+    return false;
+  }
   if (c->min_stable_reruns < 1) {
     c->min_stable_reruns = 1;
   }
@@ -1216,6 +1327,13 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
   if (c->max_reruns < c->min_reruns) {
     c->max_reruns = c->min_reruns;
   }
+  c->import_reruns =
+      std::clamp(c->import_reruns, c->min_stable_reruns, c->max_reruns);
+  c->clean_min_reruns =
+      std::clamp(c->clean_min_reruns, c->min_stable_reruns, c->min_reruns);
+  c->max_coalesce_merges = std::max(0, c->max_coalesce_merges);
+  c->max_coalesce_edges = std::max(0, c->max_coalesce_edges);
+  c->max_coalesce_nodes = std::max(0, c->max_coalesce_nodes);
   if (c->flaky_threshold < 1) {
     c->flaky_threshold = 1;
   }
@@ -1225,6 +1343,16 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
   if (c->crash_reruns_stop_after < 1) {
     c->crash_reruns_stop_after = 1;
   }
+  if (!std::isfinite(c->crash_rerun_timeout_factor) ||
+      !std::isfinite(c->opt_admit_workers_fraction)) {
+    *error =
+        "crash_rerun_timeout_factor and coverage.opt_admit_workers_fraction "
+        "must be finite numbers";
+    return false;
+  }
+  c->crash_rerun_timeout_factor = std::max(1.0, c->crash_rerun_timeout_factor);
+  c->opt_admit_workers_fraction =
+      std::clamp(c->opt_admit_workers_fraction, 0.0, 1.0);
   if (c->max_crashes_per_signature < 1) {
     c->max_crashes_per_signature = 1;
   }
@@ -1249,7 +1377,16 @@ bool FuzzConfig::Load(const Flags& flags, FuzzConfig* c, std::string* error,
   c->probe_timeout_factor = std::max(0.0, c->probe_timeout_factor);
   c->probe_timeout_extra_ms = std::max(0.0, c->probe_timeout_extra_ms);
   c->probe_timeout_min_ms = std::max(0.0, c->probe_timeout_min_ms);
+  c->probe_timeout_tighten_factor =
+      std::max(0.0, c->probe_timeout_tighten_factor);
+  c->probe_timeout_tighten_extra_ms =
+      std::max(0.0, c->probe_timeout_tighten_extra_ms);
+  c->minimizer.expressions_share =
+      std::clamp(c->minimizer.expressions_share, 0.0, 1.0);
+  c->crash_minimizer.expressions_share =
+      std::clamp(c->crash_minimizer.expressions_share, 0.0, 1.0);
   c->introspect_timeout_ms = std::max(1.0, c->introspect_timeout_ms);
+  c->material_max = std::max(0, c->material_max);
   if (!ValidateReducers(c->minimizer_reducers, "stages.minimize.reducers",
                         error) ||
       !ValidateReducers(c->crash_minimizer_reducers, "crash_minimizer.reducers",
@@ -1342,6 +1479,8 @@ std::string FuzzConfig::ToJson(Detail detail) const {
   o.Add("out_dir", out_dir);
   o.AddArray("imports", imports);
   o.Add("import_root", import_root);
+  o.AddArray("material_paths", material_paths);
+  o.Add("material_max", material_max);
   o.Add("duration_sec", duration_sec);
   o.Add("max_execs", static_cast<uint64_t>(max_execs));
   o.Add("stats_interval_sec", stats_interval_sec);
@@ -1352,14 +1491,17 @@ std::string FuzzConfig::ToJson(Detail detail) const {
   o.Add("component_stats", component_stats);
   o.Add("minimize_crashes", minimize_crashes);
   o.Add("harvest_crashes", harvest_crashes);
+  o.Add("allow_no_dcheck", allow_no_dcheck);
   o.Add("randomize_d8_flags", randomize_d8_flags);
   o.Add("d8_flag_profile", d8_flag_profile);
+  o.Add("d8_trials", d8_trials);
   o.Add("minimize_code_edges", minimize_code_edges);
   o.Add("minimize_imports", minimize_imports);
   o.Add("import_all", import_all);
   o.Add("initial_programs", initial_programs);
   o.Add("crash_reruns", crash_reruns);
   o.Add("crash_reruns_stop_after", crash_reruns_stop_after);
+  o.Add("crash_rerun_timeout_factor", crash_rerun_timeout_factor);
   o.Add("max_crashes_per_signature", max_crashes_per_signature);
   o.Add("minimize_crashes_per_signature", minimize_crashes_per_signature);
   o.Add("crash_history", crash_history);
@@ -1403,6 +1545,7 @@ std::string FuzzConfig::ToJson(Detail detail) const {
         .Add("focus_optimized", feature_weights.optimized_in_focus)
         .Add("drop_unfocused", feature_weights.drop_unfocused)
         .Add("target_boost", feature_weights.target_boost);
+    coverage.Add("opt_admit_workers_fraction", opt_admit_workers_fraction);
     JsonObject weights;
     weights.Add("builtins", feature_weights.builtins)
         .Add("optimized", feature_weights.optimized);
@@ -1446,6 +1589,7 @@ std::string FuzzConfig::ToJson(Detail detail) const {
                    selection.generators,
                    SelectorRegistry<Generator>::Instance().default_name()));
   }
+  sel.Add("swarm", selection.swarm);
   o.AddRaw("selection", sel.ToString());
   o.AddRaw("stages", StagesJson(*this));
   // Compact: only the tunables that were changed (--help-tunables lists
@@ -1491,11 +1635,16 @@ std::string FuzzConfig::JsonHelp() {
       "each "
       "new d8 (flags.* tunables)\n"
       "    \"d8_flag_profile\": \"maglev\",    // the random flags: "
-      "\"maglev\", \"turbolev\" or \"fuzzilli\"\n"
+      "\"maglev\", \"turbolev\", \"runtime\", \"fuzzilli\" or "
+      "\"fuzzilli-wasm\"\n"
+      "    \"d8_trials\": \"\",              // a "
+      "clusterfuzz_trials_config.json "
+      "file: more random d8 flags\n"
       "    \"timeout_ms\": 1000, \"jobs\": 8, \"seed\": 1, \"out_dir\": "
       "\"redline-out\",\n"
       "    \"imports\": [\"test/mjsunit\"], \"import_root\": \".\", "
       "\"prelude\": \"default\",\n"
+      "    \"material_paths\": [], \"material_max\": 20000,\n"
       "    \"duration_sec\": 0, \"max_execs\": 0, \"stats_interval_sec\": 30,\n"
       "    \"introspect\": true, \"introspect_timeout_ms\": 20000,\n"
       "    \"syntax_check\": false,           // parse mutants in-process "
@@ -1511,27 +1660,44 @@ std::string FuzzConfig::JsonHelp() {
       "\"off\",\n"
       "                   \"scratch_codegen\": 3,  // CodeGen-only links "
       "from scratch\n"
+      "                   \"focus_chain\": 0,      // focus a chain on one "
+      "function body\n"
+      "                   \"coalesce\": true,  // one minimization for "
+      "the candidates of a chain\n"
+      "                   \"max_coalesce_merges\": 3, "
+      "\"max_coalesce_edges\": 2048,\n"
+      "                   \"max_coalesce_nodes\": 2000,\n"
       "                   \"capture\": {\"on\": [\"timeout\"], \"mutators\": "
       "[\"Splice\"], \"max\": 50}},\n"
       "      \"check\":    {\"min_reruns\": 5, \"min_stable_reruns\": 1, "
       "\"max_reruns\": 50,\n"
+      "                   \"clean_min_reruns\": 2,  // reruns if no edge "
+      "was flaky\n"
+      "                   \"import_reruns\": 1,  // reruns of an import "
+      "with import_all\n"
       "                   \"flaky_threshold\": 50, \"capture\": {\"on\": "
       "[\"flaky\"], \"max\": 20}},\n"
       "      \"minimize\": {\"enabled\": true, \"max_tests\": 300, "
       "\"max_time_ms\": 30000,\n"
       "                   \"max_rounds\": 3, \"target_time_ms\": 6000, "
       "\"min_tests\": 40,\n"
+      "                   \"expressions_share\": 0.25,  // of the remaining "
+      "tests\n"
       "                   \"probe_timeout_factor\": 5, "
       "\"probe_timeout_extra_ms\": 20,\n"
-      "                   \"probe_timeout_min_ms\": 50, \"verify_attempts\": "
-      "3,\n"
-      "                   \"reducers\": [\"statements\", \"unwrap\", "
-      "\"lists\", \"expressions\"]},\n"
+      "                   \"probe_timeout_min_ms\": 50, "
+      "\"probe_timeout_tighten_factor\": 2.5,\n"
+      "                   \"probe_timeout_tighten_extra_ms\": 50, "
+      "\"verify_attempts\": 3,\n"
+      "                   \"reducers\": [\"dataflow\", \"statements\", "
+      "\"unwrap\", \"lists\",\n"
+      "                                \"expressions\"]},\n"
       "      \"publish\":  {\"save_corpus\": true}\n"
       "    },\n"
       "    \"minimize_crashes\": true, \"minimize_imports\": false,\n"
       "    \"crash_reruns\": 3, \"crash_reruns_stop_after\": 2, "
       "\"max_crashes_per_signature\": 5,\n"
+      "    \"crash_rerun_timeout_factor\": 2, \"allow_no_dcheck\": false,\n"
       "    \"minimize_crashes_per_signature\": 2, \"crash_history\": 100,\n"
       "    \"crash_history_budget_sec\": 90, \"crash_bundle_runs\": 3,\n"
       "    \"crash_flag_runs\": 2, \"crash_flag_processes\": 200, "
@@ -1541,7 +1707,7 @@ std::string FuzzConfig::JsonHelp() {
       "    \"crash_minimizer\": {\"max_tests\": 2000, \"max_time_ms\": 120000, "
       "\"max_rounds\": 10,\n"
       "                        \"target_time_ms\": 120000, \"min_tests\": "
-      "200,\n"
+      "200, \"expressions_share\": 1,\n"
       "                        \"reducers\": [\"dataflow\", \"statements\", "
       "\"unwrap\", \"lists\",\n"
       "                                     \"expressions\", \"truncate\"]},\n"
@@ -1562,7 +1728,9 @@ std::string FuzzConfig::JsonHelp() {
       "{\"weights\": {\"Splice\": 4, \"Reorder\": "
       "0}}},\n"
       "      \"generators\": {\"strategy\": \"weighted\", \"params\": "
-      "{\"weights\": {\"JitOptimize\": 10}}}\n"
+      "{\"weights\": {\"JitOptimize\": 10}}},\n"
+      "      \"swarm\": false   // true: a weight mask for each worker "
+      "except 0\n"
       "    }\n"
       "  }\n"
       "\n"
@@ -1599,9 +1767,9 @@ std::string FuzzConfig::JsonHelp() {
       "--initial-programs set the\n"
       "  same values. \"accept\" names the corpus admission criterion "
       "(new-edges only).\n"
-      "  stages.minimize.reducers lists the reducers in order (also truncate, "
-      "dataflow);\n"
-      "  without it the four above run. crash_minimizer.reducers lists the "
+      "  stages.minimize.reducers lists the reducers in order (also "
+      "truncate);\n"
+      "  without it the five above run. crash_minimizer.reducers lists the "
       "reducers of a\n"
       "  crash that reproduces alone (an empty list gives the order above). "
       "Unknown\n"

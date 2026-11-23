@@ -8,6 +8,7 @@
 #include "experimental/redline/base/log.h"
 #include "experimental/redline/core/adaptive_selector.h"
 #include "experimental/redline/core/ast_builder.h"
+#include "experimental/redline/core/swarm.h"
 #include "experimental/redline/core/tunable.h"
 #include "experimental/redline/core/weighted_selector.h"
 #include "experimental/redline/generators/api_generators.h"
@@ -2147,17 +2148,21 @@ GEN(OsrLoop) {
       icg.Body(inner, 1 + r.SmallCount(kOsrLoopMaxStatements.AsInt() - 1));
   Statement* osr =
       icg.Stmt(mk::Native(t, r.Coin() ? "OptimizeOsr" : "BaselineOsr", {}));
-  body.insert(
-      body.begin(),
-      mk::If(t,
-             mk::Binary(t, BinaryOp::kStrictEq, mk::Id(t, counter),
-                        mk::Num(t, static_cast<double>(r.Range(
-                                       kOsrLoopMinTriggerIteration.AsInt(),
-                                       kOsrLoopMaxTriggerIteration.AsInt())))),
-             mk::Block(t, {osr})));
-  Statement* loop = mk::CountedLoop(
-      t, counter, mk::Num(t, r.Pick({5.0, 7.0, 10.0, 20.0, 100.0})),
-      mk::Block(t, std::move(body)));
+  // Draw the loop bound first so the OSR trigger iteration is below it.
+  const int bound = r.Pick({5, 7, 10, 20, 100});
+  const int max_trigger =
+      std::min(kOsrLoopMaxTriggerIteration.AsInt(), bound - 1);
+  const int min_trigger =
+      std::min(kOsrLoopMinTriggerIteration.AsInt(), max_trigger);
+  const int64_t trigger = r.Range(min_trigger, max_trigger);
+  body.insert(body.begin(),
+              mk::If(t,
+                     mk::Binary(t, BinaryOp::kStrictEq, mk::Id(t, counter),
+                                mk::Num(t, static_cast<double>(trigger))),
+                     mk::Block(t, {osr})));
+  Statement* loop =
+      mk::CountedLoop(t, counter, mk::Num(t, static_cast<double>(bound)),
+                      mk::Block(t, std::move(body)));
   if (!in_function) {
     Push(out, loop);
     return true;
@@ -6145,10 +6150,28 @@ std::vector<std::string> GeneratorSet::Names() const {
 }
 
 Generator* GeneratorSet::Pick(const GenContext& ctx) const {
-  size_t index =
-      selector_->Pick(candidates_, ctx.builder.rng(),
-                      [&](const Generator& g) { return g.Applicable(ctx); });
+  size_t index = PickWithMask<Generator>(
+      *selector_, candidates_, ctx.builder.rng(),
+      [&](const Generator& g) { return g.Applicable(ctx); },
+      ActiveGeneratorMask());
   return index == Selector<Generator>::kNoChoice ? nullptr : candidates_[index];
+}
+
+const std::vector<std::string>& SwarmCoreGenerators() {
+  static const std::vector<std::string>* names = new std::vector<std::string>{
+      // Values.
+      "IntegerDecl", "FloatDecl", "StringDecl", "BooleanDecl", "ArrayDecl",
+      "ObjectDecl", "ComputedDecl",
+      // Functions and classes. The member generators are the only ones at a
+      // member slot.
+      "FunctionDecl", "ArrowDecl", "ClassDecl", "ClassMember", "LiteralMember",
+      // Operations.
+      "BinaryOp", "Compare", "Assignment", "PropertyLoad", "PropertyStore",
+      "ElementLoad", "ElementStore", "MethodCall", "FunctionCall",
+      "BuiltinCall", "Construct",
+      // Control flow.
+      "CountedLoop", "IfElse", "TryCatch", "Return"};
+  return *names;
 }
 
 // --- selection strategies for generators -----------------------------------

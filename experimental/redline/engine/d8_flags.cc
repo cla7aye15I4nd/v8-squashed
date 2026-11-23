@@ -5,12 +5,15 @@
 #include "experimental/redline/engine/d8_flags.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <iterator>
+#include <numeric>
 #include <string>
 #include <string_view>
 
+#include "experimental/redline/base/json_parser.h"
 #include "experimental/redline/core/tunable.h"
 
 namespace redline {
@@ -295,6 +298,24 @@ REDLINE_TUNABLE(kFlagsStressObjectPinning,
 REDLINE_TUNABLE(kFlagsPreciseObjectPinning, "flags.precise_object_pinning", 0.1,
                 0, 1, "probability of --precise-object-pinning");
 
+// Flags of all three profiles: heap heuristics, builtin calls and background
+// compilation.
+REDLINE_TUNABLE(kFlagsEfficiencyMode, "flags.efficiency_mode", 0.1, 0, 1,
+                "probability of --efficiency-mode");
+REDLINE_TUNABLE(kFlagsBatterySaverMode, "flags.battery_saver_mode", 0.1, 0, 1,
+                "probability of --battery-saver-mode");
+REDLINE_TUNABLE(kFlagsNoShortBuiltinCalls, "flags.no_short_builtin_calls", 0.1,
+                0, 1, "probability of --no-short-builtin-calls");
+REDLINE_TUNABLE(kFlagsStressBackgroundCompile,
+                "flags.stress_background_compile", 0.025, 0, 1,
+                "probability of --stress-background-compile");
+REDLINE_TUNABLE(kFlagsLazyNewSpaceShrinking, "flags.lazy_new_space_shrinking",
+                0.025, 0, 1, "probability of --lazy-new-space-shrinking");
+REDLINE_TUNABLE(kFlagsMaglevAssertStackSize, "flags.maglev_assert_stack_size",
+                0.05, 0, 1,
+                "Maglev and Turbolev profiles: probability of "
+                "--maglev-assert-stack-size");
+
 // Flags of the Maglev profile only.
 REDLINE_TUNABLE(kFlagsMaglevAsTopTier, "flags.maglev_as_top_tier", 0.5, 0, 1,
                 "Maglev profile: probability of --maglev-as-top-tier, when "
@@ -421,6 +442,11 @@ REDLINE_TUNABLE(kFlagsTurboshaftVerifyTaggedness,
                 "flags.turboshaft_verify_load_store_taggedness", 0.2, 0, 1,
                 "Turbolev profile: probability of "
                 "--turboshaft-verify-load-store-taggedness");
+REDLINE_TUNABLE(kFlagsTurboVerify, "flags.turbo_verify", 0.1, 0, 1,
+                "Turbolev profile: probability of --turbo-verify");
+REDLINE_TUNABLE(kFlagsTurboVerifyAllocation, "flags.turbo_verify_allocation",
+                0.1, 0, 1,
+                "Turbolev profile: probability of --turbo-verify-allocation");
 
 // The values of --deopt-every-n-times=N in the V8 profile of Fuzzilli.
 constexpr int kDeoptEveryNTimesValues[] = {100,  250,  500,  1000,
@@ -430,25 +456,39 @@ enum class FuzzilliCond {
   kTop,
   kIfNoTurbofan,
   kElseNoTurbofan,
+  kIfNotMaglevTopTier,
+  kIfTurbofan,
   kIfMaglev,
   kIfMaglevNonEager,
+  kIfMaglevTurbofan,
   kIfTurbolev,
   kIfTurbolevFuture,
+  kIfTurbolevNoSmallZero,
+  kIfTurbolevNotSandbox,
+  kIfTurbofanNoAssertTypes,
   kIfProtoAssignSeq,
   kIfNotSandbox,
   kIfMaglevOrTurbolev,
+  kIfNoLiftoff,
   kGcStress,
   kExotic,
 };
 
+// kFlagElse draws only if the kFlag row before it did not draw its flag.
+// kFlagWithPrev and kRangeWithPrev draw only if the row before them drew its
+// flag. kRangeCumulative adds the value of the kRange row before it to its
+// own value.
 enum class FuzzilliDrawKind {
   kGroup,
   kFlag,
+  kFlagElse,
+  kFlagWithPrev,
   kBoolFlag,
   kCoinFirst,
   kCoinSecond,
   kRange,
   kRangeWithPrev,
+  kRangeCumulative,
   kRangeCoinFirst,
   kRangeCoinSecond,
   kDeopt,
@@ -462,24 +502,16 @@ struct FuzzilliFlagEntry {
   const char* flag;
   int min_val;
   int max_val;
+  // Only the `fuzzilli-wasm` profile draws the rows of the Wasm flags.
+  bool wasm = false;
 };
 
-// The `fuzzilli` profile table from `v8ProcessArgs` in
+// The `fuzzilli` and `fuzzilli-wasm` profile table from `v8ProcessArgs` in
 // `Sources/Fuzzilli/Profiles/V8CommonProfile.swift` and `V8Profile.swift` at
-// commit `ebd2138c`. `tools/d8_flag_sync.py` checks this table.
+// commit `7eb96565`. `tools/d8_flag_sync.py` checks this table.
 //
-// Omitted Wasm-only flags (they act on WebAssembly code or memory alone):
-// --no-liftoff, --wasm-assert-types, --wasm-sync-tier-up,
-// --wasm-inlining-ignore-call-counts, --no-wasm-generic-wrapper,
-// --no-wasm-native-module-cache, --wasm-caching-threshold,
-// --wasm-random-rescheduling, --wasm-partial-oob-writes-are-noops,
-// --wasm-stack-switching-stack-size, --wasm-growable-stacks,
-// --stress-wasm-stack-switching, --wasm-code-gc, --stress-wasm-code-gc,
-// --stress-wasm-memory-moving, --no-wasm-loop-peeling,
-// --no-turboshaft-wasm-load-elimination, --no-wasm-loop-unrolling,
-// --no-wasm-inlining, --no-wasm-opt, --no-wasm-deopt,
-// --wasm-enforce-bounds-checks, --no-wasm-math-intrinsics,
-// --no-wasm-bulkmem-inlining, --no-wasm-lazy-compilation.
+// Deferred flags (Fuzzilli draws them, this table does not draw them yet):
+// --fuzzilli-enable-optimized-code-coverage.
 constexpr FuzzilliFlagEntry kFuzzilliFlagTable[] = {
     {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.8, "--future", 0, 0},
     {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.1, "--no-turbofan", 0, 0},
@@ -492,22 +524,39 @@ constexpr FuzzilliFlagEntry kFuzzilliFlagTable[] = {
      "--turbo-stress-instruction-scheduling", 0, 0},
     {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.1, "--no-flush-bytecode", 0,
      0},
-    {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.1, "--no-maglev", 0, 0},
+    {FuzzilliCond::kIfNotMaglevTopTier, FuzzilliDrawKind::kFlag, 0.1,
+     "--no-maglev", 0, 0},
     {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.1, "--no-sparkplug", 0, 0},
     {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.1,
      "--no-short-builtin-calls", 0, 0},
     {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.8, "--jit-fuzzing", 0, 0},
+    {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.5, "--no-liftoff", 0, 0,
+     true},
+    {FuzzilliCond::kTop, FuzzilliDrawKind::kFlagElse, 0.2,
+     "--wasm-sync-tier-up", 0, 0, true},
+    {FuzzilliCond::kIfNoLiftoff, FuzzilliDrawKind::kFlag, 0.3,
+     "--wasm-assert-types", 0, 0, true},
+    {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.5,
+     "--wasm-inlining-ignore-call-counts", 0, 0, true},
+    {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.3,
+     "--no-wasm-generic-wrapper", 0, 0, true},
+    {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.2,
+     "--no-wasm-native-module-cache", 0, 0, true},
+    {FuzzilliCond::kTop, FuzzilliDrawKind::kRange, 0.2,
+     "--wasm-caching-threshold", 1, 1000, true},
+    {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.2,
+     "--wasm-random-rescheduling", 0, 0, true},
+    {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.4,
+     "--wasm-partial-oob-writes-are-noops", 0, 0, true},
     {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.8,
      "--no-baseline-batch-compilation", 0, 0},
     {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.8,
      "--no-lazy-feedback-allocation", 0, 0},
     {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.1, "--minor-ms", 0, 0},
-    {FuzzilliCond::kTop, FuzzilliDrawKind::kCoinFirst, 0.25,
-     "--shared-string-table", 0, 0},
-    {FuzzilliCond::kTop, FuzzilliDrawKind::kCoinSecond, 0.25,
-     "--shared-strings", 0, 0},
-    {FuzzilliCond::kIfMaglev, FuzzilliDrawKind::kFlag, 0.5,
-     "--maglev-untagged-phis", 0, 0},
+    {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.25, "--shared-strings", 0,
+     0},
+    {FuzzilliCond::kIfMaglev, FuzzilliDrawKind::kFlag, 0.1,
+     "--no-maglev-untagged-phis", 0, 0},
     {FuzzilliCond::kIfMaglev, FuzzilliDrawKind::kFlag, 0.1,
      "--no-maglev-loop-peeling", 0, 0},
     {FuzzilliCond::kIfMaglev, FuzzilliDrawKind::kFlag, 0.25, "--maglev-future",
@@ -518,17 +567,38 @@ constexpr FuzzilliFlagEntry kFuzzilliFlagTable[] = {
      "--maglev-assert-stack-size", 0, 0},
     {FuzzilliCond::kIfMaglev, FuzzilliDrawKind::kFlag, 0.2,
      "--maglev-non-eager-inlining", 0, 0},
+    {FuzzilliCond::kIfMaglevNonEager, FuzzilliDrawKind::kFlag, 0.35,
+     "--max-maglev-eager-inlined-bytecode-size=0", 0, 0},
     {FuzzilliCond::kIfMaglevNonEager, FuzzilliDrawKind::kFlag, 0.4,
      "--max-maglev-inlined-bytecode-size-small=0", 0, 0},
-    {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.7, "--turbolev", 0, 0},
+    {FuzzilliCond::kIfMaglevTurbofan, FuzzilliDrawKind::kFlag, 0.1,
+     "--always-osr-from-maglev", 0, 0},
+    {FuzzilliCond::kIfTurbofan, FuzzilliDrawKind::kFlag, 0.7, "--turbolev", 0,
+     0},
     {FuzzilliCond::kIfTurbolev, FuzzilliDrawKind::kFlag, 0.82,
      "--turbolev-future", 0, 0},
     {FuzzilliCond::kIfTurbolevFuture, FuzzilliDrawKind::kFlag, 0.3,
      "--max-inlined-bytecode-size-small=0", 0, 0},
     {FuzzilliCond::kIfTurbolev, FuzzilliDrawKind::kFlag, 0.1,
      "--maglev-disable-builtin-reducers", 0, 0},
-    {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.1, "--harmony-struct", 0,
-     0},
+    {FuzzilliCond::kIfTurbolev, FuzzilliDrawKind::kFlag, 0.1,
+     "--no-turbolev-untagged-phis", 0, 0},
+    {FuzzilliCond::kIfTurbolev, FuzzilliDrawKind::kFlag, 0.1,
+     "--no-turbolev-truncated-int32-phis", 0, 0},
+    {FuzzilliCond::kIfTurbolev, FuzzilliDrawKind::kFlag, 0.1,
+     "--no-turbolev-non-eager-inlining", 0, 0},
+    {FuzzilliCond::kIfTurbolev, FuzzilliDrawKind::kFlag, 0.1,
+     "--no-turbolev-non-eager-loop-peeling", 0, 0},
+    {FuzzilliCond::kIfTurbolev, FuzzilliDrawKind::kFlag, 0.1,
+     "--no-turbolev-eager-loop-peeling-osr", 0, 0},
+    {FuzzilliCond::kIfTurbolev, FuzzilliDrawKind::kRange, 0.1,
+     "--max-inlined-bytecode-size", 0, 920},
+    {FuzzilliCond::kIfTurbolev, FuzzilliDrawKind::kRangeCumulative, 1.0,
+     "--max-inlined-bytecode-size-cumulative", 0, 920},
+    {FuzzilliCond::kIfTurbolevNoSmallZero, FuzzilliDrawKind::kRange, 0.1,
+     "--max-inlined-bytecode-size-small", 0, 54},
+    {FuzzilliCond::kIfTurbolev, FuzzilliDrawKind::kRange, 0.1,
+     "--max-inlined-bytecode-size-small-with-heapnum-in-out", 0, 150},
     {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.1, "--efficiency-mode", 0,
      0},
     {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.1, "--battery-saver-mode",
@@ -545,6 +615,12 @@ constexpr FuzzilliFlagEntry kFuzzilliFlagTable[] = {
      "--stress-descriptor-array-trimming", 0, 0},
     {FuzzilliCond::kTop, FuzzilliDrawKind::kRange, 0.1, "--stack-size", 54,
      863},
+    {FuzzilliCond::kTop, FuzzilliDrawKind::kRange, 0.5,
+     "--wasm-stack-switching-stack-size", 1, 300, true},
+    {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.5, "--wasm-growable-stacks",
+     0, 0, true},
+    {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.5,
+     "--stress-wasm-stack-switching", 0, 0, true},
     {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.5,
      "--proto-assign-seq-lazy-func-opt", 0, 0},
     {FuzzilliCond::kIfProtoAssignSeq, FuzzilliDrawKind::kFlag, 0.5,
@@ -567,6 +643,10 @@ constexpr FuzzilliFlagEntry kFuzzilliFlagTable[] = {
      "--assert-types", 0, 0},
     {FuzzilliCond::kIfMaglevOrTurbolev, FuzzilliDrawKind::kFlag, 0.1,
      "--maglev-assert-types", 0, 0},
+    {FuzzilliCond::kIfTurbolevNotSandbox, FuzzilliDrawKind::kFlag, 0.2,
+     "--maglev-range-verification", 0, 0},
+    {FuzzilliCond::kIfNotSandbox, FuzzilliDrawKind::kFlag, 0.2,
+     "--verify-turboshaft", 0, 0},
     {FuzzilliCond::kIfNotSandbox, FuzzilliDrawKind::kFlag, 0.2,
      "--turboshaft-verify-load-elimination", 0, 0},
     {FuzzilliCond::kIfNotSandbox, FuzzilliDrawKind::kFlag, 0.1,
@@ -580,8 +660,19 @@ constexpr FuzzilliFlagEntry kFuzzilliFlagTable[] = {
     {FuzzilliCond::kTop, FuzzilliDrawKind::kDeopt, 0.1, "--deopt-every-n-times",
      0, 0},
     {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.1, "--stress-ic", 0, 0},
+    {FuzzilliCond::kTop, FuzzilliDrawKind::kFlagElse, 0.1, "--no-use-ic", 0, 0},
+    {FuzzilliCond::kTop, FuzzilliDrawKind::kRange, 0.1,
+     "--invocation-count-for-feedback-allocation", 0, 8},
+    {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.1,
+     "--no-additive-safe-int-feedback", 0, 0},
     {FuzzilliCond::kTop, FuzzilliDrawKind::kFlag, 0.1,
      "--optimize-on-next-call-optimizes-to-maglev", 0, 0},
+    {FuzzilliCond::kIfTurbofan, FuzzilliDrawKind::kFlag, 0.2,
+     "--optimize-maglev-optimizes-to-turbofan", 0, 0},
+    {FuzzilliCond::kIfTurbofanNoAssertTypes, FuzzilliDrawKind::kFlag, 0.25,
+     "--stress-concurrent-inlining", 0, 0},
+    {FuzzilliCond::kIfTurbofanNoAssertTypes, FuzzilliDrawKind::kFlagWithPrev,
+     0.2, "--stress-concurrent-inlining-attach-code", 0, 0},
     {FuzzilliCond::kGcStress, FuzzilliDrawKind::kGroup, 0.1, "", 0, 0},
     {FuzzilliCond::kGcStress, FuzzilliDrawKind::kRange, 0.4, "--stress-marking",
      1, 100},
@@ -589,6 +680,12 @@ constexpr FuzzilliFlagEntry kFuzzilliFlagTable[] = {
      "--stress-scavenge", 1, 100},
     {FuzzilliCond::kGcStress, FuzzilliDrawKind::kFlag, 0.5,
      "--stress-flush-code", 0, 0},
+    {FuzzilliCond::kGcStress, FuzzilliDrawKind::kFlag, 0.5, "--wasm-code-gc", 0,
+     0, true},
+    {FuzzilliCond::kGcStress, FuzzilliDrawKind::kFlagWithPrev, 1.0,
+     "--stress-wasm-code-gc", 0, 0, true},
+    {FuzzilliCond::kGcStress, FuzzilliDrawKind::kFlag, 0.5,
+     "--stress-wasm-memory-moving", 0, 0, true},
     {FuzzilliCond::kGcStress, FuzzilliDrawKind::kRangeCoinFirst, 0.4,
      "--gc-interval", 100, 10000},
     {FuzzilliCond::kGcStress, FuzzilliDrawKind::kRangeCoinSecond, 0.4,
@@ -607,11 +704,9 @@ constexpr FuzzilliFlagEntry kFuzzilliFlagTable[] = {
     {FuzzilliCond::kExotic, FuzzilliDrawKind::kFlag, 0.5,
      "--lazy-new-space-shrinking", 0, 0},
     {FuzzilliCond::kExotic, FuzzilliDrawKind::kFlag, 0.5,
+     "--stress-wasm-memory-moving", 0, 0, true},
+    {FuzzilliCond::kExotic, FuzzilliDrawKind::kFlag, 0.5,
      "--stress-background-compile", 0, 0},
-    {FuzzilliCond::kExotic, FuzzilliDrawKind::kFlag, 0.5,
-     "--parallel-compile-tasks-for-lazy", 0, 0},
-    {FuzzilliCond::kExotic, FuzzilliDrawKind::kFlag, 0.5,
-     "--parallel-compile-tasks-for-eager-toplevel", 0, 0},
     {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
      "--always-sparkplug", 0, 0},
     {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5, "--always-osr", 0,
@@ -630,8 +725,6 @@ constexpr FuzzilliFlagEntry kFuzzilliFlagTable[] = {
     {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
      "--maglev-optimistic-peeled-loops", 0, 0},
     {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
-     "--maglev-pretenure-store-values", 0, 0},
-    {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
      "--maglev-poly-calls", 0, 0},
     {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
      "--maglev-truncation", 0, 0},
@@ -641,8 +734,6 @@ constexpr FuzzilliFlagEntry kFuzzilliFlagTable[] = {
      "--maglev-range-analysis", 0, 0},
     {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
      "--maglev-escape-analysis", 0, 0},
-    {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5, "--maglev-licm",
-     0, 0},
     {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
      "--turbo-move-optimization", 0, 0},
     {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5, "--turbo-jt", 0,
@@ -673,8 +764,6 @@ constexpr FuzzilliFlagEntry kFuzzilliFlagTable[] = {
      "--turbo-load-elimination", 0, 0},
     {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
      "--turbo-inlining", 0, 0},
-    {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
-     "--turbo-splitting", 0, 0},
     {FuzzilliCond::kExotic, FuzzilliDrawKind::kCpuUniform, 1.0,
      "--no-enable-sse3", 0, 0},
     {FuzzilliCond::kExotic, FuzzilliDrawKind::kCpuUniform, 1.0,
@@ -687,12 +776,44 @@ constexpr FuzzilliFlagEntry kFuzzilliFlagTable[] = {
      "--no-enable-avx", 0, 0},
     {FuzzilliCond::kExotic, FuzzilliDrawKind::kCpuUniform, 1.0,
      "--no-enable-avx2", 0, 0},
+    {FuzzilliCond::kExotic, FuzzilliDrawKind::kCpuUniform, 1.0,
+     "--no-enable-sahf", 0, 0},
+    {FuzzilliCond::kExotic, FuzzilliDrawKind::kCpuUniform, 1.0,
+     "--no-enable-fma3", 0, 0},
+    {FuzzilliCond::kExotic, FuzzilliDrawKind::kCpuUniform, 1.0,
+     "--no-enable-bmi1", 0, 0},
+    {FuzzilliCond::kExotic, FuzzilliDrawKind::kCpuUniform, 1.0,
+     "--no-enable-bmi2", 0, 0},
+    {FuzzilliCond::kExotic, FuzzilliDrawKind::kCpuUniform, 1.0,
+     "--no-enable-lzcnt", 0, 0},
+    {FuzzilliCond::kExotic, FuzzilliDrawKind::kCpuUniform, 1.0,
+     "--no-enable-popcnt", 0, 0},
     {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
      "--turboshaft-loop-unrolling", 0, 0},
     {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
      "--turboshaft-load-elimination", 0, 0},
     {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
      "--turboshaft-string-concat-escape-analysis", 0, 0},
+    {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
+     "--wasm-loop-peeling", 0, 0, true},
+    {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
+     "--turboshaft-wasm-load-elimination", 0, 0, true},
+    {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
+     "--wasm-loop-unrolling", 0, 0, true},
+    {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5, "--wasm-inlining",
+     0, 0, true},
+    {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5, "--wasm-opt", 0,
+     0, true},
+    {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5, "--wasm-deopt", 0,
+     0, true},
+    {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
+     "--wasm-enforce-bounds-checks", 0, 0, true},
+    {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
+     "--wasm-math-intrinsics", 0, 0, true},
+    {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
+     "--wasm-bulkmem-inlining", 0, 0, true},
+    {FuzzilliCond::kExotic, FuzzilliDrawKind::kBoolFlag, 0.5,
+     "--wasm-lazy-compilation", 0, 0, true},
 };
 
 constexpr size_t CountFuzzilliCpuFlags() {
@@ -742,8 +863,27 @@ constexpr bool ValidateFuzzilliFlagTable() {
           sv.substr(0, 5) == "--no-") {
         return false;
       }
-    } else if (e.kind == FuzzilliDrawKind::kRangeWithPrev) {
+    } else if (e.kind == FuzzilliDrawKind::kRangeWithPrev ||
+               e.kind == FuzzilliDrawKind::kRangeCumulative) {
       if (e.prob != 1.0) return false;
+    }
+    // Some rows read the draw of the row before them. That row must have
+    // the expected kind, the same condition and the same Wasm gate.
+    const bool after_flag = e.kind == FuzzilliDrawKind::kFlagElse ||
+                            e.kind == FuzzilliDrawKind::kFlagWithPrev;
+    const bool after_range = e.kind == FuzzilliDrawKind::kRangeCumulative;
+    if (after_flag || after_range ||
+        e.kind == FuzzilliDrawKind::kRangeWithPrev) {
+      if (i == 0) return false;
+      const FuzzilliFlagEntry& prev = kFuzzilliFlagTable[i - 1];
+      if (prev.cond != e.cond || prev.wasm != e.wasm ||
+          (after_flag && prev.kind != FuzzilliDrawKind::kFlag) ||
+          (e.kind == FuzzilliDrawKind::kRangeWithPrev &&
+           prev.kind != FuzzilliDrawKind::kFlag &&
+           prev.kind != FuzzilliDrawKind::kRange) ||
+          (after_range && prev.kind != FuzzilliDrawKind::kRange)) {
+        return false;
+      }
     }
   }
   return cpu_seen == kFuzzilliCpuFlagCount;
@@ -771,10 +911,165 @@ REDLINE_TUNABLE(kFlagsTargetProbeExecs, "flags.target_probe_execs", 64, 0,
                 10000,
                 "change-based fuzzing: executions without a target hit "
                 "before a child respawns");
+REDLINE_TUNABLE(kFlagsImportedChance, "flags.imported_chance", 0.25, 0, 1,
+                "normal mode: chance that a new target process starts from "
+                "the `// Flags:` set of an imported test");
+REDLINE_TUNABLE(kFlagsAffinityChance, "flags.affinity_chance", 0.15, 0, 1,
+                "normal mode: chance that a new target process starts from "
+                "a random flag set that found many new edges");
+REDLINE_TUNABLE(kFlagsSeedAffinityTries, "flags.seed_affinity_tries", 2, 1, 16,
+                "seed candidates that a worker examines to find a program "
+                "that shares a flag with its target process (1: off)");
+
+// D8FlagBlacklist: a failed start blocks its only new flag after this number
+// of started target processes.
+constexpr uint64_t kBlacklistMinStarts = 4;
+constexpr uint32_t kBlacklistRepeatedFailures = 2;
+
+// The flag pairs that CONTRADICTORY_FLAGS of
+// tools/clusterfuzz/js_fuzzer/exceptions.js lists.
+constexpr std::pair<std::string_view, std::string_view> kContradictoryFlags[] =
+    {
+        {"--assert-types", "--stress-concurrent-inlining"},
+        {"--assert-types", "--stress-concurrent-inlining-attach-code"},
+        {"--jitless", "--maglev"},
+        {"--jitless", "--maglev-future"},
+        {"--jitless", "--stress-maglev"},
+        {"--jitless", "--stress-concurrent-inlining"},
+        {"--jitless", "--stress-concurrent-inlining-attach-code"},
+};
+
+// The flag names that a test cannot give. DISALLOWED_FLAGS and
+// DISALLOWED_FLAGS_WITH_DISCOURAGED_FILES of exceptions.js give most of them.
+// The other names write logs or traces, stop d8, change the d8 shell or give
+// false crashes.
+constexpr std::string_view kDeniedTestFlags[] = {
+    // exceptions.js.
+    "--correctness-fuzzer-suppressions",
+    "--expose-trigger-failure",
+    "--sandbox-testing",
+    "--sandbox-fuzzing",
+    "--allow-natives-syntax",
+    "--debug-code",
+    "--disable-abortjs",
+    "--enable-slow-asserts",
+    "--expose-gc",
+    "--fuzzing",
+    "--omit-quit",
+    "--disable-in-process-stack-traces",
+    "--invoke-weak-callbacks",
+    "--verify-heap",
+    "--stack-size",
+    "--check-handle-count",
+    "--expose-debug-as",
+    "--expose-natives-as",
+    "--mock-arraybuffer-allocator",
+    // Redline.
+    "--help",
+    "--abort-on-contradictory-flags",
+    "--single-threaded",
+    "--trace",
+    "--simulate-errors",
+    "--enable-os-system",
+    "--isolate",
+    "--module",
+    "--throws",
+    "--stress-runs",
+    "--expose-memory-corruption-api",
+};
+
+constexpr std::string_view kDeniedTestFlagPrefixes[] = {
+    // exceptions.js.
+    "--experimental-",
+    "--icu-data-file",
+    "--random-seed",
+    // Redline: logs, traces and profiles.
+    "--print-",
+    "--trace-",
+    "--perf-",
+    "--prof",
+    "--log",
+    "--gdbjit",
+    "--heap-snapshot",
+    "--wasm-pgo",
+};
 
 std::string_view FlagPrefix(std::string_view flag) {
   const size_t eq = flag.find('=');
   return eq == std::string_view::npos ? flag : flag.substr(0, eq);
+}
+
+// The flag name of `flag` with `-` for `_`.
+std::string NormalizedName(std::string_view flag) {
+  std::string name(FlagPrefix(flag));
+  std::replace(name.begin(), name.end(), '_', '-');
+  return name;
+}
+
+// `flag` with `-` for `_` in its name. The value stays.
+std::string NormalizedFlag(std::string_view flag) {
+  const std::string_view name = FlagPrefix(flag);
+  return NormalizedName(name) + std::string(flag.substr(name.size()));
+}
+
+// The normalized name of `flag` without `no-`: `--foo` and `--no-foo` have
+// the same key.
+std::string FlagKey(std::string_view flag) {
+  std::string key = NormalizedName(flag);
+  if (key.starts_with("--no-")) {
+    key.erase(2, 3);
+  }
+  return key;
+}
+
+bool IsDeniedTestFlagName(std::string_view name) {
+  if (name.starts_with("--harmony-") && name != "--harmony-shipping") {
+    return true;
+  }
+  if (name.starts_with("--js-") && name != "--js-staging" &&
+      name != "--js-shipping") {
+    return true;
+  }
+  for (std::string_view denied : kDeniedTestFlags) {
+    if (name == denied) {
+      return true;
+    }
+  }
+  for (std::string_view prefix : kDeniedTestFlagPrefixes) {
+    if (name.starts_with(prefix)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::vector<std::string> SplitWhitespace(std::string_view text) {
+  std::vector<std::string> words;
+  size_t i = 0;
+  while (i < text.size()) {
+    while (i < text.size() && isspace(static_cast<unsigned char>(text[i]))) {
+      i++;
+    }
+    const size_t start = i;
+    while (i < text.size() && !isspace(static_cast<unsigned char>(text[i]))) {
+      i++;
+    }
+    if (i > start) {
+      words.emplace_back(text.substr(start, i - start));
+    }
+  }
+  return words;
+}
+
+bool HasFlagName(const std::vector<std::string>& flags, std::string_view name) {
+  return std::any_of(flags.begin(), flags.end(), [name](const std::string& f) {
+    return NormalizedName(f) == name;
+  });
+}
+
+bool HasFlagKey(const std::vector<std::string>& flags, std::string_view key) {
+  return std::any_of(flags.begin(), flags.end(),
+                     [key](const std::string& f) { return FlagKey(f) == key; });
 }
 
 int64_t FlagIntValue(const std::string& flag) {
@@ -789,22 +1084,29 @@ bool ContainsFlag(const std::vector<std::string>& list, std::string_view name) {
                      [name](const std::string& f) { return f == name; });
 }
 
+// Draws the rows of kFuzzilliFlagTable. The Wasm rows need `with_wasm`.
 void DrawFuzzilliD8Flags(Random& rng,
                          const std::vector<std::string>& fixed_args,
-                         std::vector<std::string>* flags) {
+                         bool with_wasm, std::vector<std::string>* flags) {
   bool drew_no_turbofan = false;
   bool else_no_turbofan = false;
+  bool has_no_turbofan = ContainsFlag(fixed_args, "--no-turbofan");
+  bool has_top_tier = ContainsFlag(fixed_args, "--maglev-as-top-tier");
   bool has_no_maglev = ContainsFlag(fixed_args, "--no-maglev");
   bool drew_maglev_non_eager = false;
   bool has_turbolev = ContainsFlag(fixed_args, "--turbolev");
   bool drew_turbolev = false;
   bool drew_turbolev_future = false;
+  bool drew_small_zero = false;
+  bool has_assert_types = ContainsFlag(fixed_args, "--assert-types");
   bool drew_proto_assign_seq = false;
+  bool drew_no_liftoff = false;
   const bool for_sandbox = ContainsFlag(fixed_args, "--sandbox-fuzzing") ||
                            ContainsFlag(fixed_args, "--sandbox-testing");
   bool in_gc_stress = false;
   bool in_exotic = false;
   bool prev_drawn = false;
+  int64_t prev_value = 0;
 
   const size_t n = std::size(kFuzzilliFlagTable);
   for (size_t i = 0; i < n; i++) {
@@ -832,17 +1134,35 @@ void DrawFuzzilliD8Flags(Random& rng,
       case FuzzilliCond::kElseNoTurbofan:
         active = else_no_turbofan;
         break;
+      case FuzzilliCond::kIfNotMaglevTopTier:
+        active = !has_top_tier;
+        break;
+      case FuzzilliCond::kIfTurbofan:
+        active = !has_no_turbofan;
+        break;
       case FuzzilliCond::kIfMaglev:
         active = !has_no_maglev;
         break;
       case FuzzilliCond::kIfMaglevNonEager:
         active = !has_no_maglev && drew_maglev_non_eager;
         break;
+      case FuzzilliCond::kIfMaglevTurbofan:
+        active = !has_no_maglev && !has_no_turbofan;
+        break;
       case FuzzilliCond::kIfTurbolev:
         active = drew_turbolev;
         break;
       case FuzzilliCond::kIfTurbolevFuture:
         active = drew_turbolev && drew_turbolev_future;
+        break;
+      case FuzzilliCond::kIfTurbolevNoSmallZero:
+        active = drew_turbolev && !drew_small_zero;
+        break;
+      case FuzzilliCond::kIfTurbolevNotSandbox:
+        active = has_turbolev && !for_sandbox;
+        break;
+      case FuzzilliCond::kIfTurbofanNoAssertTypes:
+        active = !has_no_turbofan && !has_assert_types;
         break;
       case FuzzilliCond::kIfProtoAssignSeq:
         active = drew_proto_assign_seq;
@@ -853,6 +1173,9 @@ void DrawFuzzilliD8Flags(Random& rng,
       case FuzzilliCond::kIfMaglevOrTurbolev:
         active = !for_sandbox && (!has_no_maglev || has_turbolev);
         break;
+      case FuzzilliCond::kIfNoLiftoff:
+        active = drew_no_liftoff && !for_sandbox;
+        break;
       case FuzzilliCond::kGcStress:
         active = in_gc_stress;
         break;
@@ -860,7 +1183,7 @@ void DrawFuzzilliD8Flags(Random& rng,
         active = in_exotic;
         break;
     }
-    if (!active) {
+    if (!active || (e.wasm && !with_wasm)) {
       if (e.kind == FuzzilliDrawKind::kCoinFirst ||
           e.kind == FuzzilliDrawKind::kRangeCoinFirst) {
         i++;
@@ -872,14 +1195,28 @@ void DrawFuzzilliD8Flags(Random& rng,
     }
 
     switch (e.kind) {
-      case FuzzilliDrawKind::kFlag: {
-        const bool drawn = rng.Chance(e.prob);
-        prev_drawn = drawn;
+      case FuzzilliDrawKind::kFlag:
+      case FuzzilliDrawKind::kFlagElse:
+      case FuzzilliDrawKind::kFlagWithPrev: {
+        bool drawn = false;
+        if (e.kind == FuzzilliDrawKind::kFlag) {
+          drawn = rng.Chance(e.prob);
+        } else if (e.kind == FuzzilliDrawKind::kFlagElse) {
+          drawn = !prev_drawn && rng.Chance(e.prob);
+        } else {
+          drawn = prev_drawn && rng.Chance(e.prob);
+        }
+        if (e.kind != FuzzilliDrawKind::kFlagWithPrev) {
+          prev_drawn = drawn;
+        }
         if (drawn) {
           flags->emplace_back(e.flag);
           const std::string_view name(e.flag);
           if (name == "--no-turbofan") {
             drew_no_turbofan = true;
+            has_no_turbofan = true;
+          } else if (name == "--maglev-as-top-tier") {
+            has_top_tier = true;
           } else if (name == "--no-maglev") {
             has_no_maglev = true;
           } else if (name == "--maglev-non-eager-inlining") {
@@ -889,8 +1226,14 @@ void DrawFuzzilliD8Flags(Random& rng,
             has_turbolev = true;
           } else if (name == "--turbolev-future") {
             drew_turbolev_future = true;
+          } else if (name == "--max-inlined-bytecode-size-small=0") {
+            drew_small_zero = true;
+          } else if (name == "--assert-types") {
+            has_assert_types = true;
           } else if (name == "--proto-assign-seq-lazy-func-opt") {
             drew_proto_assign_seq = true;
+          } else if (name == "--no-liftoff") {
+            drew_no_liftoff = true;
           }
         }
         break;
@@ -916,15 +1259,20 @@ void DrawFuzzilliD8Flags(Random& rng,
         const bool drawn = rng.Chance(e.prob);
         prev_drawn = drawn;
         if (drawn) {
+          prev_value = rng.Range(e.min_val, e.max_val);
           flags->push_back(std::string(e.flag) + "=" +
-                           std::to_string(rng.Range(e.min_val, e.max_val)));
+                           std::to_string(prev_value));
         }
         break;
       }
-      case FuzzilliDrawKind::kRangeWithPrev: {
+      case FuzzilliDrawKind::kRangeWithPrev:
+      case FuzzilliDrawKind::kRangeCumulative: {
         if (prev_drawn) {
-          flags->push_back(std::string(e.flag) + "=" +
-                           std::to_string(rng.Range(e.min_val, e.max_val)));
+          int64_t value = rng.Range(e.min_val, e.max_val);
+          if (e.kind == FuzzilliDrawKind::kRangeCumulative) {
+            value += prev_value;
+          }
+          flags->push_back(std::string(e.flag) + "=" + std::to_string(value));
         }
         break;
       }
@@ -989,6 +1337,16 @@ void SanitizeFuzzilliFixedClashes(std::vector<std::string>* flags,
     remove_exact("--maglev-future");
     remove_exact("--turbolev-future");
     remove_exact("--jit-fuzzing");
+    remove_exact("--verify-turboshaft");
+    remove_exact("--always-osr-from-maglev");
+    remove_exact("--optimize-maglev-optimizes-to-turbofan");
+  }
+  // V8 resets a fixed flag that clashes with --stress-concurrent-inlining.
+  if (has_fixed("--maglev-as-top-tier") || has_fixed("--single-threaded") ||
+      has_fixed("--turboshaft-assert-types") || has_fixed("--jitless") ||
+      has_fixed("--lite-mode") || has_fixed("--disable-optimizing-compilers")) {
+    remove_exact("--stress-concurrent-inlining");
+    remove_exact("--stress-concurrent-inlining-attach-code");
   }
   if (has_fixed("--turbofan") || has_fixed("--turbolev") ||
       has_fixed("--turbolev-future") || has_fixed("--no-maglev")) {
@@ -1015,7 +1373,6 @@ void SanitizeFuzzilliFixedClashes(std::vector<std::string>* flags,
   }
   if (has_fixed("--empty-shared-heap")) {
     remove_exact("--shared-strings");
-    remove_exact("--shared-string-table");
   }
 }
 
@@ -1024,14 +1381,12 @@ void SanitizeFuzzilliFixedClashes(std::vector<std::string>* flags,
 void SanitizeD8Flags(std::vector<std::string>* flags,
                      const std::vector<std::string>& fixed_args) {
   std::vector<std::string> deduped;
+  std::vector<std::string> keys;
   deduped.reserve(flags->size());
   for (const std::string& flag : *flags) {
-    const std::string_view prefix = FlagPrefix(flag);
-    const bool seen = std::any_of(deduped.begin(), deduped.end(),
-                                  [prefix](const std::string& existing) {
-                                    return FlagPrefix(existing) == prefix;
-                                  });
-    if (!seen) {
+    std::string key = FlagKey(flag);
+    if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
+      keys.push_back(std::move(key));
       deduped.push_back(flag);
     }
   }
@@ -1150,6 +1505,22 @@ void SanitizeD8Flags(std::vector<std::string>* flags,
       std::iter_swap(size_it, cum_it);
     }
   }
+
+  // The contradictory pairs: the flag of `fixed_args` stays, else the first
+  // flag stays.
+  for (const auto& [a, b] : kContradictoryFlags) {
+    auto it_a = std::find(flags->begin(), flags->end(), a);
+    auto it_b = std::find(flags->begin(), flags->end(), b);
+    const bool in_a = it_a != flags->end();
+    const bool in_b = it_b != flags->end();
+    if (in_a && has_fixed(b)) {
+      flags->erase(it_a);
+    } else if (in_b && has_fixed(a)) {
+      flags->erase(it_b);
+    } else if (in_a && in_b) {
+      flags->erase(it_a < it_b ? it_b : it_a);
+    }
+  }
 }
 
 bool ParseD8FlagProfile(const std::string& name, D8FlagProfile* profile) {
@@ -1165,6 +1536,14 @@ bool ParseD8FlagProfile(const std::string& name, D8FlagProfile* profile) {
     *profile = D8FlagProfile::kFuzzilli;
     return true;
   }
+  if (name == "fuzzilli-wasm") {
+    *profile = D8FlagProfile::kFuzzilliWasm;
+    return true;
+  }
+  if (name == "runtime") {
+    *profile = D8FlagProfile::kRuntime;
+    return true;
+  }
   return false;
 }
 
@@ -1176,6 +1555,10 @@ const char* D8FlagProfileName(D8FlagProfile profile) {
       return "turbolev";
     case D8FlagProfile::kFuzzilli:
       return "fuzzilli";
+    case D8FlagProfile::kFuzzilliWasm:
+      return "fuzzilli-wasm";
+    case D8FlagProfile::kRuntime:
+      return "runtime";
   }
   return "maglev";
 }
@@ -1184,8 +1567,10 @@ std::vector<std::string> RandomD8Flags(
     Random& rng, D8FlagProfile profile,
     const std::vector<std::string>& fixed_args) {
   std::vector<std::string> flags;
-  if (profile == D8FlagProfile::kFuzzilli) {
-    DrawFuzzilliD8Flags(rng, fixed_args, &flags);
+  if (profile == D8FlagProfile::kFuzzilli ||
+      profile == D8FlagProfile::kFuzzilliWasm) {
+    DrawFuzzilliD8Flags(rng, fixed_args,
+                        profile == D8FlagProfile::kFuzzilliWasm, &flags);
     SanitizeFuzzilliFixedClashes(&flags, fixed_args);
     return flags;
   }
@@ -1209,15 +1594,23 @@ std::vector<std::string> RandomD8Flags(
     add_value(flag, min.AsInt(), max.AsInt());
     return true;
   };
+  // kRuntime draws no flag that only acts on Sparkplug, Maglev, Turbofan or
+  // Turbolev, and no CPU feature flag.
+  const bool jit = profile != D8FlagProfile::kRuntime;
   const bool single_threaded =
       maybe(kFlagsSingleThreaded, "--single-threaded") ||
       ContainsFlag(fixed_args, "--single-threaded");
-  const bool assert_types = maybe(kFlagsAssertTypes, "--assert-types") ||
-                            ContainsFlag(fixed_args, "--assert-types");
+  const bool assert_types =
+      (jit && maybe(kFlagsAssertTypes, "--assert-types")) ||
+      ContainsFlag(fixed_args, "--assert-types");
   maybe(kFlagsNoLazyFeedbackAllocation, "--no-lazy-feedback-allocation");
-  maybe(kFlagsNoBaselineBatchCompilation, "--no-baseline-batch-compilation");
+  if (jit) {
+    maybe(kFlagsNoBaselineBatchCompilation, "--no-baseline-batch-compilation");
+  }
   maybe(kFlagsPrivateFieldBytecodes, "--private-field-bytecodes");
   if (profile == D8FlagProfile::kTurbolev) {
+    maybe(kFlagsTurboVerify, "--turbo-verify");
+    maybe(kFlagsTurboVerifyAllocation, "--turbo-verify-allocation");
     // Turbolev builds its graph with the Maglev graph builder, so the builtin
     // reducers of Maglev apply to it too.
     maybe(kFlagsTurbolevDisableBuiltinReducers,
@@ -1289,7 +1682,7 @@ std::vector<std::string> RandomD8Flags(
           "--turboshaft-verify-load-elimination");
     maybe(kFlagsTurboshaftVerifyTaggedness,
           "--turboshaft-verify-load-store-taggedness");
-  } else {
+  } else if (profile == D8FlagProfile::kMaglev) {
     maybe(kFlagsMaglevFuture, "--maglev-future");
     if (maybe(kFlagsMaglevNonEagerInlining, "--maglev-non-eager-inlining")) {
       // Without eager inlining, the calls stay for the later inliner.
@@ -1311,16 +1704,21 @@ std::vector<std::string> RandomD8Flags(
     maybe(kFlagsMaglevInlineApiCalls, "--maglev-inline-api-calls");
   }
 
-  // The flags of both profiles. Turbolev also reads the Maglev assertions in
+  // The flags of all profiles. Turbolev also reads the Maglev assertions in
   // its graph builder and in Turboshaft.
-  maybe(kFlagsMaglevAssert, "--maglev-assert");
-  maybe(kFlagsMaglevAssertTypes, "--maglev-assert-types");
+  if (jit) {
+    maybe(kFlagsMaglevAssert, "--maglev-assert");
+    maybe(kFlagsMaglevAssertTypes, "--maglev-assert-types");
+    maybe(kFlagsMaglevAssertStackSize, "--maglev-assert-stack-size");
+  }
   maybe(kFlagsStressIc, "--stress-ic");
   maybe(kFlagsVerifyHeap, "--verify-heap");
   maybe(kFlagsFuture, "--future");
-  maybe(kFlagsJitFuzzing, "--jit-fuzzing");
-  const bool no_sparkplug = maybe(kFlagsNoSparkplug, "--no-sparkplug") ||
-                            ContainsFlag(fixed_args, "--no-sparkplug");
+  bool no_sparkplug = ContainsFlag(fixed_args, "--no-sparkplug");
+  if (jit) {
+    maybe(kFlagsJitFuzzing, "--jit-fuzzing");
+    no_sparkplug |= maybe(kFlagsNoSparkplug, "--no-sparkplug");
+  }
   maybe(kFlagsSharedStrings, "--shared-strings");
   maybe(kFlagsProtoAssignSeqOptCountOne, "--proto-assign-seq-opt-count=1");
   const double verify_roll = rng.Double();
@@ -1334,44 +1732,53 @@ std::vector<std::string> RandomD8Flags(
   maybe(kFlagsStressLazy, "--stress-lazy");
   maybe(kFlagsNoLazy, "--no-lazy");
   maybe(kFlagsNoLazyEval, "--no-lazy-eval");
-  maybe(kFlagsAlwaysOsr, "--always-osr");
-  if (!no_sparkplug) {
-    maybe(kFlagsAlwaysSparkplug, "--always-sparkplug");
+  if (jit) {
+    maybe(kFlagsAlwaysOsr, "--always-osr");
+    if (!no_sparkplug) {
+      maybe(kFlagsAlwaysSparkplug, "--always-sparkplug");
+    }
   }
   maybe(kFlagsForceSlowPath, "--force-slow-path");
-  maybe(kFlagsStressGcDuringCompilation, "--stress-gc-during-compilation");
+  if (jit) {
+    maybe(kFlagsStressGcDuringCompilation, "--stress-gc-during-compilation");
+  }
   maybe_value(kFlagsFeedbackAllocationCount,
               "--invocation-count-for-feedback-allocation",
               kFlagsFeedbackAllocationCountMin,
               kFlagsFeedbackAllocationCountMax);
-  if (rng.Chance(kFlagsDeoptEveryNTimes())) {
+  if (jit && rng.Chance(kFlagsDeoptEveryNTimes())) {
     const int n =
         kDeoptEveryNTimesValues[rng.Index(std::size(kDeoptEveryNTimesValues))];
     flags.push_back("--deopt-every-n-times=" + std::to_string(n));
   }
   maybe(kFlagsNoUseIc, "--no-use-ic");
-  maybe(kFlagsDisableLoopStackChecks, "--disable-loop-stack-checks");
+  // Only the optimizing compilers read --disable-loop-stack-checks.
+  if (jit) {
+    maybe(kFlagsDisableLoopStackChecks, "--disable-loop-stack-checks");
+  }
   maybe_value(kFlagsStackSize, "--stack-size", kFlagsStackSizeMin,
               kFlagsStackSizeMax);
-  maybe(kFlagsNoEnableSse3, "--no-enable-sse3");
-  maybe(kFlagsNoEnableSsse3, "--no-enable-ssse3");
-  maybe(kFlagsNoEnableSse41, "--no-enable-sse4-1");
-  maybe(kFlagsNoEnableSse42, "--no-enable-sse4-2");
-  maybe(kFlagsNoEnableAvx, "--no-enable-avx");
-  maybe(kFlagsNoEnableAvx2, "--no-enable-avx2");
-  maybe(kFlagsNoEnableSahf, "--no-enable-sahf");
-  maybe(kFlagsNoEnableFma3, "--no-enable-fma3");
-  maybe(kFlagsNoEnableBmi1, "--no-enable-bmi1");
-  maybe(kFlagsNoEnableBmi2, "--no-enable-bmi2");
-  maybe(kFlagsNoEnableLzcnt, "--no-enable-lzcnt");
-  maybe(kFlagsNoEnablePopcnt, "--no-enable-popcnt");
-  maybe(kFlagsNoMaglevInlining, "--no-maglev-inlining");
-  maybe(kFlagsNoMaglevPolyCalls, "--no-maglev-poly-calls");
-  maybe(kFlagsNoMaglevEscapeAnalysis, "--no-maglev-escape-analysis");
-  maybe(kFlagsNoMaglevOptimisticPeeledLoops,
-        "--no-maglev-optimistic-peeled-loops");
-  maybe(kFlagsNoMaglevTruncation, "--no-maglev-truncation");
-  maybe(kFlagsNoMaglevCse, "--no-maglev-cse");
+  if (jit) {
+    maybe(kFlagsNoEnableSse3, "--no-enable-sse3");
+    maybe(kFlagsNoEnableSsse3, "--no-enable-ssse3");
+    maybe(kFlagsNoEnableSse41, "--no-enable-sse4-1");
+    maybe(kFlagsNoEnableSse42, "--no-enable-sse4-2");
+    maybe(kFlagsNoEnableAvx, "--no-enable-avx");
+    maybe(kFlagsNoEnableAvx2, "--no-enable-avx2");
+    maybe(kFlagsNoEnableSahf, "--no-enable-sahf");
+    maybe(kFlagsNoEnableFma3, "--no-enable-fma3");
+    maybe(kFlagsNoEnableBmi1, "--no-enable-bmi1");
+    maybe(kFlagsNoEnableBmi2, "--no-enable-bmi2");
+    maybe(kFlagsNoEnableLzcnt, "--no-enable-lzcnt");
+    maybe(kFlagsNoEnablePopcnt, "--no-enable-popcnt");
+    maybe(kFlagsNoMaglevInlining, "--no-maglev-inlining");
+    maybe(kFlagsNoMaglevPolyCalls, "--no-maglev-poly-calls");
+    maybe(kFlagsNoMaglevEscapeAnalysis, "--no-maglev-escape-analysis");
+    maybe(kFlagsNoMaglevOptimisticPeeledLoops,
+          "--no-maglev-optimistic-peeled-loops");
+    maybe(kFlagsNoMaglevTruncation, "--no-maglev-truncation");
+    maybe(kFlagsNoMaglevCse, "--no-maglev-cse");
+  }
   maybe(kFlagsStressCompaction, "--stress-compaction");
   maybe(kFlagsStressCompactionRandom, "--stress-compaction-random");
   maybe_value(kFlagsStressMarking, "--stress-marking", kFlagsStressMarkingMin,
@@ -1395,6 +1802,11 @@ std::vector<std::string> RandomD8Flags(
   maybe(kFlagsStressObjectPinning,
         "--stress-scavenger-conservative-object-pinning-random");
   maybe(kFlagsPreciseObjectPinning, "--precise-object-pinning");
+  maybe(kFlagsEfficiencyMode, "--efficiency-mode");
+  maybe(kFlagsBatterySaverMode, "--battery-saver-mode");
+  maybe(kFlagsNoShortBuiltinCalls, "--no-short-builtin-calls");
+  maybe(kFlagsStressBackgroundCompile, "--stress-background-compile");
+  maybe(kFlagsLazyNewSpaceShrinking, "--lazy-new-space-shrinking");
   SanitizeD8Flags(&flags, fixed_args);
   return flags;
 }
@@ -1436,5 +1848,308 @@ double EffectiveTargetGuidedChance(uint64_t completed_children,
 double TargetMutateChance() { return kFlagsTargetMutateChance(); }
 int TargetTournament() { return kFlagsTargetTournament.AsInt(); }
 int TargetProbeExecs() { return kFlagsTargetProbeExecs.AsInt(); }
+
+double ImportedFlagsChance() { return kFlagsImportedChance(); }
+double FlagAffinityChance() { return kFlagsAffinityChance(); }
+int SeedAffinityTries() { return kFlagsSeedAffinityTries.AsInt(); }
+
+std::string_view D8FlagName(std::string_view flag) { return FlagPrefix(flag); }
+
+bool IsAllowedTestFlag(std::string_view flag) {
+  // A bare `--` stops the flag parser of V8.
+  if (flag.size() <= 2 || !flag.starts_with("--") || flag.ends_with(".mjs")) {
+    return false;
+  }
+  const std::string name = NormalizedName(flag);
+  if (IsDeniedTestFlagName(name)) {
+    return false;
+  }
+  // V8 also reads `--no-foo` and `--nofoo` as the negation of `--foo`.
+  if (name.starts_with("--no-")) {
+    return !IsDeniedTestFlagName("--" + name.substr(5));
+  }
+  if (name.starts_with("--no")) {
+    return !IsDeniedTestFlagName("--" + name.substr(4));
+  }
+  return true;
+}
+
+std::vector<std::string> SanitizeTestFlags(const std::vector<std::string>& raw,
+                                           std::vector<std::string>* rejected) {
+  std::vector<std::string> flags;
+  for (const std::string& flag : raw) {
+    if (!IsAllowedTestFlag(flag)) {
+      if (rejected != nullptr) {
+        rejected->push_back(flag);
+      }
+      continue;
+    }
+    flags.push_back(NormalizedFlag(flag));
+  }
+  SanitizeD8Flags(&flags);
+  return flags;
+}
+
+void RemoveFixedD8Flags(std::vector<std::string>* flags,
+                        const std::vector<std::string>& fixed_args) {
+  if (fixed_args.empty()) {
+    return;
+  }
+  flags->erase(std::remove_if(flags->begin(), flags->end(),
+                              [&fixed_args](const std::string& flag) {
+                                return HasFlagKey(fixed_args, FlagKey(flag));
+                              }),
+               flags->end());
+}
+
+std::vector<std::string> MergeProgramFlags(
+    const std::vector<std::string>& first,
+    const std::vector<std::string>& second, size_t max_flags) {
+  std::vector<std::string> merged;
+  for (const std::vector<std::string>* list : {&first, &second}) {
+    for (const std::string& flag : *list) {
+      if (merged.size() >= max_flags) {
+        return merged;
+      }
+      if (!HasFlagKey(merged, FlagKey(flag))) {
+        merged.push_back(flag);
+      }
+    }
+  }
+  return merged;
+}
+
+bool SharesD8Flag(const std::vector<std::string>& a,
+                  const std::vector<std::string>& b) {
+  for (const std::string& x : a) {
+    const std::string_view name = FlagPrefix(x);
+    for (const std::string& y : b) {
+      if (FlagPrefix(y) == name) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool ParseD8Trials(std::string_view json, std::vector<D8Trial>* trials,
+                   std::string* error, size_t* dropped) {
+  JsonValue root;
+  if (!JsonValue::Parse(json, &root, error)) {
+    return false;
+  }
+  if (!root.is_array()) {
+    *error = "the trials file is not a JSON list";
+    return false;
+  }
+  for (const JsonValue& entry : root.as_array()) {
+    if (!entry.is_object()) {
+      *error = "a trial is not a JSON object";
+      return false;
+    }
+    if (entry.GetString("app_name", "") != "d8") {
+      continue;
+    }
+    D8Trial trial;
+    trial.probability =
+        std::clamp(entry.GetNumber("probability", 0.0), 0.0, 1.0);
+    const std::vector<std::string> args =
+        SplitWhitespace(entry.GetString("app_args", ""));
+    if (args.empty() || trial.probability <= 0) {
+      continue;
+    }
+    if (!std::all_of(args.begin(), args.end(), [](const std::string& arg) {
+          return IsAllowedTestFlag(arg);
+        })) {
+      if (dropped != nullptr) {
+        (*dropped)++;
+      }
+      continue;
+    }
+    for (const std::string& arg : args) {
+      trial.args.push_back(NormalizedFlag(arg));
+    }
+    for (const JsonValue& flag : entry.Get("contradicts").as_array()) {
+      if (flag.is_string()) {
+        trial.contradicts.push_back(NormalizedName(flag.as_string()));
+      }
+    }
+    trials->push_back(std::move(trial));
+  }
+  return true;
+}
+
+void AddD8Trials(Random& rng, const std::vector<D8Trial>& trials,
+                 const std::vector<std::string>& fixed_args,
+                 std::vector<std::string>* flags) {
+  std::vector<size_t> order(trials.size());
+  std::iota(order.begin(), order.end(), 0);
+  for (size_t i = order.size(); i > 1; i--) {
+    std::swap(order[i - 1], order[rng.Index(i)]);
+  }
+  // The flag names that the drawn trials contradict.
+  std::vector<std::string> blocked;
+  for (size_t index : order) {
+    const D8Trial& trial = trials[index];
+    if (!rng.Chance(trial.probability)) {
+      continue;
+    }
+    const bool contradicts = std::any_of(
+        trial.contradicts.begin(), trial.contradicts.end(),
+        [&](const std::string& name) {
+          return HasFlagName(*flags, name) || HasFlagName(fixed_args, name);
+        });
+    const bool clashes = std::any_of(
+        trial.args.begin(), trial.args.end(), [&](const std::string& arg) {
+          const std::string key = FlagKey(arg);
+          return HasFlagKey(*flags, key) || HasFlagKey(fixed_args, key) ||
+                 std::find(blocked.begin(), blocked.end(),
+                           NormalizedName(arg)) != blocked.end();
+        });
+    if (contradicts || clashes) {
+      continue;
+    }
+    flags->insert(flags->end(), trial.args.begin(), trial.args.end());
+    blocked.insert(blocked.end(), trial.contradicts.begin(),
+                   trial.contradicts.end());
+  }
+  SanitizeD8Flags(flags, fixed_args);
+}
+
+void FlagSetPool::Record(const std::vector<std::string>& flags, double score) {
+  if (flags.empty() || score <= 0) {
+    return;
+  }
+  std::scoped_lock<std::mutex> lock(mutex_);
+  for (Entry& entry : entries_) {
+    if (entry.flags == flags) {
+      entry.score = std::max(entry.score, score);
+      return;
+    }
+  }
+  if (entries_.size() < capacity_) {
+    entries_.push_back(Entry{flags, score});
+    size_.store(entries_.size(), std::memory_order_release);
+    return;
+  }
+  auto worst = std::min_element(
+      entries_.begin(), entries_.end(),
+      [](const Entry& a, const Entry& b) { return a.score < b.score; });
+  if (worst != entries_.end() && score > worst->score) {
+    *worst = Entry{flags, score};
+  }
+}
+
+void FlagSetPool::Decay(double factor) {
+  std::scoped_lock<std::mutex> lock(mutex_);
+  for (Entry& entry : entries_) {
+    entry.score *= factor;
+  }
+}
+
+bool FlagSetPool::Pick(Random& rng, int tournament,
+                       std::vector<std::string>* flags) const {
+  std::scoped_lock<std::mutex> lock(mutex_);
+  if (entries_.empty()) {
+    return false;
+  }
+  size_t best = rng.Index(entries_.size());
+  for (int i = 1; i < tournament; i++) {
+    const size_t candidate = rng.Index(entries_.size());
+    if (entries_[candidate].score > entries_[best].score) {
+      best = candidate;
+    }
+  }
+  *flags = entries_[best].flags;
+  return true;
+}
+
+bool D8FlagBlacklist::RecordSpawn(const std::vector<std::string>& flags,
+                                  bool started) {
+  std::vector<std::string> names;
+  for (const std::string& flag : flags) {
+    std::string name = NormalizedName(flag);
+    if (std::find(names.begin(), names.end(), name) == names.end()) {
+      names.push_back(std::move(name));
+    }
+  }
+  if (names.empty()) {
+    return false;
+  }
+  std::scoped_lock<std::mutex> lock(mutex_);
+  if (started) {
+    total_started_++;
+    for (const std::string& name : names) {
+      counts_[name].started++;
+    }
+    return false;
+  }
+  failed_spawns_.fetch_add(1, std::memory_order_relaxed);
+  std::vector<std::string> never_started;
+  for (const std::string& name : names) {
+    Counts& counts = counts_[name];
+    counts.failed++;
+    if (counts.started == 0) {
+      never_started.push_back(name);
+    }
+  }
+  std::vector<std::string> block;
+  if (names.size() == 1 ||
+      (never_started.size() == 1 && total_started_ >= kBlacklistMinStarts)) {
+    block = never_started;
+  } else {
+    // The flag that is in the most failed starts. A tie blocks no flag,
+    // because a flag that is often drawn with the bad flag can tie.
+    uint32_t most = 0;
+    uint32_t second = 0;
+    const std::string* top = nullptr;
+    for (const std::string& name : never_started) {
+      const uint32_t failed = counts_[name].failed;
+      if (failed > most) {
+        second = most;
+        most = failed;
+        top = &name;
+      } else if (failed > second) {
+        second = failed;
+      }
+    }
+    if (top != nullptr && most >= kBlacklistRepeatedFailures && most > second) {
+      block.push_back(*top);
+    }
+  }
+  bool blocked_new = false;
+  for (std::string& name : block) {
+    blocked_new |= blocked_.insert(std::move(name)).second;
+  }
+  if (!blocked_.empty()) {
+    any_blocked_.store(true, std::memory_order_release);
+  }
+  return blocked_new;
+}
+
+bool D8FlagBlacklist::IsBlocked(std::string_view flag) const {
+  if (!any_blocked_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  std::scoped_lock<std::mutex> lock(mutex_);
+  return blocked_.contains(NormalizedName(flag));
+}
+
+void D8FlagBlacklist::Filter(std::vector<std::string>* flags) const {
+  if (!any_blocked_.load(std::memory_order_acquire)) {
+    return;
+  }
+  std::scoped_lock<std::mutex> lock(mutex_);
+  flags->erase(std::remove_if(flags->begin(), flags->end(),
+                              [this](const std::string& flag) {
+                                return blocked_.contains(NormalizedName(flag));
+                              }),
+               flags->end());
+}
+
+std::vector<std::string> D8FlagBlacklist::Blocked() const {
+  std::scoped_lock<std::mutex> lock(mutex_);
+  return std::vector<std::string>(blocked_.begin(), blocked_.end());
+}
 
 }  // namespace redline
