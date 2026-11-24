@@ -1453,12 +1453,14 @@ class ReducerBase : public Next {
   }
 
   OpIndex REDUCE(FastApiCall)(
-      V<LazyFrameState> frame_state, V<Object> data_argument,
+      V<LazyFrameState> frame_state,
+      OptionalV<EagerFrameState> eager_frame_state, V<Object> data_argument,
       V<Context> context, base::Vector<const OpIndex> arguments,
       const FastApiCallParameters* parameters,
       base::Vector<const RegisterRepresentation> out_reps) {
-    OpIndex raw_call = Next::ReduceFastApiCall(
-        frame_state, data_argument, context, arguments, parameters, out_reps);
+    OpIndex raw_call =
+        Next::ReduceFastApiCall(frame_state, eager_frame_state, data_argument,
+                                context, arguments, parameters, out_reps);
     bool has_catch_block = CatchIfInCatchScope(raw_call);
     return ReduceDidntThrow(raw_call, has_catch_block,
                             &Asm()
@@ -3604,7 +3606,7 @@ class AssemblerOpInterface : public Next {
 #define DEF_CMOVE(Rep, rep)                                              \
   V<Rep> Rep##CMove(ConstOrV<Word32> cond, ConstOrV<Rep> vtrue,          \
                     ConstOrV<Rep> vfalse) {                              \
-    DCHECK(SupportedOperations::rep##_select());                         \
+    DCHECK(SupportedOperations::rep##_cmove());                          \
     return Select<Rep>(resolve(cond), resolve(vtrue), resolve(vfalse),   \
                        RegisterRepresentation::Rep(), BranchHint::kNone, \
                        SelectOp::Implementation::kForceCMove);           \
@@ -4895,23 +4897,26 @@ class AssemblerOpInterface : public Next {
   }
 
 #ifdef V8_INTL_SUPPORT
-  V<String> StringToCaseIntl(V<String> string, V<LazyFrameState> frame_state,
-                             V<Context> context,
-                             StringToCaseIntlOp::Kind kind) {
+  V<String> StringToCaseIntl(
+      V<String> string, V<LazyFrameState> frame_state, V<Context> context,
+      StringToCaseIntlOp::Kind kind,
+      LazyDeoptOnThrow lazy_deopt_on_throw = LazyDeoptOnThrow{false}) {
     return ReduceIfReachableStringToCaseIntl(string, frame_state, context, kind,
-                                             LazyDeoptOnThrow{false});
+                                             lazy_deopt_on_throw);
   }
-  V<String> StringToLowerCaseIntl(V<String> string,
-                                  V<LazyFrameState> frame_state,
-                                  V<Context> context) {
+  V<String> StringToLowerCaseIntl(
+      V<String> string, V<LazyFrameState> frame_state, V<Context> context,
+      LazyDeoptOnThrow lazy_deopt_on_throw = LazyDeoptOnThrow{false}) {
     return StringToCaseIntl(string, frame_state, context,
-                            StringToCaseIntlOp::Kind::kLower);
+                            StringToCaseIntlOp::Kind::kLower,
+                            lazy_deopt_on_throw);
   }
-  V<String> StringToUpperCaseIntl(V<String> string,
-                                  V<LazyFrameState> frame_state,
-                                  V<Context> context) {
+  V<String> StringToUpperCaseIntl(
+      V<String> string, V<LazyFrameState> frame_state, V<Context> context,
+      LazyDeoptOnThrow lazy_deopt_on_throw = LazyDeoptOnThrow{false}) {
     return StringToCaseIntl(string, frame_state, context,
-                            StringToCaseIntlOp::Kind::kUpper);
+                            StringToCaseIntlOp::Kind::kUpper,
+                            lazy_deopt_on_throw);
   }
   V<Smi> StringLocaleCompareIntl(V<JSFunction> locale_compare_fn,
                                  V<Object> left, V<Object> right,
@@ -5101,12 +5106,15 @@ class AssemblerOpInterface : public Next {
     return ReduceIfReachableFloat64SameValue(resolve(left), resolve(right));
   }
 
-  OpIndex FastApiCall(V<LazyFrameState> frame_state, V<Object> data_argument,
-                      V<Context> context, base::Vector<const OpIndex> arguments,
+  OpIndex FastApiCall(V<LazyFrameState> frame_state,
+                      OptionalV<EagerFrameState> eager_frame_state,
+                      V<Object> data_argument, V<Context> context,
+                      base::Vector<const OpIndex> arguments,
                       const FastApiCallParameters* parameters,
                       base::Vector<const RegisterRepresentation> out_reps) {
-    return ReduceIfReachableFastApiCall(frame_state, data_argument, context,
-                                        arguments, parameters, out_reps);
+    return ReduceIfReachableFastApiCall(frame_state, eager_frame_state,
+                                        data_argument, context, arguments,
+                                        parameters, out_reps);
   }
 
   V<None> RuntimeAbort(AbortReason reason) {

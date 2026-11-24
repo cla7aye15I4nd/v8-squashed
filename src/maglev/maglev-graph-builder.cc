@@ -2255,7 +2255,11 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceCompareEqualAgainstConstant() {
   }
   if (!maybe_constant) return {};
 
-  if (CheckType(other, NodeType::kBoolean)) {
+  NodeType other_type;
+  if (CheckType(other, NodeType::kBoolean, &other_type)) {
+    if (IsEmptyNodeType(other_type)) {
+      return reducer_.BuildAbort(AbortReason::kUnreachable);
+    }
     auto CompareOtherWith = [&](bool constant) {
       compiler::OptionalHeapObjectRef const_other =
           TryGetConstant<HeapObject>(other);
@@ -2270,7 +2274,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceCompareEqualAgainstConstant() {
         SetAccumulator(other);
         return ReduceResult::Done();
       } else {
-        return SetAccumulator(AddNewNode<LogicalNot>({other}));
+        return SetAccumulator(BuildLogicalNot(other));
       }
     };
 
@@ -4255,17 +4259,18 @@ ReduceResult MaglevGraphBuilder::BuildLoadField(
 
   // Insert the static field information: the type for every access, and the
   // map identity when the field has a stable map.
-  NodeInfo* known_info = GetOrCreateInfoFor(value);
   if (stable_field_map.has_value()) {
     DCHECK(stable_field_map.value().IsJSReceiverMap());
+    NodeInfo* known_info = GetOrCreateInfoFor(value);
     if (!known_info->SetPossibleMaps(PossibleMaps{stable_field_map.value()},
                                      false, node_type, broker(),
                                      known_node_aspects())) {
-      return reducer_.EmitUnconditionalDeopt(DeoptimizeReason::kWrongValue);
+      return reducer_.BuildAbort(AbortReason::kUnreachable);
     }
     broker()->dependencies()->DependOnStableMap(stable_field_map.value());
-  } else {
-    known_info->IntersectType(node_type);
+  } else if (known_node_aspects().EnsureType(broker(), value, node_type) ==
+             EnsureTypeResult::kContradiction) {
+    return reducer_.BuildAbort(AbortReason::kUnreachable);
   }
   return value;
 }
@@ -7420,7 +7425,7 @@ MaglevGraphBuilder::TryBuildFindNonDefaultConstructorOrConstruct(
 
         ValueNode* object;
         if (HasValidInitialMap(new_target_function.value(), current_function)) {
-          GET_VALUE(
+          GET_VALUE_OR_ABORT(
               object,
               reducer_.BuildInlinedAllocation(
                   reducer_.CreateJSConstructor(new_target_function.value())));
@@ -8604,8 +8609,10 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayIteratorPrototypeNext(
 
   if (iterated_object->Is<InlinedAllocation>()) {
     VirtualObject* array = iterated_object->Cast<InlinedAllocation>()->object();
-    auto map = *array->map();
-    if (!process_map(map)) {
+    if (!array->map()) {
+      MAGLEV_FAIL("iterated object has no static map");
+    }
+    if (!process_map(*array->map())) {
       return {};
     }
   } else {
@@ -15184,7 +15191,7 @@ MaglevGraphBuilder::BranchResult MaglevGraphBuilder::BuildBranchIfNull(
 template <typename BranchBuilderT>
 MaglevGraphBuilder::BranchResult MaglevGraphBuilder::BuildBranchIfUndefined(
     BranchBuilderT& builder, ValueNode* node) {
-  return BuildBranchIfRootConstant(builder, node, RootIndex::kUndefinedValue);
+  return reducer_.BuildBranchIfUndefined(builder, node);
 }
 
 template <typename BranchBuilderT>
@@ -15616,13 +15623,6 @@ ReduceResult MaglevGraphBuilder::VisitReThrow() {
 }
 
 ReduceResult MaglevGraphBuilder::VisitReturn() {
-  // See also: InterpreterAssembler::UpdateInterruptBudgetOnReturn.
-  const uint32_t relative_jump_bytecode_offset = iterator_.current_offset();
-  if (ShouldEmitInterruptBudgetChecks() && relative_jump_bytecode_offset > 0) {
-    RETURN_IF_ABORT(AddNewNode<ReduceInterruptBudgetForReturn>(
-        {GetFeedbackCell()}, relative_jump_bytecode_offset));
-  }
-
   if (is_inline()) {
     // All inlined function returns instead jump to one past the end of the
     // bytecode, where we'll later create a final basic block which resumes
@@ -16535,6 +16535,15 @@ bool MaglevGraphBuilder::Build() {
       zone(), GetDeoptFrameForEntryStackCheck(),
       interpreter::Register::invalid_value(), 0, compiler::FeedbackSource());
   reducer_.AddInitializedNodeToGraph(function_entry_stack_check);
+
+  if (!compilation_unit_->is_osr() && ShouldEmitInterruptBudgetChecks()) {
+    DCHECK_GT(bytecode().length(), 0);
+    if (AddNewNode<ReduceInterruptBudgetForEntry>({GetFeedbackCell()},
+                                                  bytecode().length())
+            .IsDoneWithAbort()) {
+      return false;
+    }
+  }
 
   BuildMergeStates();
   InitializeScopeInfo();

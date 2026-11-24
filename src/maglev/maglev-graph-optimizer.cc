@@ -1532,8 +1532,8 @@ ProcessResult MaglevGraphOptimizer::VisitReduceInterruptBudgetForLoop(
   return ProcessResult::kContinue;
 }
 
-ProcessResult MaglevGraphOptimizer::VisitReduceInterruptBudgetForReturn(
-    ReduceInterruptBudgetForReturn* node, const ProcessingState& state) {
+ProcessResult MaglevGraphOptimizer::VisitReduceInterruptBudgetForEntry(
+    ReduceInterruptBudgetForEntry* node, const ProcessingState& state) {
   // TODO(b/424157317): Optimize.
   return ProcessResult::kContinue;
 }
@@ -2942,6 +2942,18 @@ ProcessResult MaglevGraphOptimizer::VisitStringLocaleCompareIntl(
     StringLocaleCompareIntl* node, const ProcessingState& state) {
   // Lowered to an inline ASCII fast path by Turboshaft (see
   // MachineLoweringReducer::REDUCE(StringLocaleCompareIntl)).
+  return ProcessResult::kContinue;
+}
+
+ProcessResult MaglevGraphOptimizer::VisitStringToLowerCaseIntl(
+    StringToLowerCaseIntl* node, const ProcessingState& state) {
+  // TODO(b/424157317): Optimize.
+  return ProcessResult::kContinue;
+}
+
+ProcessResult MaglevGraphOptimizer::VisitStringToUpperCaseIntl(
+    StringToUpperCaseIntl* node, const ProcessingState& state) {
+  // TODO(b/424157317): Optimize.
   return ProcessResult::kContinue;
 }
 #endif  // V8_INTL_SUPPORT

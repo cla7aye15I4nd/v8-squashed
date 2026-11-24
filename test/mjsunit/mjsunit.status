@@ -762,6 +762,9 @@
 
   # GC stress sets --concurrent-recompilation-delay itself.
   'compiler/regress-542923494': [SKIP],
+
+  # Stack headroom can change if concurrent tier-up happens mid-recursion.
+  'wasm/regress-535877252-2': [SKIP],
 }],  # 'gc_stress'
 
 ##############################################################################
@@ -841,6 +844,8 @@
   'sandbox/regress/regress-581087235': [SKIP],
   'sandbox/regress/regress-581130652': [SKIP],
   'sandbox/regress/regress-581560002': [SKIP],
+  'sandbox/regress/regress-581855680-1': [SKIP],
+  'sandbox/regress/regress-581855680-2': [SKIP],
   'sandbox/regress-537948358': [SKIP],
   'sandbox/regress-558640961': [SKIP],
   'sandbox/wasm-inlining-sigcheck': [SKIP],
@@ -1237,6 +1242,7 @@
   # --enable-testing-opcode-in-wasm
   'regress/wasm/regress-377971725': [SKIP],
   'regress/wasm/regress-426164352': [SKIP],
+  'regress/wasm/regress-586580682': [SKIP],
 
   # Module serialization tests expect compilation
   'regress/wasm/regress-11024': [SKIP],
@@ -1313,6 +1319,7 @@
   'regress/wasm/regress-498818401': [SKIP],
   'regress/wasm/regress-500113958': [SKIP],
   'regress/wasm/regress-555812363': [SKIP],
+  'regress/wasm/regress-582479998': [SKIP],
 
   # The interpreter call stack contains an additional top frame if we throw a
   # type-mismatch exception before executing the Wasm function.
@@ -2066,6 +2073,7 @@
   # https://crbug.com/539796962
   'compiler/concurrent-string-ext-seq': [SKIP],
   'compiler/regress-519664497': [SKIP],
+  'maglev/regress-588321630': [SKIP],
   'sandbox/regress/regress-575053489': [SKIP],
   'turboshaft/regress-539984773': [SKIP],
   'turboshaft/regress-587014652': [SKIP],
@@ -2299,6 +2307,7 @@
   'wasm/futex': [SKIP],
   'wasm/grow-shared-memory': [SKIP],
   'wasm/regress-576453351': [SKIP],
+  'wasm/shared-memory-buffer-refresh': [SKIP],
   'wasm/shared-memory-size-atomic': [SKIP],
   'wasm/shared-memory-worker-stress': [SKIP],
   'wasm/drumbrake/drumbrake': [SKIP],

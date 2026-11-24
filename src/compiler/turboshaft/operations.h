@@ -1444,8 +1444,8 @@ struct FixedArityOperationT : OperationT<Derived> {
   V(word64_popcnt, Word64Popcnt)                           \
   V(word32_reverse_bits, Word32ReverseBits)                \
   V(word64_reverse_bits, Word64ReverseBits)                \
-  V(float32_select, Float32Select)                         \
-  V(float64_select, Float64Select)                         \
+  V(float32_cmove, Float32Select)                          \
+  V(float64_cmove, Float64Select)                          \
   V(float64_min_max, Float64MinMax)                        \
   V(int32_abs_with_overflow, Int32AbsWithOverflow)         \
   V(int64_abs_with_overflow, Int64AbsWithOverflow)         \
@@ -1453,8 +1453,8 @@ struct FixedArityOperationT : OperationT<Derived> {
   V(word64_rol, Word64Rol)                                 \
   V(word64_rol_lowerable, Word64RolLowerable)              \
   V(sat_conversion_is_safe, SatConversionIsSafe)           \
-  V(word32_select, Word32Select)                           \
-  V(word64_select, Word64Select)                           \
+  V(word32_cmove, Word32Select)                            \
+  V(word64_cmove, Word64Select)                            \
   V(float16_mem_access, Float16MemAccess)                  \
   V(float16_raw_bits_conversion, Float16RawBitsConversion) \
   V(float16_arithmetic, Float16Arithmetic)
@@ -2743,16 +2743,16 @@ struct SelectOp : FixedArityOperationT<3, SelectOp> {
     if (implem == Implementation::kForceCMove) {
       switch (rep.value()) {
         case RegisterRepresentation::Enum::kWord32:
-          DCHECK(SupportedOperations::word32_select());
+          DCHECK(SupportedOperations::word32_cmove());
           break;
         case RegisterRepresentation::Enum::kWord64:
-          DCHECK(SupportedOperations::word64_select());
+          DCHECK(SupportedOperations::word64_cmove());
           break;
         case RegisterRepresentation::Enum::kFloat32:
-          DCHECK(SupportedOperations::float32_select());
+          DCHECK(SupportedOperations::float32_cmove());
           break;
         case RegisterRepresentation::Enum::kFloat64:
-          DCHECK(SupportedOperations::float64_select());
+          DCHECK(SupportedOperations::float64_cmove());
           break;
 
         case RegisterRepresentation::Enum::kCompressed:
@@ -7224,15 +7224,20 @@ struct Float64SameValueOp : FixedArityOperationT<2, Float64SameValueOp> {
 
 struct FastApiCallParameters : public NON_EXPORTED_BASE(ZoneObject) {
   FastApiCallFunction c_function;
+  FeedbackSource feedback;
 
   const CFunctionInfo* c_signature() const { return c_function.signature; }
+  bool NeedsEagerFrameState() const {
+    return fast_api_call::NeedsEagerFrameState(c_signature());
+  }
 
-  explicit FastApiCallParameters(FastApiCallFunction c_function)
-      : c_function(c_function) {}
+  FastApiCallParameters(FastApiCallFunction c_function, FeedbackSource feedback)
+      : c_function(c_function), feedback(feedback) {}
 
   static const FastApiCallParameters* Create(FastApiCallFunction c_function,
+                                             FeedbackSource feedback,
                                              Zone* graph_zone) {
-    return graph_zone->New<FastApiCallParameters>(c_function);
+    return graph_zone->New<FastApiCallParameters>(c_function, feedback);
   }
 };
 
@@ -7246,23 +7251,30 @@ struct FastApiCallOp : OperationT<FastApiCallOp> {
 
   static constexpr OpEffects effects = OpEffects().CanCallAnything();
 
-  // There are three inputs that are not parameters, the frame state, the data
-  // argument, and the context.
-  static constexpr int kNumNonParamInputs = 3;
+  bool HasEagerFrameState() const { return parameters->NeedsEagerFrameState(); }
+
+  // There are three inputs that are not parameters (the lazy frame state, the
+  // data argument, and the context), plus an optional eager frame state when
+  // the signature has kPointer or kSeqOneByteString arguments.
+  int NumNonParamInputs() const { return 3 + HasEagerFrameState(); }
 
   // The outputs are produced by the `DidntThrow` operation.
   base::Vector<const RegisterRepresentation> outputs_rep() const { return {}; }
 
   base::Vector<const MaybeRegisterRepresentation> inputs_rep(
       ZoneVector<MaybeRegisterRepresentation>& storage) const {
-    DCHECK_EQ(inputs().size(),
-              kNumNonParamInputs + parameters->c_signature()->ArgumentCount());
+    const int num_non_param_inputs = NumNonParamInputs();
+    DCHECK_EQ(inputs().size(), num_non_param_inputs +
+                                   parameters->c_signature()->ArgumentCount());
     storage.resize(inputs().size());
     storage[0] = MaybeRegisterRepresentation::None();
-    storage[1] = MaybeRegisterRepresentation::Tagged();
-    storage[2] = MaybeRegisterRepresentation::Tagged();
+    if (HasEagerFrameState()) {
+      storage[1] = MaybeRegisterRepresentation::None();
+    }
+    storage[1 + HasEagerFrameState()] = MaybeRegisterRepresentation::Tagged();
+    storage[2 + HasEagerFrameState()] = MaybeRegisterRepresentation::Tagged();
     for (unsigned i = 0; i < parameters->c_signature()->ArgumentCount(); ++i) {
-      storage[i + kNumNonParamInputs] = argument_representation(i);
+      storage[i + num_non_param_inputs] = argument_representation(i);
     }
     return base::VectorOf(storage);
   }
@@ -7307,47 +7319,70 @@ struct FastApiCallOp : OperationT<FastApiCallOp> {
 
   V<LazyFrameState> frame_state() const { return input<LazyFrameState>(0); }
 
-  V<Object> data_argument() const { return input<Object>(1); }
-
-  V<Context> context() const { return input<Context>(2); }
-
-  base::Vector<const OpIndex> arguments() const {
-    return inputs().SubVector(kNumNonParamInputs, inputs().size());
+  OptionalV<EagerFrameState> eager_frame_state() const {
+    return HasEagerFrameState() ? input<EagerFrameState>(1)
+                                : OptionalV<EagerFrameState>::Nullopt();
   }
 
-  FastApiCallOp(V<LazyFrameState> frame_state, V<Object> data_argument,
-                V<Context> context, base::Vector<const OpIndex> arguments,
+  V<Object> data_argument() const {
+    return input<Object>(1 + HasEagerFrameState());
+  }
+
+  V<Context> context() const {
+    return input<Context>(2 + HasEagerFrameState());
+  }
+
+  base::Vector<const OpIndex> arguments() const {
+    return inputs().SubVector(NumNonParamInputs(), inputs().size());
+  }
+
+  FastApiCallOp(V<LazyFrameState> frame_state,
+                OptionalV<EagerFrameState> eager_frame_state,
+                V<Object> data_argument, V<Context> context,
+                base::Vector<const OpIndex> arguments,
                 const FastApiCallParameters* parameters,
                 base::Vector<const RegisterRepresentation> out_reps)
-      : Base(kNumNonParamInputs + arguments.size()),
+      : Base(3 + eager_frame_state.valid() + arguments.size()),
         parameters(parameters),
         out_reps(out_reps),
         lazy_deopt_on_throw(LazyDeoptOnThrow{false}) {
+    DCHECK_EQ(eager_frame_state.valid(), parameters->NeedsEagerFrameState());
     base::Vector<OpIndex> inputs = this->inputs();
     inputs[0] = frame_state;
-    inputs[1] = data_argument;
-    inputs[2] = context;
-    inputs.SubVector(kNumNonParamInputs, kNumNonParamInputs + arguments.size())
+    if (eager_frame_state.valid()) {
+      inputs[1] = eager_frame_state.value();
+    }
+    inputs[1 + eager_frame_state.valid()] = data_argument;
+    inputs[2 + eager_frame_state.valid()] = context;
+    inputs
+        .SubVector(3 + eager_frame_state.valid(),
+                   3 + eager_frame_state.valid() + arguments.size())
         .OverwriteWith(arguments);
   }
 
   template <typename Fn, typename Mapper>
   V8_INLINE auto Explode(Fn fn, Mapper& mapper) const {
     V<LazyFrameState> mapped_frame_state = mapper.Map(frame_state());
+    OptionalV<EagerFrameState> mapped_eager_frame_state =
+        OptionalV<EagerFrameState>::Cast(mapper.Map(eager_frame_state()));
     OpIndex mapped_data_argument = mapper.Map(data_argument());
     V<Context> mapped_context = mapper.Map(context());
     auto mapped_arguments = mapper.template Map<8>(arguments());
-    return fn(mapped_frame_state, mapped_data_argument, mapped_context,
+    return fn(mapped_frame_state, mapped_eager_frame_state,
+              mapped_data_argument, mapped_context,
               base::VectorOf(mapped_arguments), parameters, out_reps);
   }
 
   static FastApiCallOp& New(
-      Graph* graph, V<LazyFrameState> frame_state, V<Object> data_argument,
+      Graph* graph, V<LazyFrameState> frame_state,
+      OptionalV<EagerFrameState> eager_frame_state, V<Object> data_argument,
       V<Context> context, base::Vector<const OpIndex> arguments,
       const FastApiCallParameters* parameters,
       base::Vector<const RegisterRepresentation> out_reps) {
-    return Base::New(graph, kNumNonParamInputs + arguments.size(), frame_state,
-                     data_argument, context, arguments, parameters, out_reps);
+    DCHECK_EQ(eager_frame_state.valid(), parameters->NeedsEagerFrameState());
+    return Base::New(graph, 3 + eager_frame_state.valid() + arguments.size(),
+                     frame_state, eager_frame_state, data_argument, context,
+                     arguments, parameters, out_reps);
   }
 
   // out_reps[0] is always word32.
@@ -7680,8 +7715,6 @@ struct RootConstantOp : FixedArityOperationT<0, RootConstantOp> {
     return {};
   }
 
-  void Validate(const Graph& graph) const {}
-
   auto options() const { return std::tuple{index}; }
 };
 
@@ -7787,10 +7820,6 @@ struct AssertNotNullOp : OperationT<AssertNotNullOp> {
   base::Vector<const MaybeRegisterRepresentation> inputs_rep(
       ZoneVector<MaybeRegisterRepresentation>& storage) const {
     return MaybeRepVector<MaybeRegisterRepresentation::Tagged()>();
-  }
-
-  void Validate(const Graph& graph) const {
-    // TODO(14108): Validate.
   }
 
   auto options() const { return std::tuple{type, trap_id}; }
@@ -8826,10 +8855,6 @@ struct Simd128ConstantOp : FixedArityOperationT<0, Simd128ConstantOp> {
   base::Vector<const MaybeRegisterRepresentation> inputs_rep(
       ZoneVector<MaybeRegisterRepresentation>& storage) const {
     return {};
-  }
-
-  void Validate(const Graph& graph) const {
-    // TODO(14108): Validate.
   }
 
   bool IsZero() const {
@@ -10490,10 +10515,6 @@ struct Simd256ConstantOp : FixedArityOperationT<0, Simd256ConstantOp> {
   base::Vector<const MaybeRegisterRepresentation> inputs_rep(
       ZoneVector<MaybeRegisterRepresentation>& storage) const {
     return {};
-  }
-
-  void Validate(const Graph& graph) const {
-    // TODO(14108): Validate.
   }
 
   bool IsZero() const {

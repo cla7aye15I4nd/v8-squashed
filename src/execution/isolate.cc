@@ -4459,13 +4459,16 @@ DirectHandle<NativeContext> Isolate::GetIncumbentContextSlow() {
   // 1st candidate: most-recently-entered author function's context
   // if it's newer than the last Context::BackupIncumbentScope entry.
   //
-  // NOTE: This code assumes that the stack grows downward.
+  // NOTE: This code assumes that the stack grows downward. Compare against
+  // fp() rather than sp(), because sp() is kNullAddress on reconstructed
+  // Fast C API caller frames whereas fp() is valid and BackupIncumbentScope
+  // always resides outside JS frames.
   Address top_backup_incumbent =
       top_backup_incumbent_scope()
           ? top_backup_incumbent_scope()->JSStackComparableAddressPrivate()
           : 0;
   if (!it.done() &&
-      (!top_backup_incumbent || it.frame()->sp() < top_backup_incumbent)) {
+      (!top_backup_incumbent || it.frame()->fp() < top_backup_incumbent)) {
     Tagged<Context> context = Cast<Context>(it.frame()->context());
     // If the topmost_script_having_context is set then it must be correct.
     if (DEBUG_BOOL && !topmost_script_having_context().is_null()) {
@@ -6349,13 +6352,6 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
 
   isolate_data_.has_lazy_closures_ = v8_flags.proto_assign_seq_lazy_func_opt;
 
-  if (use_shared_space_isolate && !is_shared_space_isolate() &&
-      use_shared_space_isolate->heap()
-          ->incremental_marking()
-          ->IsMajorMarking()) {
-    heap_.SetIsSharedMarkingFlag(true);
-  }
-
   // Set up the object heap.
   DCHECK(!heap_.HasBeenSetUp());
   heap_.SetUp(main_thread_local_heap());
@@ -6410,6 +6406,16 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
   PerIsolateThreadData* const current_data = CurrentPerIsolateThreadData();
   DCHECK_EQ(current_data->isolate(), this);
   SetIsolateThreadLocals(this, current_data);
+
+  // The main thread's marking barrier is now set up and installed, so write
+  // barriers may observe shared marking from here on.
+  if (use_shared_space_isolate && !is_shared_space_isolate() &&
+      use_shared_space_isolate->heap()
+          ->incremental_marking()
+          ->IsMajorMarking()) {
+    DCHECK(!isolate_data_.is_shared_marking());
+    heap_.SetIsSharedMarkingFlag(true);
+  }
 
   if (OwnsStringTables()) {
     string_table_ = std::make_unique<StringTable>(this);
@@ -8761,8 +8767,7 @@ void Isolate::PrintNumberStringCacheStats(const char* comment,
 
 void Isolate::MarkContextSlotNotAssignedIsUnreliable() {
   if (is_context_slot_not_assigned_unreliable()) return;
-  context_slot_not_assigned_is_unreliable_.store(true,
-                                                 std::memory_order_relaxed);
+  is_context_slot_not_assigned_unreliable_ = true;
   // Abort any in-flight concurrent compilations that may have relied on
   // kNotAssigned and deoptimize existing optimized code.
   AbortConcurrentOptimization(BlockingBehavior::kBlock);

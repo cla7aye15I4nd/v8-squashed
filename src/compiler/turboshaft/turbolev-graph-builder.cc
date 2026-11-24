@@ -3341,6 +3341,24 @@ class GraphBuildingNodeProcessor {
                      native_context(), ShouldLazyDeoptOnThrow(node)));
     return maglev::ProcessResult::kContinue;
   }
+  maglev::ProcessResult Process(maglev::StringToLowerCaseIntl* node,
+                                const maglev::ProcessingState& state) {
+    ThrowingScope throwing_scope(this, node);
+    GET_FRAME_STATE_MAYBE_ABORT(frame_state, node->lazy_deopt_info());
+    SetMap(node, __ StringToLowerCaseIntl(Map(node->StringInput()), frame_state,
+                                          native_context(),
+                                          ShouldLazyDeoptOnThrow(node)));
+    return maglev::ProcessResult::kContinue;
+  }
+  maglev::ProcessResult Process(maglev::StringToUpperCaseIntl* node,
+                                const maglev::ProcessingState& state) {
+    ThrowingScope throwing_scope(this, node);
+    GET_FRAME_STATE_MAYBE_ABORT(frame_state, node->lazy_deopt_info());
+    SetMap(node, __ StringToUpperCaseIntl(Map(node->StringInput()), frame_state,
+                                          native_context(),
+                                          ShouldLazyDeoptOnThrow(node)));
+    return maglev::ProcessResult::kContinue;
+  }
 #endif  // V8_INTL_SUPPORT
   maglev::ProcessResult Process(maglev::StringAt* node,
                                 const maglev::ProcessingState& state) {
@@ -4951,16 +4969,34 @@ class GraphBuildingNodeProcessor {
       SetMap(node, __ Float64RoundToZero(Map(node->ValueInput())));
     } else {
       DCHECK_EQ(node->kind(), maglev::Float64Round::Kind::kNearest);
-      // Nearest rounds to +infinity on ties. We emulate this by rounding up and
-      // adjusting if the difference exceeds 0.5 (like SimplifiedLowering does
-      // for lower Float64Round).
-      OpIndex input = Map(node->ValueInput());
-      ScopedVar<Float64, AssemblerT> result(this, __ Float64RoundUp(input));
-      IF_NOT (__ Float64LessThanOrEqual(__ Float64Sub(result, 0.5), input)) {
-        result = __ Float64Sub(result, 1.0);
+      // Nearest rounds to +infinity on ties.
+      V<Float64> input = Map(node->ValueInput());
+      if (SupportedOperations::float64_round_ties_even()) {
+        // Round to nearest (ties to even), and adjust by +1.0 if we rounded
+        // down by exactly 0.5 (i.e. exact 2k + 0.5 ties). Use a conditional
+        // move (e.g. fcsel on arm64) when supported; otherwise use an unlikely
+        // branch so the fixup is deferred out-of-line and never mispredicted
+        // for non-tie inputs.
+        V<Float64> rounded = __ Float64RoundTiesEven(input);
+        V<Word32> is_tie_down =
+            __ Float64Equal(__ Float64Sub(input, rounded), 0.5);
+        if (SupportedOperations::float64_cmove()) {
+          SetMap(node, __ Float64CMove(is_tie_down, __ Float64Add(rounded, 1.0),
+                                       rounded));
+        } else {
+          ScopedVar<Float64, AssemblerT> result(this, rounded);
+          IF (UNLIKELY(is_tie_down)) {
+            result = __ Float64Add(rounded, 1.0);
+          }
+          SetMap(node, result);
+        }
+      } else {
+        // Emulate by rounding up and adjusting if the difference exceeds 0.5.
+        V<Float64> ceil = __ Float64RoundUp(input);
+        V<Word32> cond =
+            __ Float64LessThanOrEqual(__ Float64Sub(ceil, 0.5), input);
+        SetMap(node, __ Float64Select(cond, ceil, __ Float64Sub(ceil, 1.0)));
       }
-
-      SetMap(node, result);
     }
     return maglev::ProcessResult::kContinue;
   }
@@ -5907,7 +5943,7 @@ class GraphBuildingNodeProcessor {
     return maglev::ProcessResult::kContinue;
   }
 
-  maglev::ProcessResult Process(maglev::ReduceInterruptBudgetForReturn*,
+  maglev::ProcessResult Process(maglev::ReduceInterruptBudgetForEntry*,
                                 const maglev::ProcessingState&) {
     // No need to update the interrupt budget once we reach Turboshaft.
     return maglev::ProcessResult::kContinue;

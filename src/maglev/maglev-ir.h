@@ -390,6 +390,8 @@ class ExceptionHandlerInfo;
   V(StringConcat)                             \
   V(StringIndexOf)                            \
   IF_INTL(V, StringLocaleCompareIntl)         \
+  IF_INTL(V, StringToLowerCaseIntl)           \
+  IF_INTL(V, StringToUpperCaseIntl)           \
   V(ConsStringMap)                            \
   V(UnwrapStringWrapper)                      \
   V(ToBoolean)                                \
@@ -496,7 +498,7 @@ class ExceptionHandlerInfo;
   V(StoreTrustedPointerFieldWithWriteBarrier) \
   V(HandleNoHeapWritesInterrupt)              \
   V(ReduceInterruptBudgetForLoop)             \
-  V(ReduceInterruptBudgetForReturn)           \
+  V(ReduceInterruptBudgetForEntry)            \
   V(ThrowReferenceErrorIfTdzHole)             \
   V(ThrowSuperNotCalledIfTdzHole)             \
   V(ThrowSuperAlreadyCalledIfNotTdzHole)      \
@@ -5396,8 +5398,9 @@ class RootConstant : public FixedInputValueNodeT<0, RootConstant> {
       case RootIndex::kFalseValue:
         return NodeType::kBoolean;
       case RootIndex::kUndefinedValue:
+        return NodeType::kUndefined;
       case RootIndex::kNullValue:
-        return NodeType::kOddball;
+        return NodeType::kNull;
       default:
         compiler::HeapObjectRef ref = TryGetConstant(broker).value();
         return StaticTypeForConstant(broker, ref);
@@ -10045,6 +10048,44 @@ class StringLocaleCompareIntl
   void SetValueLocationConstraints();
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
 };
+
+class StringToLowerCaseIntl
+    : public FixedInputValueNodeT<1, StringToLowerCaseIntl> {
+ public:
+  explicit StringToLowerCaseIntl(uint64_t bitfield) : Base(bitfield) {}
+
+  static constexpr OpProperties kProperties =
+      OpProperties::Call() | OpProperties::CanThrow();
+
+  int MaxCallStackArgs() const { return 0; }
+
+  DECLARE_INPUTS(String)
+  DECLARE_INPUT_TYPES(Tagged)
+
+  void SetValueLocationConstraints();
+  void GenerateCode(MaglevAssembler*, const ProcessingState&);
+
+  NodeType type() const { return NodeType::kString; }
+};
+
+class StringToUpperCaseIntl
+    : public FixedInputValueNodeT<1, StringToUpperCaseIntl> {
+ public:
+  explicit StringToUpperCaseIntl(uint64_t bitfield) : Base(bitfield) {}
+
+  static constexpr OpProperties kProperties =
+      OpProperties::Call() | OpProperties::CanThrow();
+
+  int MaxCallStackArgs() const { return 1; }
+
+  DECLARE_INPUTS(String)
+  DECLARE_INPUT_TYPES(Tagged)
+
+  void SetValueLocationConstraints();
+  void GenerateCode(MaglevAssembler*, const ProcessingState&);
+
+  NodeType type() const { return NodeType::kString; }
+};
 #endif  // V8_INTL_SUPPORT
 
 class StringConcat : public FixedInputValueNodeT<2, StringConcat> {
@@ -10327,6 +10368,7 @@ class Phi : public ValueNodeT<Phi> {
 
   bool is_exception_phi() const { return input_count() == 0; }
   bool is_loop_phi() const;
+  bool is_unwrappable_single_input() const;
 
   bool is_backedge_offset(int i) const {
     return is_loop_phi() && i == backedge_index();
@@ -10385,9 +10427,13 @@ class Phi : public ValueNodeT<Phi> {
   void set_type(NodeType type) {
     type_ = type;
   }
+  // Returns the raw stored NodeType (without unwrapping single-input Phis).
   NodeType type() const {
     return type_;
   }
+  // Returns the static NodeType of a tagged Phi, intersecting with its single
+  // input's static type if unwrappable.
+  NodeType type(compiler::JSHeapBroker* broker);
 
   // Check if a phi has cleared the loop.
   bool is_unmerged_loop_phi() const;
@@ -11344,10 +11390,10 @@ class ReduceInterruptBudgetForLoop
   const FeedbackSlot feedback_slot_;
 };
 
-class ReduceInterruptBudgetForReturn
-    : public FixedInputNodeT<1, ReduceInterruptBudgetForReturn> {
+class ReduceInterruptBudgetForEntry
+    : public FixedInputNodeT<1, ReduceInterruptBudgetForEntry> {
  public:
-  explicit ReduceInterruptBudgetForReturn(uint64_t bitfield, int amount)
+  explicit ReduceInterruptBudgetForEntry(uint64_t bitfield, int amount)
       : Base(bitfield), amount_(amount) {
     DCHECK_GT(amount, 0);
   }

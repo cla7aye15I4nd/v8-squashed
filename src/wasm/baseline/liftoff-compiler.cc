@@ -716,11 +716,15 @@ class LiftoffCompiler {
   //   which is added to the PC distance on every tier-up check. This cost is
   //   for loading the tiering budget, subtracting from one entry in the array,
   //   and the conditional branch if the value is negative.
-  // - {kTierUpCostForFunctionEntry} reflects the cost for calling the frame
-  //   setup stub in the function prologue (the time is spent in another code
-  //   object and hence not reflected in the PC distance).
+  // - {kTierUpCostForFunctionEntry} reflects the cost of function entry
+  //   overhead, including calling the frame setup stub (which lives in another
+  //   code object, chases the feedback vector array, and updates the invocation
+  //   count) as well as frame setup/teardown. Charging a realistic entry cost
+  //   ensures frequently-called small functions (common in WasmGC) tier up
+  //   without requiring excessive call counts, while leaving loop backedge
+  //   tiering unaffected.
   static constexpr int kTierUpCostForCheck = 20;
-  static constexpr int kTierUpCostForFunctionEntry = 40;
+  static constexpr int kTierUpCostForFunctionEntry = 1000;
 
   struct ElseState {
     explicit ElseState(Zone* zone) : label(zone), state(zone) {}
@@ -1624,16 +1628,21 @@ class LiftoffCompiler {
     DCHECK_NULL(next_dead_breakpoint_ptr_);
 
     if (v8_flags.wasm_inlining && !encountered_call_instructions_.empty()) {
-      // Update the call targets stored in the WasmModule.
+      // Update the call targets stored in the WasmModule. Allocate and copy
+      // the call targets before taking the (module-wide) mutex, to keep the
+      // critical section short.
+      base::UniqueArray<uint32_t> new_call_targets =
+          base::UniqueCopyOf(encountered_call_instructions_);
+      const uint32_t liftoff_frame_size = __ GetTotalFrameSize();
       TypeFeedbackStorage& type_feedback = env_->module->type_feedback;
       base::MutexGuard mutex_guard(&type_feedback.mutex);
       FunctionTypeFeedback& function_feedback =
           type_feedback.feedback_for_function[func_index_];
-      function_feedback.liftoff_frame_size = __ GetTotalFrameSize();
+      function_feedback.liftoff_frame_size = liftoff_frame_size;
       base::UniqueArray<uint32_t>& call_targets =
           function_feedback.call_targets;
       if (call_targets.empty()) {
-        call_targets = base::UniqueCopyOf(encountered_call_instructions_);
+        call_targets = std::move(new_call_targets);
       } else {
         DCHECK_EQ(call_targets, base::VectorOf(encountered_call_instructions_));
       }

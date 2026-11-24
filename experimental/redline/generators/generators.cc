@@ -156,154 +156,802 @@ GenContext ClassMethodContext(const GenContext& ctx) {
 // --- value declarations
 // ---------------------------------------------------------
 
-GEN(WasmModule) {
-  WasmModule m = RandomWasmModule(ctx.rng());
+REDLINE_TUNABLE(kWasmThrowingImportProb,
+                "generators.WasmModule.throwing_import_probability", 0.35, 0, 1,
+                "probability that a Wasm JS import throws on a countdown");
+REDLINE_TUNABLE(kWasmTierUpProb, "generators.WasmModule.tier_up_probability",
+                0.9, 0, 1,
+                "probability of calling `%WasmTierUpFunction` on an export");
+REDLINE_TUNABLE(kWasmJsInlineProb,
+                "generators.WasmModule.js_inline_probability", 0.75, 0, 1,
+                "probability of emitting an optimized JS-to-Wasm wrapper");
+REDLINE_TUNABLE(kWasmResizableBufferProb,
+                "generators.WasmModule.resizable_buffer_probability", 0.4, 0, 1,
+                "probability of exercising `toResizableBuffer` and "
+                "`toFixedLengthBuffer`");
+REDLINE_TUNABLE(kWasmAsyncCompileProb,
+                "generators.WasmModule.async_compile_probability", 0.15, 0, 1,
+                "probability of also exercising `WebAssembly.validate` and "
+                "`WebAssembly.compile`");
+REDLINE_TUNABLE(kWasmGcReuseProb, "generators.WasmModule.gc_reuse_probability",
+                0.65, 0, 1,
+                "probability of passing a captured WasmGC value back to Wasm");
 
-  // Create Uint8Array with the bytes
+struct WasmGcVars {
+  std::string_view struct_var;
+  std::string_view array_var;
+  uint32_t struct_type = 0;
+  uint32_t array_type = 0;
+  bool has_gc = false;
+};
+
+std::string_view WasmTagParamName(const WasmValType& type) {
+  switch (type.kind) {
+    case WasmType::kI32:
+      return "i32";
+    case WasmType::kI64:
+      return "i64";
+    case WasmType::kF32:
+      return "f32";
+    case WasmType::kF64:
+      return "f64";
+    case WasmType::kExternRef:
+      return "externref";
+    case WasmType::kAnyRef:
+      return "anyref";
+    case WasmType::kEqRef:
+      return "eqref";
+    case WasmType::kI31Ref:
+      return "i31ref";
+    case WasmType::kStructRef:
+      return "structref";
+    case WasmType::kArrayRef:
+      return "arrayref";
+    case WasmType::kFuncRef:
+      return "funcref";
+    default:
+      return "i32";
+  }
+}
+
+Expression* WasmJsArg(GenContext& ctx, const WasmValType& type,
+                      const WasmGcVars& gc = {}) {
+  Tree* t = T(ctx);
+  Random& r = ctx.rng();
+  if (type.IsRef()) {
+    if (type.IsConcreteRef()) {
+      if (gc.has_gc && type.type_idx == gc.struct_type &&
+          !gc.struct_var.empty() && r.Chance(kWasmGcReuseProb())) {
+        return mk::Id(t, gc.struct_var);
+      }
+      if (gc.has_gc && type.type_idx == gc.array_type &&
+          !gc.array_var.empty() && r.Chance(kWasmGcReuseProb())) {
+        return mk::Id(t, gc.array_var);
+      }
+      return mk::Null(t);
+    }
+    if (type.kind == WasmType::kI31Ref) {
+      if (r.Coin()) {
+        return mk::Null(t);
+      }
+      return mk::Num(t, static_cast<double>(r.Range(-100, 100)));
+    }
+    if (type.kind == WasmType::kFuncRef) {
+      return mk::Null(t);
+    }
+    if (type.kind == WasmType::kStructRef) {
+      if (!gc.struct_var.empty() && r.Chance(kWasmGcReuseProb())) {
+        return mk::Id(t, gc.struct_var);
+      }
+      if (ctx.natives && r.Coin()) {
+        return mk::Native(t, "WasmStruct", {});
+      }
+      return mk::Null(t);
+    }
+    if (type.kind == WasmType::kArrayRef) {
+      if (!gc.array_var.empty() && r.Chance(kWasmGcReuseProb())) {
+        return mk::Id(t, gc.array_var);
+      }
+      if (ctx.natives && r.Coin()) {
+        return mk::Native(t, "WasmArray", {});
+      }
+      return mk::Null(t);
+    }
+    if (type.kind == WasmType::kEqRef) {
+      // `eqref` accepts `null`, Smi `i31` integers, and WasmGC structs/arrays.
+      const size_t k = r.Index(5);
+      if (k == 0) {
+        return mk::Null(t);
+      }
+      if (k == 1) {
+        return mk::Num(t, static_cast<double>(r.Range(-50, 50)));
+      }
+      if (k == 2 && !gc.struct_var.empty()) {
+        return mk::Id(t, gc.struct_var);
+      }
+      if (k == 3 && !gc.array_var.empty()) {
+        return mk::Id(t, gc.array_var);
+      }
+      if (ctx.natives) {
+        return mk::Native(t, r.Coin() ? "WasmStruct" : "WasmArray", {});
+      }
+      return mk::Num(t, static_cast<double>(r.Range(-50, 50)));
+    }
+    // `anyref` or `externref`: mix JS values and WasmGC objects.
+    const size_t k = r.Index(7);
+    if (k == 0) {
+      return mk::Null(t);
+    }
+    if (k == 1) {
+      return mk::Num(t, static_cast<double>(r.Range(-50, 50)));
+    }
+    if (k == 2) {
+      return mk::Str(t, r.Coin() ? "wasm" : "redline");
+    }
+    if (k == 3) {
+      return mk::Object(t, {mk::Prop(t, "x", mk::Num(t, 1))});
+    }
+    if (k == 4 && !gc.struct_var.empty()) {
+      return mk::Id(t, gc.struct_var);
+    }
+    if (k == 5 && !gc.array_var.empty()) {
+      return mk::Id(t, gc.array_var);
+    }
+    if (k == 6 && ctx.natives) {
+      return mk::Native(t, r.Coin() ? "WasmStruct" : "WasmArray", {});
+    }
+    return mk::Array(t, {mk::Num(t, 1), mk::Num(t, 2)});
+  }
+  if (type.kind == WasmType::kI64) {
+    if (r.Chance(0.3)) {
+      static constexpr const char* kPos[] = {
+          "0", "1", "42", "2147483647", "4294967296", "9007199254740992"};
+      static constexpr const char* kNeg[] = {"1", "42", "2147483648",
+                                             "9007199254740992"};
+      if (r.Coin()) {
+        return mk::BigInt(t, kPos[r.Index(6)]);
+      }
+      return mk::Unary(t, UnaryOp::kMinus, mk::BigInt(t, kNeg[r.Index(4)]));
+    }
+    const int64_t val = r.Range(-100, 100);
+    if (val < 0) {
+      return mk::Unary(t, UnaryOp::kMinus, mk::BigInt(t, std::to_string(-val)));
+    }
+    return mk::BigInt(t, std::to_string(val));
+  }
+  if (type.kind == WasmType::kI32) {
+    if (r.Chance(0.3)) {
+      static constexpr double kEdges[] = {0,  1,     -1,         7,
+                                          16, 65535, 2147483647, -2147483648.0};
+      return mk::Num(t, kEdges[r.Index(8)]);
+    }
+    return mk::Num(t, static_cast<double>(r.Range(-100, 100)));
+  }
+  if (r.Chance(0.25)) {
+    const size_t k = r.Index(5);
+    if (k == 0) {
+      return mk::Id(t, "NaN");
+    }
+    if (k == 1) {
+      return mk::Id(t, "Infinity");
+    }
+    if (k == 2) {
+      return mk::Unary(t, UnaryOp::kMinus, mk::Id(t, "Infinity"));
+    }
+    if (k == 3) {
+      return mk::Unary(t, UnaryOp::kMinus, mk::Num(t, 0));
+    }
+    return mk::Num(t, 1.5);
+  }
+  return mk::Num(t, r.Double() * 100.0);
+}
+
+Statement* GuardedStmt(GenContext& ctx, std::vector<Statement*> body) {
+  return mk::Try(T(ctx), std::move(body), ctx.builder.FreshName("e"), {});
+}
+
+Statement* GuardedCall(GenContext& ctx, std::string_view func_name,
+                       std::vector<Expression*> args) {
+  Tree* t = T(ctx);
+  Expression* call = mk::Call(t, mk::Id(t, func_name), std::move(args));
+  return GuardedStmt(ctx, {mk::ExprStmt(t, call)});
+}
+
+Expression* BuildWasmImportFn(GenContext& ctx, const WasmSignature& sig,
+                              std::string_view state_name, bool is_jspi) {
+  Tree* t = T(ctx);
+  Random& r = ctx.rng();
+  std::vector<std::string_view> params;
+  params.reserve(sig.params.size());
+  for (size_t p = 0; p < sig.params.size(); ++p) {
+    params.push_back(ctx.builder.FreshName("p"));
+  }
+  std::vector<Statement*> body;
+  const bool use_async = is_jspi && r.Coin();
+  if (use_async) {
+    Expression* resolved =
+        mk::CallMethod(t, mk::Id(t, "Promise"), "resolve", {mk::Num(t, 0)});
+    body.push_back(mk::ExprStmt(t, mk::Await(t, resolved)));
+  }
+
+  // Mutate shared JS state so the callback has visible side effects.
+  Expression* inc = mk::Binary(
+      t, BinaryOp::kBitOr,
+      mk::Binary(t, BinaryOp::kAdd, mk::Id(t, state_name), mk::Num(t, 1)),
+      mk::Num(t, 0));
+  body.push_back(mk::ExprStmt(t, mk::Assign(t, mk::Id(t, state_name), inc)));
+
+  // Throw on one countdown hit so Wasm-to-JS-to-JS unwinding executes.
+  if (!is_jspi && r.Chance(kWasmThrowingImportProb())) {
+    const double limit = static_cast<double>(2 + r.Index(4));
+    Expression* cond = mk::Binary(t, BinaryOp::kStrictEq, mk::Id(t, state_name),
+                                  mk::Num(t, limit));
+    Expression* err = mk::New(t, mk::Id(t, "Error"), {mk::Str(t, "wasm")});
+    body.push_back(mk::If(t, cond, mk::Block(t, {mk::Throw(t, err)})));
+  }
+
+  if (!sig.results.empty()) {
+    const WasmValType res = sig.results[0];
+    Expression* ret_val = nullptr;
+    if (res.IsRef()) {
+      if (res.kind == WasmType::kExternRef || res.kind == WasmType::kAnyRef) {
+        ret_val = r.Coin() ? static_cast<Expression*>(mk::Str(t, "wasm"))
+                           : static_cast<Expression*>(mk::Null(t));
+      } else if (res.kind == WasmType::kI31Ref) {
+        ret_val = mk::Id(t, state_name);
+      } else {
+        ret_val = mk::Null(t);
+      }
+    } else if (res.kind == WasmType::kI64) {
+      Expression* state_bi =
+          mk::Call(t, mk::Id(t, "BigInt"), {mk::Id(t, state_name)});
+      for (size_t p = 0; p < sig.params.size(); ++p) {
+        if (sig.params[p].kind == WasmType::kI64) {
+          ret_val =
+              mk::Binary(t, BinaryOp::kAdd, mk::Id(t, params[p]), state_bi);
+          break;
+        }
+      }
+      if (ret_val == nullptr) {
+        ret_val = state_bi;
+      }
+    } else {
+      for (size_t p = 0; p < sig.params.size(); ++p) {
+        if (sig.params[p].kind == WasmType::kI32 ||
+            sig.params[p].kind == WasmType::kF32 ||
+            sig.params[p].kind == WasmType::kF64) {
+          Expression* base =
+              res.kind == WasmType::kI32
+                  ? static_cast<Expression*>(mk::Binary(t, BinaryOp::kBitOr,
+                                                        mk::Id(t, params[p]),
+                                                        mk::Num(t, 0)))
+                  : static_cast<Expression*>(mk::Id(t, params[p]));
+          ret_val = mk::Binary(t, BinaryOp::kAdd, base, mk::Id(t, state_name));
+          break;
+        }
+      }
+      if (ret_val == nullptr) {
+        ret_val = res.kind == WasmType::kI32
+                      ? static_cast<Expression*>(mk::Id(t, state_name))
+                      : static_cast<Expression*>(
+                            mk::Binary(t, BinaryOp::kAdd, mk::Id(t, state_name),
+                                       mk::Num(t, 0.5)));
+      }
+    }
+    if (is_jspi && !use_async) {
+      ret_val = mk::CallMethod(t, mk::Id(t, "Promise"), "resolve", {ret_val});
+    }
+    body.push_back(mk::Return(t, ret_val));
+  } else if (is_jspi && !use_async) {
+    body.push_back(
+        mk::Return(t, mk::CallMethod(t, mk::Id(t, "Promise"), "resolve", {})));
+  }
+  Expression* fn = mk::Arrow(t, std::move(params), std::move(body), use_async);
+  if (is_jspi) {
+    return mk::New(t, mk::Member(t, mk::Id(t, "WebAssembly"), "Suspending"),
+                   {fn});
+  }
+  return fn;
+}
+
+GEN(WasmModule) {
+  Tree* t = T(ctx);
+  Random& r = ctx.rng();
+  WasmModule m = RandomWasmModule(r);
+
+  // Build `Uint8Array` with the WebAssembly module bytes.
   std::vector<Expression*> byte_exprs;
   byte_exprs.reserve(m.bytes.size());
   for (uint8_t b : m.bytes) {
-    byte_exprs.push_back(mk::Num(T(ctx), b));
+    byte_exprs.push_back(mk::Num(t, b));
   }
-  Expression* arr = mk::Array(T(ctx), byte_exprs);
-  Expression* typed_arr = mk::New(T(ctx), mk::Id(T(ctx), "Uint8Array"), {arr});
+  Expression* arr = mk::Array(t, std::move(byte_exprs));
+  Expression* typed_arr = mk::New(t, mk::Id(t, "Uint8Array"), {arr});
 
   std::string_view bytes_name = ctx.builder.FreshName("bytes");
-  Statement* bytes_decl = mk::Const(T(ctx), bytes_name, typed_arr);
-  Push(out, bytes_decl);
+  Push(out, mk::Const(t, bytes_name, typed_arr));
   ctx.Declare(bytes_name, JsType::kObject, true);
 
-  // Create import object {m: {f0: ..., f1: ...}}
+  // Build clean JS imports (functions, JSPI suspending import, imported memory,
+  // `WebAssembly.JSTag`, and JS-constructed `WebAssembly.Tag` objects).
   std::vector<Node*> m_props;
-  for (size_t i = 0; i < m.imports.size(); i++) {
-    Expression* func_expr = cg.Callable();
-    if (!func_expr) {
-      func_expr = mk::ArrowExpr(T(ctx), {}, mk::Num(T(ctx), 0));
+  if (!m.imports.empty()) {
+    std::string_view state_name = ctx.builder.FreshName("ws");
+    Push(out, mk::Let(t, state_name, mk::Num(t, 0)));
+    ctx.Declare(state_name, JsType::kNumber, false);
+    for (size_t i = 0; i < m.imports.size(); ++i) {
+      const bool is_jspi = (static_cast<int>(i) == m.jspi_import);
+      Expression* fn =
+          BuildWasmImportFn(ctx, m.imports[i], state_name, is_jspi);
+      m_props.push_back(mk::Prop(t, "f" + std::to_string(i), fn));
     }
-    std::string fname = "f" + std::to_string(i);
-    m_props.push_back(mk::Prop(T(ctx), fname, func_expr));
   }
-  Expression* m_obj = mk::Object(T(ctx), m_props);
-  Expression* import_obj = mk::Object(T(ctx), {mk::Prop(T(ctx), "m", m_obj)});
+  if (!m.memories.empty() && m.memories[0].imported) {
+    const WasmMemoryInfo& mi = m.memories[0];
+    std::vector<Node*> desc_props;
+    if (mi.is_memory64) {
+      desc_props.push_back(
+          mk::Prop(t, "initial", mk::BigInt(t, std::to_string(mi.min_pages))));
+      desc_props.push_back(
+          mk::Prop(t, "maximum", mk::BigInt(t, std::to_string(mi.max_pages))));
+      desc_props.push_back(mk::Prop(t, "address", mk::Str(t, "i64")));
+    } else {
+      desc_props.push_back(mk::Prop(
+          t, "initial", mk::Num(t, static_cast<double>(mi.min_pages))));
+      desc_props.push_back(mk::Prop(
+          t, "maximum", mk::Num(t, static_cast<double>(mi.max_pages))));
+    }
+    if (mi.is_shared) {
+      desc_props.push_back(mk::Prop(t, "shared", mk::Bool(t, true)));
+    }
+    Expression* imem_expr =
+        mk::New(t, mk::Member(t, mk::Id(t, "WebAssembly"), "Memory"),
+                {mk::Object(t, std::move(desc_props))});
+    std::string_view imem_name = ctx.builder.FreshName("imem");
+    Push(out, mk::Let(t, imem_name, mk::Null(t)));
+    ctx.Declare(imem_name, JsType::kObject, false);
+    Push(out,
+         GuardedStmt(ctx, {mk::ExprStmt(t, mk::Assign(t, mk::Id(t, imem_name),
+                                                      imem_expr))}));
+    m_props.push_back(mk::Prop(t, "mem0", mk::Id(t, imem_name)));
+  }
+  if (m.has_imported_jstag) {
+    m_props.push_back(
+        mk::Prop(t, "jstag", mk::Member(t, mk::Id(t, "WebAssembly"), "JSTag")));
+  }
+  for (size_t i = 0; i < m.imported_tags.size(); ++i) {
+    std::vector<Expression*> pnames;
+    for (const WasmValType& pt : m.imported_tags[i].params) {
+      pnames.push_back(mk::Str(t, WasmTagParamName(pt)));
+    }
+    Expression* tag_desc = mk::Object(
+        t, {mk::Prop(t, "parameters", mk::Array(t, std::move(pnames)))});
+    Expression* tag_expr =
+        mk::New(t, mk::Member(t, mk::Id(t, "WebAssembly"), "Tag"), {tag_desc});
+    m_props.push_back(mk::Prop(t, "t" + std::to_string(i), tag_expr));
+  }
+  Expression* m_obj = mk::Object(t, std::move(m_props));
+  Expression* import_obj = mk::Object(t, {mk::Prop(t, "m", m_obj)});
 
-  // new WebAssembly.Module(bytes)
-  Expression* module_expr = mk::New(
-      T(ctx), mk::Member(T(ctx), mk::Id(T(ctx), "WebAssembly"), "Module"),
-      {mk::Id(T(ctx), bytes_name)});
+  auto make_js_string_opts = [&]() -> Expression* {
+    return mk::Object(
+        t, {mk::Prop(t, "builtins", mk::Array(t, {mk::Str(t, "js-string")})),
+            mk::Prop(t, "importedStringConstants", mk::Str(t, "s"))});
+  };
 
-  std::string_view module_name = ctx.builder.FreshName("module");
-  Statement* module_decl = mk::Const(T(ctx), module_name, module_expr);
-  Push(out, module_decl);
-  ctx.Declare(module_name, JsType::kObject, true);
-
-  // new WebAssembly.Instance(module, import_obj)
-  Expression* instance_expr = mk::New(
-      T(ctx), mk::Member(T(ctx), mk::Id(T(ctx), "WebAssembly"), "Instance"),
-      {mk::Id(T(ctx), module_name), import_obj});
-  std::string_view instance_name = ctx.builder.FreshName("instance");
-  Statement* instance_decl = mk::Const(T(ctx), instance_name, instance_expr);
-  Push(out, instance_decl);
-  ctx.Declare(instance_name, JsType::kObject, true);
-
-  // exports = instance.exports
-  Expression* exports_expr =
-      mk::Member(T(ctx), mk::Id(T(ctx), instance_name), "exports");
+  // Guard module compilation and instantiation cleanly.
   std::string_view exports_name = ctx.builder.FreshName("exports");
-  Statement* exports_decl = mk::Const(T(ctx), exports_name, exports_expr);
-  Push(out, exports_decl);
-  ctx.Declare(exports_name, JsType::kObject, true);
+  Push(out, mk::Let(t, exports_name, mk::Object(t, {})));
+  ctx.Declare(exports_name, JsType::kObject, false);
+  {
+    std::string_view module_name = ctx.builder.FreshName("module");
+    std::string_view instance_name = ctx.builder.FreshName("instance");
+    std::vector<Expression*> mod_args = {mk::Id(t, bytes_name)};
+    if (m.has_js_string_builtins) {
+      mod_args.push_back(make_js_string_opts());
+    }
+    Expression* module_expr =
+        mk::New(t, mk::Member(t, mk::Id(t, "WebAssembly"), "Module"),
+                std::move(mod_args));
+    Expression* instance_expr =
+        mk::New(t, mk::Member(t, mk::Id(t, "WebAssembly"), "Instance"),
+                {mk::Id(t, module_name), import_obj});
+    Expression* assign_exports =
+        mk::Assign(t, mk::Id(t, exports_name),
+                   mk::Member(t, mk::Id(t, instance_name), "exports"));
+    Push(out, GuardedStmt(ctx, {mk::Const(t, module_name, module_expr),
+                                mk::Const(t, instance_name, instance_expr),
+                                mk::ExprStmt(t, assign_exports)}));
+  }
 
-  // exported functions
-  for (size_t i = 0; i < m.functions.size(); i++) {
+  // Track live WasmGC struct and array references returned from exports so
+  // later calls pass typed WasmGC objects back across the JS-Wasm boundary.
+  WasmGcVars gc_vars;
+  if (m.has_gc && !m.struct_types.empty() && !m.array_types.empty()) {
+    gc_vars.has_gc = true;
+    gc_vars.struct_type = m.struct_types[0];
+    gc_vars.array_type = m.array_types[0];
+    gc_vars.struct_var = ctx.builder.FreshName("gcs");
+    gc_vars.array_var = ctx.builder.FreshName("gca");
+    Push(out, mk::Let(t, gc_vars.struct_var, mk::Null(t)));
+    ctx.Declare(gc_vars.struct_var, JsType::kObject, false);
+    Push(out, mk::Let(t, gc_vars.array_var, mk::Null(t)));
+    ctx.Declare(gc_vars.array_var, JsType::kObject, false);
+  }
+
+  // Optionally also exercise `WebAssembly.validate` and async
+  // `WebAssembly.compile` alongside synchronous execution.
+  if (r.Chance(kWasmAsyncCompileProb())) {
+    std::vector<Expression*> val_args = {mk::Id(t, bytes_name)};
+    std::vector<Expression*> comp_args = {mk::Id(t, bytes_name)};
+    if (m.has_js_string_builtins) {
+      val_args.push_back(make_js_string_opts());
+      comp_args.push_back(make_js_string_opts());
+    }
+    Expression* val_call = mk::CallMethod(t, mk::Id(t, "WebAssembly"),
+                                          "validate", std::move(val_args));
+    Expression* comp_call = mk::CallMethod(t, mk::Id(t, "WebAssembly"),
+                                           "compile", std::move(comp_args));
+    Expression* caught =
+        mk::CallMethod(t, comp_call, "catch", {mk::Arrow(t, {}, {})});
+    Push(out, GuardedStmt(
+                  ctx, {mk::ExprStmt(t, val_call), mk::ExprStmt(t, caught)}));
+  }
+
+  // Bind exported tag 0 when present so JS can inspect `WebAssembly.Exception`.
+  std::string_view tag_name;
+  if (!m.exported_tags.empty()) {
+    tag_name = ctx.builder.FreshName("tag");
+    Push(out, mk::Const(t, tag_name,
+                        mk::Member(t, mk::Id(t, exports_name), "tag0")));
+    ctx.Declare(tag_name, JsType::kObject, true);
+    // Construct one `WebAssembly.Exception` from JS.
+    std::vector<Expression*> exn_args;
+    for (const WasmValType& pt : m.exported_tags[0].params) {
+      exn_args.push_back(WasmJsArg(ctx, pt, gc_vars));
+    }
+    Expression* exn_expr =
+        mk::New(t, mk::Member(t, mk::Id(t, "WebAssembly"), "Exception"),
+                {mk::Id(t, tag_name), mk::Array(t, std::move(exn_args))});
+    Push(out, GuardedStmt(ctx, {mk::ExprStmt(t, exn_expr)}));
+  }
+
+  // Bind exported functions, warm them up, tier them up, and invoke again.
+  std::vector<std::string_view> func_names;
+  func_names.reserve(m.functions.size());
+  for (size_t i = 0; i < m.functions.size(); ++i) {
+    const WasmSignature& sig = m.functions[i];
     std::string ename = "e" + std::to_string(i);
-    Expression* func_load =
-        mk::Member(T(ctx), mk::Id(T(ctx), exports_name), ename);
+    Expression* func_load = mk::Member(t, mk::Id(t, exports_name), ename);
     std::string_view func_name = ctx.builder.FreshName("f");
-    Statement* func_decl = mk::Const(T(ctx), func_name, func_load);
-    Push(out, func_decl);
+    Push(out, mk::Const(t, func_name, func_load));
     ctx.Declare(func_name, JsType::kFunction, true);
+    func_names.push_back(func_name);
 
-    // Call it 1-3 times
-    int calls = 1 + static_cast<int>(ctx.rng().Index(3));
-    for (int c = 0; c < calls; ++c) {
+    BindingInfo& info = ctx.builder.RecordInfo(func_name);
+    info.parameters.clear();
+    for (const WasmValType& p : sig.params) {
+      info.parameters.push_back(p.kind == WasmType::kI64 ? JsType::kBigInt
+                                : p.IsRef()              ? JsType::kObject
+                                                         : JsType::kNumber);
+    }
+
+    auto make_args = [&](int override_slot) {
       std::vector<Expression*> args;
-      for (auto t : m.functions[i].params) {
-        if (t == WasmType::kI64) {
-          args.push_back(
-              mk::BigInt(T(ctx), std::to_string(ctx.rng().Range(0, 100))));
+      args.reserve(sig.params.size());
+      for (size_t p = 0; p < sig.params.size(); ++p) {
+        if (p == 0 && override_slot >= 0 &&
+            sig.params[p].kind == WasmType::kI32) {
+          args.push_back(mk::Num(t, static_cast<double>(override_slot)));
         } else {
-          args.push_back(mk::Num(T(ctx), ctx.rng().Double() * 100));
+          args.push_back(WasmJsArg(ctx, sig.params[p], gc_vars));
         }
       }
-      Expression* call_expr = mk::Call(T(ctx), mk::Id(T(ctx), func_name), args);
-      Push(out, cg.Stmt(call_expr));
+      return args;
+    };
+
+    std::string_view capture_target;
+    if (gc_vars.has_gc && !sig.results.empty()) {
+      const WasmValType& rt = sig.results[0];
+      if (rt.IsConcreteRef() && rt.type_idx == gc_vars.struct_type) {
+        capture_target = gc_vars.struct_var;
+      } else if (rt.IsConcreteRef() && rt.type_idx == gc_vars.array_type) {
+        capture_target = gc_vars.array_var;
+      }
+    }
+
+    auto guarded_tier_up = [&](std::string_view fn_name) -> Statement* {
+      Expression* is_fn =
+          mk::Binary(t, BinaryOp::kStrictEq,
+                     mk::Unary(t, UnaryOp::kTypeof, mk::Id(t, fn_name)),
+                     mk::Str(t, "function"));
+      return mk::If(t, is_fn,
+                    mk::Block(t, {cg.Stmt(mk::Native(t, "WasmTierUpFunction",
+                                                     {mk::Id(t, fn_name)}))}));
+    };
+
+    auto guarded_invoke = [&](std::string_view target_name,
+                              std::vector<Expression*> args,
+                              std::string_view capture_var) -> Statement* {
+      Expression* call = mk::Call(t, mk::Id(t, target_name), std::move(args));
+      Statement* call_stmt =
+          !capture_var.empty()
+              ? static_cast<Statement*>(mk::ExprStmt(
+                    t, mk::Assign(t, mk::Id(t, capture_var), call)))
+              : static_cast<Statement*>(mk::ExprStmt(t, call));
+      if (!tag_name.empty() && r.Coin()) {
+        std::string_view ex_name = ctx.builder.FreshName("ex");
+        Expression* is_exn =
+            mk::Binary(t, BinaryOp::kInstanceof, mk::Id(t, ex_name),
+                       mk::Member(t, mk::Id(t, "WebAssembly"), "Exception"));
+        Expression* check_tag =
+            mk::CallMethod(t, mk::Id(t, ex_name), "is", {mk::Id(t, tag_name)});
+        Expression* get_arg =
+            mk::CallMethod(t, mk::Id(t, ex_name), "getArg",
+                           {mk::Id(t, tag_name), mk::Num(t, 0)});
+        Statement* inspect = mk::If(
+            t, is_exn,
+            mk::Block(t, {mk::If(t, check_tag,
+                                 mk::Block(t, {mk::ExprStmt(t, get_arg)}))}));
+        return mk::Try(t, {call_stmt}, ex_name, {inspect});
+      }
+      return GuardedStmt(ctx, {call_stmt});
+    };
+
+    // Wrap and invoke the designated JSPI export with `WebAssembly.promising`.
+    if (static_cast<int>(i) == m.jspi_export) {
+      std::string_view prom_name = ctx.builder.FreshName("pf");
+      Expression* prom_expr = mk::CallMethod(
+          t, mk::Id(t, "WebAssembly"), "promising", {mk::Id(t, func_name)});
+      Push(out, mk::Let(t, prom_name, mk::Null(t)));
+      ctx.Declare(prom_name, JsType::kFunction, false);
+      Push(out,
+           GuardedStmt(ctx, {mk::ExprStmt(t, mk::Assign(t, mk::Id(t, prom_name),
+                                                        prom_expr))}));
+      auto invoke_promising = [&]() {
+        Expression* pcall = mk::Call(t, mk::Id(t, prom_name), make_args(-1));
+        Expression* caught =
+            mk::CallMethod(t, pcall, "catch", {mk::Arrow(t, {}, {})});
+        Push(out, GuardedStmt(ctx, {mk::ExprStmt(t, caught)}));
+      };
+      invoke_promising();
+      if (ctx.natives && r.Chance(kWasmTierUpProb())) {
+        Push(out, guarded_tier_up(func_name));
+        invoke_promising();
+      }
+      continue;
+    }
+
+    const bool is_deopt_caller = static_cast<int>(i) == m.indirect_caller &&
+                                 m.table_callees >= 2 && !sig.params.empty() &&
+                                 sig.params[0].kind == WasmType::kI32;
+
+    if (is_deopt_caller) {
+      // Warm up slot 0, force tier-up, then call other table slots to trigger
+      // speculative `call_indirect` deoptimization.
+      Push(out, guarded_invoke(func_name, make_args(0), capture_target));
+      if (ctx.natives && r.Chance(kWasmTierUpProb())) {
+        Push(out, guarded_tier_up(func_name));
+      }
+      for (uint32_t slot = 1; slot < m.table_callees; ++slot) {
+        Push(out, guarded_invoke(func_name, make_args(static_cast<int>(slot)),
+                                 capture_target));
+        if (ctx.natives && slot == 1 && m.table_callees >= 3 && r.Coin()) {
+          Push(out, guarded_tier_up(func_name));
+        }
+      }
+    } else {
+      const int warmup = 1 + static_cast<int>(r.Index(2));
+      for (int c = 0; c < warmup; ++c) {
+        Push(out, guarded_invoke(func_name, make_args(-1), capture_target));
+      }
+      if (ctx.natives && r.Chance(kWasmTierUpProb())) {
+        Push(out, guarded_tier_up(func_name));
+        const int after = 1 + static_cast<int>(r.Index(2));
+        for (int c = 0; c < after; ++c) {
+          Push(out, guarded_invoke(func_name, make_args(-1), capture_target));
+        }
+      }
     }
   }
 
-  if (m.memory) {
+  // Emit a small JS wrapper calling one non-JSPI Wasm export in a short loop
+  // so TurboFan and Turboshaft exercise JS-to-Wasm inlining.
+  const bool has_sync_export =
+      !func_names.empty() && !(func_names.size() == 1 && m.jspi_export == 0);
+  if (has_sync_export && r.Chance(kWasmJsInlineProb())) {
+    size_t target_idx = r.Index(func_names.size());
+    if (static_cast<int>(target_idx) == m.jspi_export) {
+      target_idx = (target_idx + 1) % func_names.size();
+    }
+    const std::string_view target_fn = func_names[target_idx];
+    const WasmSignature& sig = m.functions[target_idx];
+    std::string_view wrap_name = ctx.builder.FreshName("w");
+    std::string_view arg_name = ctx.builder.FreshName("x");
+    std::string_view acc_name = ctx.builder.FreshName("acc");
+    std::string_view iter_name = ctx.builder.FreshName("i");
+
+    std::vector<Expression*> inner_args;
+    inner_args.reserve(sig.params.size());
+    bool uses_num_param = false;
+    for (size_t p = 0; p < sig.params.size(); ++p) {
+      if (sig.params[p].kind == WasmType::kI64) {
+        inner_args.push_back(
+            mk::Call(t, mk::Id(t, "BigInt"), {mk::Id(t, iter_name)}));
+      } else if (sig.params[p].IsRef()) {
+        inner_args.push_back(WasmJsArg(ctx, sig.params[p], gc_vars));
+      } else if (!uses_num_param) {
+        inner_args.push_back(mk::Id(t, arg_name));
+        uses_num_param = true;
+      } else {
+        inner_args.push_back(mk::Id(t, iter_name));
+      }
+    }
+    Expression* inner_call =
+        mk::Call(t, mk::Id(t, target_fn), std::move(inner_args));
+    Statement* assign_acc =
+        mk::ExprStmt(t, mk::Assign(t, mk::Id(t, acc_name), inner_call));
+    Statement* loop_step =
+        r.Coin() ? GuardedStmt(ctx, {assign_acc}) : assign_acc;
+    Statement* loop =
+        mk::CountedLoop(t, iter_name, mk::Num(t, 5), mk::Block(t, {loop_step}));
+    std::vector<Statement*> wrap_body = {
+        mk::Let(t, acc_name, mk::Num(t, 0)),
+        loop,
+        mk::Return(t, mk::Id(t, acc_name)),
+    };
+    Expression* wrap_fn = mk::Function(t, "", {arg_name}, std::move(wrap_body));
+    Push(out, mk::Const(t, wrap_name, wrap_fn));
+    ctx.Declare(wrap_name, JsType::kFunction, true);
+
+    if (ctx.natives) {
+      Push(out, cg.Stmt(mk::Native(t, "PrepareFunctionForOptimization",
+                                   {mk::Id(t, wrap_name)})));
+      Push(out, GuardedCall(ctx, wrap_name, {mk::Num(t, 1)}));
+      Push(out, GuardedCall(ctx, wrap_name, {mk::Num(t, 2)}));
+      Push(out, cg.Stmt(mk::Native(t, "OptimizeFunctionOnNextCall",
+                                   {mk::Id(t, wrap_name)})));
+      Push(out, GuardedCall(ctx, wrap_name, {mk::Num(t, 3)}));
+      if (uses_num_param && r.Coin()) {
+        // Trigger a lazy deopt during JS-to-Wasm numeric conversion.
+        std::vector<Statement*> vo_body = {
+            mk::ExprStmt(
+                t, mk::Native(t, "DeoptimizeFunction", {mk::Id(t, wrap_name)})),
+            mk::Return(t, mk::Num(t, 4)),
+        };
+        Expression* trigger = mk::Object(
+            t, {mk::Method(t, "valueOf",
+                           mk::Function(t, "", {}, std::move(vo_body)))});
+        Push(out, GuardedCall(ctx, wrap_name, {trigger}));
+      }
+    } else {
+      Push(out, GuardedCall(ctx, wrap_name, {mk::Num(t, 1)}));
+      Push(out, GuardedCall(ctx, wrap_name, {mk::Num(t, 2)}));
+    }
+  }
+
+  // Exercise exported memories: views, `grow` (`1n` for memory64), `Atomics` on
+  // shared memories, and `toResizableBuffer` / `toFixedLengthBuffer`
+  // transitions.
+  for (const WasmMemoryInfo& mi : m.memories) {
     Expression* mem_load =
-        mk::Member(T(ctx), mk::Id(T(ctx), exports_name), "mem");
+        mk::Member(t, mk::Id(t, exports_name), mi.export_name);
     std::string_view mem_name = ctx.builder.FreshName("mem");
-    Statement* mem_decl = mk::Const(T(ctx), mem_name, mem_load);
-    Push(out, mem_decl);
+    Push(out, mk::Const(t, mem_name, mem_load));
     ctx.Declare(mem_name, JsType::kObject, true);
 
-    if (ctx.rng().Coin()) {
-      Expression* buf_load =
-          mk::Member(T(ctx), mk::Id(T(ctx), mem_name), "buffer");
+    auto make_grow_delta = [&]() -> Expression* {
+      return mi.is_memory64 ? static_cast<Expression*>(mk::BigInt(t, "1"))
+                            : static_cast<Expression*>(mk::Num(t, 1));
+    };
+
+    if (mi.is_shared) {
+      std::string_view view_name = ctx.builder.FreshName("sview");
+      Push(out, mk::Let(t, view_name, mk::Null(t)));
+      ctx.Declare(view_name, JsType::kTypedArray, false);
+      Expression* buf_load = mk::Member(t, mk::Id(t, mem_name), "buffer");
+      Expression* view_expr = mk::New(t, mk::Id(t, "Int32Array"), {buf_load});
+      Expression* atomic_add =
+          mk::CallMethod(t, mk::Id(t, "Atomics"), "add",
+                         {mk::Id(t, view_name), mk::Num(t, 0), mk::Num(t, 1)});
+      Push(out,
+           GuardedStmt(ctx, {mk::ExprStmt(t, mk::Assign(t, mk::Id(t, view_name),
+                                                        view_expr)),
+                             mk::ExprStmt(t, atomic_add)}));
+    } else if (r.Chance(kWasmResizableBufferProb())) {
+      std::string_view rab_name = ctx.builder.FreshName("rab");
+      Expression* to_rab =
+          mk::CallMethod(t, mk::Id(t, mem_name), "toResizableBuffer", {});
       Expression* view_expr =
-          mk::New(T(ctx), mk::Id(T(ctx), "Uint8Array"), {buf_load});
+          mk::New(t, mk::Id(t, r.Coin() ? "Uint8Array" : "Int32Array"),
+                  {mk::Id(t, rab_name)});
+      Expression* grow_call =
+          mk::CallMethod(t, mk::Id(t, mem_name), "grow", {make_grow_delta()});
+      Expression* to_fixed =
+          mk::CallMethod(t, mk::Id(t, mem_name), "toFixedLengthBuffer", {});
+      Push(out,
+           GuardedStmt(
+               ctx, {mk::Const(t, rab_name, to_rab), mk::ExprStmt(t, view_expr),
+                     mk::ExprStmt(t, grow_call), mk::ExprStmt(t, to_fixed)}));
+    } else if (r.Coin()) {
       std::string_view view_name = ctx.builder.FreshName("view");
-      Statement* view_decl = mk::Const(T(ctx), view_name, view_expr);
-      Push(out, view_decl);
-      ctx.Declare(view_name, JsType::kTypedArray, true);
+      Push(out, mk::Let(t, view_name, mk::Null(t)));
+      ctx.Declare(view_name, JsType::kTypedArray, false);
+      Expression* buf_load = mk::Member(t, mk::Id(t, mem_name), "buffer");
+      Expression* view_expr = mk::New(t, mk::Id(t, "Uint8Array"), {buf_load});
+      Push(out,
+           GuardedStmt(ctx, {mk::ExprStmt(t, mk::Assign(t, mk::Id(t, view_name),
+                                                        view_expr))}));
     } else {
-      Expression* grow_call = mk::CallMethod(T(ctx), mk::Id(T(ctx), mem_name),
-                                             "grow", {mk::Num(T(ctx), 1)});
-      Push(out, cg.Stmt(grow_call));
+      Expression* grow_call =
+          mk::CallMethod(t, mk::Id(t, mem_name), "grow", {make_grow_delta()});
+      Push(out, GuardedStmt(ctx, {mk::ExprStmt(t, grow_call)}));
     }
   }
 
   if (m.table) {
-    Expression* tab_load =
-        mk::Member(T(ctx), mk::Id(T(ctx), exports_name), "tab");
+    Expression* tab_load = mk::Member(t, mk::Id(t, exports_name), "tab");
     std::string_view tab_name = ctx.builder.FreshName("tab");
-    Statement* tab_decl = mk::Const(T(ctx), tab_name, tab_load);
-    Push(out, tab_decl);
+    Push(out, mk::Const(t, tab_name, tab_load));
     ctx.Declare(tab_name, JsType::kObject, true);
 
-    if (ctx.rng().Coin()) {
-      Expression* get_call = mk::CallMethod(T(ctx), mk::Id(T(ctx), tab_name),
-                                            "get", {mk::Num(T(ctx), 0)});
-      Push(out, cg.Stmt(get_call));
+    if (r.Coin()) {
+      const uint32_t slot =
+          m.table_size > 0 ? static_cast<uint32_t>(r.Index(m.table_size)) : 0;
+      Expression* slot_expr =
+          m.table_is_64
+              ? static_cast<Expression*>(mk::BigInt(t, std::to_string(slot)))
+              : static_cast<Expression*>(mk::Num(t, static_cast<double>(slot)));
+      Expression* get_call =
+          mk::CallMethod(t, mk::Id(t, tab_name), "get", {slot_expr});
+      Push(out, GuardedStmt(ctx, {mk::ExprStmt(t, get_call)}));
     } else {
-      Expression* len_load =
-          mk::Member(T(ctx), mk::Id(T(ctx), tab_name), "length");
-      Push(out, cg.Stmt(len_load));
+      Expression* len_load = mk::Member(t, mk::Id(t, tab_name), "length");
+      Push(out, GuardedStmt(ctx, {mk::ExprStmt(t, len_load)}));
     }
   }
 
-  int g_idx = 0;
-  for (auto t : m.globals) {
-    std::string gname = "g" + std::to_string(g_idx++);
-    Expression* glob_load =
-        mk::Member(T(ctx), mk::Id(T(ctx), exports_name), gname);
+  if (m.has_gc_table) {
+    Expression* gtab_load = mk::Member(t, mk::Id(t, exports_name), "tab1");
+    std::string_view gtab_name = ctx.builder.FreshName("gtab");
+    Push(out, mk::Const(t, gtab_name, gtab_load));
+    ctx.Declare(gtab_name, JsType::kObject, true);
+
+    if (r.Coin()) {
+      const uint32_t slot =
+          m.gc_table_size > 0 ? static_cast<uint32_t>(r.Index(m.gc_table_size))
+                              : 0;
+      Expression* slot_expr =
+          m.gc_table_is_64
+              ? static_cast<Expression*>(mk::BigInt(t, std::to_string(slot)))
+              : static_cast<Expression*>(mk::Num(t, static_cast<double>(slot)));
+      Expression* get_call =
+          mk::CallMethod(t, mk::Id(t, gtab_name), "get", {slot_expr});
+      Push(out, GuardedStmt(ctx, {mk::ExprStmt(t, get_call)}));
+    } else {
+      Expression* delta = m.gc_table_is_64
+                              ? static_cast<Expression*>(mk::BigInt(t, "1"))
+                              : static_cast<Expression*>(mk::Num(t, 1));
+      Expression* grow_call =
+          mk::CallMethod(t, mk::Id(t, gtab_name), "grow", {delta, mk::Null(t)});
+      Push(out, GuardedStmt(ctx, {mk::ExprStmt(t, grow_call)}));
+    }
+  }
+
+  for (const WasmGlobalExport& gexp : m.globals) {
+    Expression* glob_load = mk::Member(t, mk::Id(t, exports_name), gexp.name);
     std::string_view glob_name = ctx.builder.FreshName("g");
-    Statement* glob_decl = mk::Const(T(ctx), glob_name, glob_load);
-    Push(out, glob_decl);
+    Push(out, mk::Const(t, glob_name, glob_load));
     ctx.Declare(glob_name, JsType::kObject, true);
 
-    if (ctx.rng().Coin()) {
-      Expression* val_load =
-          mk::Member(T(ctx), mk::Id(T(ctx), glob_name), "value");
-      Push(out, cg.Stmt(val_load));
+    if (r.Coin()) {
+      Expression* val_load = mk::Member(t, mk::Id(t, glob_name), "value");
+      Push(out, GuardedStmt(ctx, {mk::ExprStmt(t, val_load)}));
     } else {
-      Expression* val_store = mk::Assign(
-          T(ctx), mk::Member(T(ctx), mk::Id(T(ctx), glob_name), "value"),
-          (t == WasmType::kI64)
-              ? static_cast<Expression*>(mk::BigInt(T(ctx), "42"))
-              : static_cast<Expression*>(mk::Num(T(ctx), 42)));
-      Push(out, cg.Stmt(val_store));
+      Expression* val_store =
+          mk::Assign(t, mk::Member(t, mk::Id(t, glob_name), "value"),
+                     WasmJsArg(ctx, gexp.type, gc_vars));
+      Push(out, GuardedStmt(ctx, {mk::ExprStmt(t, val_store)}));
     }
   }
 
@@ -454,7 +1102,7 @@ GEN(TypedArrayDecl) {
 
 GEN(ComputedDecl) {
   Expression* v = cg.Expression(0);
-  Push(out, cg.Declare(v, Builder::GuessType(v)));
+  Push(out, cg.Declare(v, ctx.builder.GuessExpressionType(v)));
   return true;
 }
 
@@ -765,25 +1413,60 @@ REDLINE_TUNABLE(kClassDeclExpressionChance,
                 "generators.ClassDecl.expression_chance", 0.15, 0, 1,
                 "probability that the class is a class expression bound to a "
                 "const (const C = class {...})");
+REDLINE_TUNABLE(kClassDeclBuiltinSuperClassChance,
+                "generators.ClassDecl.builtin_superclass_chance", 0.5, 0, 1,
+                "probability that a superclass is a builtin constructor");
 REDLINE_TUNABLE(kClassDeclStaticBlockChance,
                 "generators.ClassDecl.static_block_chance", 0.15, 0, 1,
                 "probability that the class gets a static { ... } block");
 REDLINE_TUNABLE(kClassDeclStaticBlockMaxStatements,
                 "generators.ClassDecl.static_block_max_statements", 3, 1, 64,
                 "most statements in the static block");
+REDLINE_TUNABLE(kClassDeclMetaInspectChance,
+                "generators.ClassDecl.meta_inspect_chance", 0.3, 0, 1,
+                "probability that the constructor inspects new.target or "
+                "this.constructor");
 
 GEN(ClassDecl) {
   Random& r = ctx.rng();
   Tree* t = T(ctx);
   std::string_view name = ctx.builder.FreshName("C");
   Expression* super_class = nullptr;
+  std::string_view builtin_super;
   if (r.Chance(kClassDeclSuperClassChance())) {
-    if (Identifier* id = cg.Variable(JsType::kClass)) {
-      super_class = id;
-    } else if (r.Coin()) {
-      super_class =
-          mk::Id(t, r.Pick({"Array", "Error", "Map", "Set", "Object", "Promise",
-                            "Uint8Array", "Function", "RegExp", "Date"}));
+    static const char* const kBuiltinSupers[] = {"Array",
+                                                 "Error",
+                                                 "Map",
+                                                 "Set",
+                                                 "Object",
+                                                 "Promise",
+                                                 "Function",
+                                                 "RegExp",
+                                                 "Date",
+                                                 "WeakSet",
+                                                 "WeakMap",
+                                                 "ArrayBuffer",
+                                                 "SharedArrayBuffer",
+                                                 "DataView",
+                                                 "Uint8Array",
+                                                 "Int8Array",
+                                                 "Uint8ClampedArray",
+                                                 "Int16Array",
+                                                 "Uint16Array",
+                                                 "Int32Array",
+                                                 "Uint32Array",
+                                                 "Float16Array",
+                                                 "Float32Array",
+                                                 "Float64Array",
+                                                 "BigInt64Array",
+                                                 "BigUint64Array"};
+    Identifier* user_cls = cg.Variable(JsType::kClass);
+    if (user_cls != nullptr && !r.Chance(kClassDeclBuiltinSuperClassChance())) {
+      super_class = user_cls;
+    } else {
+      builtin_super = kBuiltinSupers[r.Index(sizeof(kBuiltinSupers) /
+                                             sizeof(kBuiltinSupers[0]))];
+      super_class = mk::Id(t, builtin_super);
     }
   }
   std::vector<Node*> members;
@@ -822,17 +1505,65 @@ GEN(ClassDecl) {
     CodeGen inner(nested);
     Statements body;
     if (super_class != nullptr) {
-      // Forward the parameters, a rest parameter as a spread.
+      // Forward the parameters, a rest parameter as a spread, or pass default
+      // arguments required by DataView/Promise when the constructor takes none.
       std::vector<Expression*> args;
-      args.reserve(names.size());
-      for (size_t i = 0; i < names.size(); i++) {
-        Expression* arg = mk::Id(t, names[i]);
-        if (params[i]->Is<RestElement>()) {
-          arg = mk::Spread(t, arg);
+      if (names.empty() && builtin_super == "DataView") {
+        args.push_back(mk::New(t, mk::Id(t, "ArrayBuffer"), {mk::Num(t, 16)}));
+      } else if (names.empty() && builtin_super == "Promise") {
+        args.push_back(mk::Arrow(
+            t, {"r"}, {mk::ExprStmt(t, mk::Call(t, mk::Id(t, "r"), {}))}));
+      } else {
+        args.reserve(names.size());
+        for (size_t i = 0; i < names.size(); i++) {
+          Expression* arg = mk::Id(t, names[i]);
+          if (params[i]->Is<RestElement>()) {
+            arg = mk::Spread(t, arg);
+          }
+          args.push_back(arg);
         }
-        args.push_back(arg);
       }
       body.push_back(inner.Stmt(mk::Call(t, t->New<Super>(), std::move(args))));
+    }
+    if (r.Chance(kClassDeclMetaInspectChance())) {
+      switch (r.Index(3)) {
+        case 0: {
+          std::string_view nt = ctx.builder.FreshName("nt");
+          body.push_back(mk::Const(t, nt, mk::NewTarget(t)));
+          body.push_back(inner.Stmt(mk::Assign(
+              t, mk::Member(t, mk::This(t), "ctor"), mk::Id(t, nt))));
+          break;
+        }
+        case 1: {
+          std::string_view tc = ctx.builder.FreshName("tc");
+          body.push_back(
+              mk::Const(t, tc, mk::Member(t, mk::This(t), "constructor")));
+          body.push_back(inner.Stmt(mk::Assign(
+              t, mk::Member(t, mk::This(t), "ctor"), mk::Id(t, tc))));
+          break;
+        }
+        default: {
+          if (!names.empty() && params[0]->Is<Identifier>()) {
+            // Bound recursion to depth 1 with an explicit argument check.
+            Expression* cond = mk::Binary(t, BinaryOp::kStrictEq,
+                                          mk::Id(t, names[0]), mk::Num(t, 0));
+            Statement* call = mk::Try(
+                t,
+                {mk::ExprStmt(
+                    t, mk::New(t, mk::Member(t, mk::This(t), "constructor"),
+                               {mk::Num(t, 1)}))},
+                "e", {});
+            body.push_back(mk::If(t, cond, mk::Block(t, {call})));
+          } else {
+            std::string_view tc = ctx.builder.FreshName("tc");
+            body.push_back(
+                mk::Const(t, tc, mk::Member(t, mk::This(t), "constructor")));
+            body.push_back(inner.Stmt(mk::Assign(
+                t, mk::Member(t, mk::This(t), "ctor"), mk::Id(t, tc))));
+          }
+          break;
+        }
+      }
     }
     int fields = 1 + r.SmallCount(kClassDeclConstructorMaxFields.AsInt() - 1);
     for (int i = 0; i < fields; i++) {
@@ -890,13 +1621,19 @@ GEN(ClassDecl) {
   RecordClassKeys(ctx, name, out->back());
   // Instantiate it, with arguments of the constructor's parameter types.
   if (r.Chance(kClassDeclInstantiateChance())) {
-    Push(out,
-         cg.Declare(
-             mk::New(t, mk::Id(t, name),
-                     constructor_types.empty()
-                         ? cg.Arguments(0, kClassDeclInstantiateMaxArgs.AsInt())
-                         : cg.ArgumentsFor(constructor_types)),
-             JsType::kObject, "o"));
+    Expression* inst =
+        mk::New(t, mk::Id(t, name),
+                constructor_types.empty()
+                    ? cg.Arguments(0, kClassDeclInstantiateMaxArgs.AsInt())
+                    : cg.ArgumentsFor(constructor_types));
+    if ((builtin_super == "DataView" || builtin_super == "Promise") &&
+        !constructor_types.empty()) {
+      for (Statement* s : cg.DeclareGuarded(inst, JsType::kObject, "o")) {
+        Push(out, s);
+      }
+    } else {
+      Push(out, cg.Declare(inst, JsType::kObject, "o"));
+    }
   }
   return true;
 }
@@ -928,7 +1665,7 @@ GEN(Iife) {
 
 GEN(BinaryOp) {
   Expression* v = cg.BinaryOperation(0);
-  Push(out, cg.Declare(v, Builder::GuessType(v)));
+  Push(out, cg.Declare(v, ctx.builder.GuessExpressionType(v)));
   return true;
 }
 
@@ -945,7 +1682,7 @@ GEN(UnaryOp) {
     Push(out, cg.Stmt(v));
     return true;
   }
-  Push(out, cg.Declare(v, Builder::GuessType(v)));
+  Push(out, cg.Declare(v, ctx.builder.GuessExpressionType(v)));
   return true;
 }
 
@@ -1041,7 +1778,7 @@ GEN(PropertyStore) {
   Expression* target = nullptr;
   if (r.Chance(kPropertyStoreWritableChance())) {
     // Most properties of a builtin type are getters of its prototype.
-    JsType type = Builder::GuessType(object);
+    JsType type = ctx.builder.GuessExpressionType(object);
     if (auto* id = object->As<Identifier>()) {
       for (const Variable& v : ctx.visible) {
         if (v.name == id->name) {
@@ -1166,24 +1903,15 @@ REDLINE_TUNABLE(kMethodCallTypedReceiverChance,
 // The result type of `object.name(...)` in the model, or kUnknown.
 JsType MethodResultType(GenContext& ctx, Expression* object,
                         std::string_view name) {
-  auto* id = object->As<Identifier>();
-  if (id == nullptr) {
-    return JsType::kUnknown;
-  }
-  for (const Variable& v : ctx.visible) {
-    if (v.name != id->name) {
-      continue;
-    }
-    if (const BuiltinType* bt = ctx.env.ForType(v.type)) {
-      for (const BuiltinFunction& m : bt->methods) {
-        if (m.name == name) {
-          return m.result;
-        }
+  if (auto* id = object->As<Identifier>()) {
+    for (const Variable& v : ctx.visible) {
+      if (v.name == id->name) {
+        return ctx.env.LookupMethodReturnType(v.type, name);
       }
     }
-    break;
   }
-  return JsType::kUnknown;
+  return ctx.env.LookupMethodReturnType(ctx.builder.GuessExpressionType(object),
+                                        name);
 }
 
 // CodeGenerators.swift:2262 (MethodCallGenerator).
@@ -1197,7 +1925,8 @@ GEN(MethodCall) {
   if (object == nullptr) {
     object = cg.ObjectLike();
   }
-  Expression* call = cg.MethodCall(object, Builder::GuessType(object));
+  Expression* call =
+      cg.MethodCall(object, ctx.builder.GuessExpressionType(object));
   auto* callee = call->Cast<CallExpression>()->callee->As<MemberExpression>();
   JsType result = JsType::kUnknown;
   if (callee != nullptr && !callee->computed) {
@@ -1292,7 +2021,7 @@ GEN(BuiltinCall) {
   Random& r = ctx.rng();
   Expression* call = cg.BuiltinCall();
   if (r.Chance(kBuiltinCallDeclareChance())) {
-    Push(out, cg.Declare(call, Builder::GuessType(call)));
+    Push(out, cg.Declare(call, ctx.builder.GuessExpressionType(call)));
   } else {
     Push(out, cg.Stmt(call));
   }
@@ -1301,18 +2030,47 @@ GEN(BuiltinCall) {
 
 REDLINE_TUNABLE(kConstructMaxArgs, "generators.Construct.max_args", 2, 0, 16,
                 "most arguments passed to new on a visible class or function");
+REDLINE_TUNABLE(kConstructReflectChance, "generators.Construct.reflect_chance",
+                0.25, 0, 1,
+                "probability of emitting Reflect.construct with a newTarget");
 
 GEN(Construct) {
   Random& r = ctx.rng();
+  Tree* t = T(ctx);
+  if (r.Chance(kConstructReflectChance())) {
+    static const char* const kCtors[] = {"Object", "Array",     "Error",
+                                         "Map",    "Set",       "RegExp",
+                                         "Date",   "Uint8Array"};
+    constexpr size_t kNumCtors = sizeof(kCtors) / sizeof(kCtors[0]);
+    std::string_view fallback_target = kCtors[r.Index(kNumCtors)];
+    std::string_view fallback_nt = kCtors[r.Index(kNumCtors)];
+    if (fallback_nt == fallback_target) {
+      fallback_nt = fallback_target == "Array" ? "Object" : "Array";
+    }
+    Identifier* cls1 = cg.Variable(JsType::kClass);
+    Expression* target = cls1 != nullptr ? static_cast<Expression*>(cls1)
+                                         : mk::Id(t, fallback_target);
+    Identifier* cls2 = cg.Variable(JsType::kClass);
+    Expression* new_target =
+        (cls2 != nullptr && (cls1 == nullptr || cls2->name != cls1->name))
+            ? static_cast<Expression*>(cls2)
+            : mk::Id(t, fallback_nt);
+    Expression* v = mk::CallMethod(
+        t, mk::Id(t, "Reflect"), "construct",
+        {target, mk::Array(t, cg.Arguments(0, kConstructMaxArgs.AsInt())),
+         new_target});
+    Push(out, cg.Declare(v, JsType::kObject, "o"));
+    return true;
+  }
   Expression* v = nullptr;
   if (r.Coin()) {
     if (Identifier* id = cg.Variable(JsType::kClass)) {
-      v = mk::New(T(ctx), id, cg.Arguments(0, kConstructMaxArgs.AsInt()));
+      v = mk::New(t, id, cg.Arguments(0, kConstructMaxArgs.AsInt()));
     }
   }
   if (v == nullptr && r.Coin()) {
     if (Identifier* id = cg.Variable(JsType::kFunction)) {
-      v = mk::New(T(ctx), id, cg.Arguments(0, kConstructMaxArgs.AsInt()));
+      v = mk::New(t, id, cg.Arguments(0, kConstructMaxArgs.AsInt()));
     }
   }
   if (v == nullptr) {
@@ -1321,7 +2079,7 @@ GEN(Construct) {
   if (v == nullptr) {
     return false;
   }
-  Push(out, cg.Declare(v, Builder::GuessType(v), "o"));
+  Push(out, cg.Declare(v, ctx.builder.GuessExpressionType(v), "o"));
   return true;
 }
 
@@ -1358,7 +2116,7 @@ GEN(TypeCheck) {
       break;
     }
   }
-  Push(out, cg.Declare(v, Builder::GuessType(v), "b"));
+  Push(out, cg.Declare(v, ctx.builder.GuessExpressionType(v), "b"));
   return true;
 }
 
@@ -1384,7 +2142,7 @@ GEN(SpreadCall) {
   Random& r = ctx.rng();
   if (r.Chance(kSpreadCallMethodChance())) {
     Expression* object = cg.ObjectLike();
-    auto* call = cg.MethodCall(object, Builder::GuessType(object))
+    auto* call = cg.MethodCall(object, ctx.builder.GuessExpressionType(object))
                      ->Cast<CallExpression>();
     if (call->arguments.empty() ||
         !call->arguments.back()->Is<SpreadElement>()) {
@@ -1828,31 +2586,41 @@ GEN(BreakContinue) {
 // --- JIT
 // ------------------------------------------------------------------------
 
-// Picks a function to compile: a visible function variable, or a fresh one.
-// `*is_generator` tells if the function is a fresh generator function.
-Identifier* FunctionForJit(GenContext& ctx, CodeGen& cg, Statements* out,
-                           bool* is_generator = nullptr) {
-  if (is_generator != nullptr) {
-    *is_generator = false;
+REDLINE_TUNABLE(
+    kJitReceiverChance, "generators.JitOptimize.receiver_chance", 0.3, 0, 1,
+    "probability that JitOptimize or JitBaseline compiles a method, "
+    "accessor or class constructor of a visible variable rather "
+    "than a function");
+
+// Picks a function to compile: sometimes a method, accessor or constructor
+// of a visible variable (ReceiverJitTarget), else a visible function
+// variable, or a fresh one. False if there is none.
+bool FunctionForJit(GenContext& ctx, CodeGen& cg, Statements* out,
+                    JitTarget* target) {
+  *target = JitTarget();
+  if (ctx.rng().Chance(kJitReceiverChance()) &&
+      ReceiverJitTarget(ctx, out, target)) {
+    return true;
   }
   if (Identifier* f = cg.Variable(JsType::kFunction)) {
-    return f;
+    target->name = f->name;
+    return true;
   }
   Statements decl;
   if (!GenFunctionDecl(ctx, cg, &decl)) {
-    return nullptr;
+    return false;
   }
   out->insert(out->end(), decl.begin(), decl.end());
-  if (is_generator != nullptr) {
-    *is_generator = decl.front()->Cast<FunctionDeclaration>()->is_generator;
-  }
+  target->is_generator =
+      decl.front()->Cast<FunctionDeclaration>()->is_generator;
   // The declaration registered the name as the newest visible function.
   for (const Variable& v : ctx.visible) {
     if (v.type == JsType::kFunction) {
-      return mk::Id(T(ctx), v.name);
+      target->name = v.name;
+      return true;
     }
   }
-  return nullptr;
+  return false;
 }
 
 REDLINE_TUNABLE(kJitOptimizeMaxWarmupCalls,
@@ -1921,20 +2689,20 @@ REDLINE_TUNABLE(kJitOptimizeOtherTypesChance,
 GEN(JitOptimize) {
   Random& r = ctx.rng();
   Tree* t = T(ctx);
-  bool is_generator = false;
-  Identifier* f = FunctionForJit(ctx, cg, out, &is_generator);
-  if (f == nullptr) {
+  JitTarget jit;
+  if (!FunctionForJit(ctx, cg, out, &jit)) {
     return false;
   }
+  const bool is_generator = jit.is_generator;
   if (!out->empty()) {
     // A function that FunctionForJit just declared: maybe a GC inside it.
     auto* decl = out->back()->As<FunctionDeclaration>();
     if (decl != nullptr && decl->name != nullptr &&
-        decl->name->name == f->name && decl->body != nullptr) {
+        decl->name->name == jit.name && decl->body != nullptr) {
       MaybeInsertGcNative(ctx, cg, &decl->body->body);
     }
   }
-  std::string_view name = f->name;
+  std::string_view name = jit.name;
   std::string_view target_name = name;
 
   const bool constant_caller = r.Chance(kJitOptimizeConstantCallerChance());
@@ -1960,12 +2728,13 @@ GEN(JitOptimize) {
       for (JsType type : types) {
         args.push_back(cg.Literal(type));
       }
-      inner_call = mk::Call(t, mk::Id(t, name), std::move(args));
+      inner_call = jit.Call(t, std::move(args));
     } else {
       caller_body = caller_cg.Body(
           caller_ctx,
           1 + r.SmallCount(kJitOptimizeCallerMaxStatements.AsInt() - 1));
-      inner_call = caller_cg.CallWithArguments(mk::Id(t, name));
+      inner_call =
+          jit.Call(t, caller_cg.CallWithArguments(mk::Id(t, name))->arguments);
     }
     if (is_generator) {
       // Without next(), the body of the generator does not run.
@@ -2051,10 +2820,10 @@ GEN(JitOptimize) {
     if (!warmup && args.empty()) {
       args = lists.Next(kJitOptimizeOptimizedReuseChance());
     }
-    CallExpression* call = mk::Call(t, mk::Id(t, name), std::move(args));
     if (warmup && array_warmup) {
-      call->arguments.insert(call->arguments.begin(), cg.ArrayLiteral(1));
+      args.insert(args.begin(), cg.ArrayLiteral(1));
     }
+    Expression* call = jit.Call(t, std::move(args));
     if (is_generator) {
       return cg.Stmt(mk::CallMethod(t, call, "next", {}));
     }
@@ -2083,12 +2852,13 @@ GEN(JitOptimize) {
 
 GEN(JitBaseline) {
   Tree* t = T(ctx);
-  Identifier* f = FunctionForJit(ctx, cg, out);
-  if (f == nullptr) {
+  JitTarget jit;
+  if (!FunctionForJit(ctx, cg, out, &jit)) {
     return false;
   }
-  Push(out, cg.Stmt(mk::Native(t, "CompileBaseline", {f})));
-  Push(out, cg.Stmt(cg.CallWithArguments(mk::Id(t, f->name))));
+  Push(out, cg.Stmt(mk::Native(t, "CompileBaseline", {mk::Id(t, jit.name)})));
+  Push(out, cg.Stmt(jit.Call(
+                t, cg.CallWithArguments(mk::Id(t, jit.name))->arguments)));
   return true;
 }
 
@@ -2096,12 +2866,18 @@ REDLINE_TUNABLE(kDeoptDeoptimizeFunctionChance,
                 "generators.Deopt.deoptimize_function_chance", 0.8, 0, 1,
                 "probability of %DeoptimizeFunction(f) rather than "
                 "%NeverOptimizeFunction(f)");
+REDLINE_TUNABLE(kDeoptInlineChance, "generators.Deopt.inline_chance", 0.5, 0, 1,
+                "probability of %_DeoptimizeNow rather than %DeoptimizeNow");
 
 GEN(Deopt) {
   Random& r = ctx.rng();
   Tree* t = T(ctx);
   if (r.Coin()) {
-    Push(out, cg.Stmt(mk::Native(t, "DeoptimizeNow", {})));
+    Push(out,
+         cg.Stmt(mk::Native(t,
+                            r.Chance(kDeoptInlineChance()) ? "_DeoptimizeNow"
+                                                           : "DeoptimizeNow",
+                            {})));
     return true;
   }
   Identifier* f = cg.Variable(JsType::kFunction);
@@ -2130,6 +2906,9 @@ REDLINE_TUNABLE(kOsrLoopFunctionChance, "generators.OsrLoop.function_chance",
                 0.3, 0, 1,
                 "probability that the loop is in a new function that gets "
                 "%PrepareFunctionForOptimization before its call");
+REDLINE_TUNABLE(
+    kOsrLoopCallerDepthChance, "generators.OsrLoop.caller_depth_chance", 0.17,
+    0, 1, "probability that an in-function OSR loop uses %OptimizeOsr(1)");
 
 GEN(OsrLoop) {
   Random& r = ctx.rng();
@@ -2146,8 +2925,13 @@ GEN(OsrLoop) {
   CodeGen icg(inner);
   Statements body =
       icg.Body(inner, 1 + r.SmallCount(kOsrLoopMaxStatements.AsInt() - 1));
-  Statement* osr =
-      icg.Stmt(mk::Native(t, r.Coin() ? "OptimizeOsr" : "BaselineOsr", {}));
+  const bool baseline = r.Coin();
+  std::vector<Expression*> osr_args;
+  if (!baseline && in_function && r.Chance(kOsrLoopCallerDepthChance())) {
+    osr_args.push_back(mk::Num(t, 1));
+  }
+  Statement* osr = icg.Stmt(mk::Native(
+      t, baseline ? "BaselineOsr" : "OptimizeOsr", std::move(osr_args)));
   // Draw the loop bound first so the OSR trigger iteration is below it.
   const int bound = r.Pick({5, 7, 10, 20, 100});
   const int max_trigger =
@@ -2712,10 +3496,123 @@ GEN(Gc) {
 
 REDLINE_TUNABLE(kPrototypeSetNullChance, "generators.PrototypeSet.null_chance",
                 0.3, 0, 1, "probability that the new prototype is null");
+REDLINE_TUNABLE(kPrototypeSetSpeciesChance,
+                "generators.PrototypeSet.species_chance", 0.3, 0, 1,
+                "probability that PrototypeSet overrides constructor or "
+                "Symbol.species");
+REDLINE_TUNABLE(kPrototypeSetSpeciesTriggerChance,
+                "generators.PrototypeSet.species_trigger_chance", 0.7, 0, 1,
+                "probability that a species override runs an array or typed "
+                "array method");
+
+// Overrides `constructor` or `Symbol.species` on an `Array` or `TypedArray`
+// instance and optionally runs a species-consuming method.
+void EmitSpeciesOverride(GenContext& ctx, CodeGen& cg, Statements* out) {
+  Random& r = ctx.rng();
+  Tree* t = T(ctx);
+  bool is_typed = r.Coin();
+  Identifier* target =
+      cg.Variable(is_typed ? JsType::kTypedArray : JsType::kArray);
+  if (target == nullptr) {
+    is_typed = !is_typed;
+    target = cg.Variable(is_typed ? JsType::kTypedArray : JsType::kArray);
+  }
+  const bool reused = target != nullptr;
+  std::string_view target_name;
+  if (reused) {
+    target_name = target->name;
+  } else {
+    Expression* init =
+        is_typed ? cg.Instance(JsType::kTypedArray) : cg.ArrayLiteral(1);
+    if (init == nullptr) {
+      is_typed = false;
+      init = cg.ArrayLiteral(1);
+    }
+    Statement* decl =
+        cg.Declare(init, is_typed ? JsType::kTypedArray : JsType::kArray,
+                   is_typed ? "ta" : "arr");
+    Push(out, decl);
+    target_name = LastDeclared(ctx);
+  }
+  Expression* ctor = nullptr;
+  switch (r.Index(3)) {
+    case 0:
+      ctor = cg.Variable(r.Coin() ? JsType::kClass : JsType::kFunction);
+      break;
+    case 1:
+      ctor = mk::Id(
+          t, is_typed ? r.Pick({"Int32Array", "Uint8Array", "Float64Array"})
+                      : r.Pick({"Array", "Object", "Uint8Array"}));
+      break;
+    default:
+      ctor = mk::Function(t, "", {}, {mk::Return(t, mk::Array(t, {}))});
+      break;
+  }
+  if (ctor == nullptr) {
+    ctor = mk::Id(t, is_typed ? "Int32Array" : "Array");
+  }
+  auto make_species_obj = [&]() -> Expression* {
+    return mk::Object(
+        t, {mk::Prop(t, mk::Member(t, mk::Id(t, "Symbol"), "species"), ctor,
+                     /*computed=*/true)});
+  };
+  Statement* override_stmt = nullptr;
+  switch (r.Index(3)) {
+    case 0:
+      override_stmt = cg.Stmt(
+          mk::Assign(t, mk::Member(t, mk::Id(t, target_name), "constructor"),
+                     make_species_obj()));
+      break;
+    case 1:
+      override_stmt = cg.Stmt(mk::Assign(
+          t, mk::Member(t, mk::Id(t, target_name), "constructor"), ctor));
+      break;
+    default:
+      override_stmt = cg.Stmt(mk::CallMethod(
+          t, mk::Id(t, "Object"), "defineProperty",
+          {mk::Id(t, target_name), mk::Str(t, "constructor"),
+           mk::Object(t, {mk::Prop(t, "value", make_species_obj()),
+                          mk::Prop(t, "configurable", mk::Bool(t, true)),
+                          mk::Prop(t, "writable", mk::Bool(t, true))})}));
+      break;
+  }
+  if (reused) {
+    Push(out, mk::Try(t, {override_stmt}, "e", {}));
+  } else {
+    Push(out, override_stmt);
+  }
+  if (!r.Chance(kPrototypeSetSpeciesTriggerChance())) {
+    return;
+  }
+  Expression* recv = mk::Id(t, target_name);
+  Expression* call = nullptr;
+  const int choice = static_cast<int>(r.Index(is_typed ? 4 : 5));
+  if (choice == 0) {
+    call = mk::CallMethod(t, recv, "slice", {mk::Num(t, 0)});
+  } else if (choice == 1) {
+    call = is_typed ? mk::CallMethod(t, recv, "subarray", {mk::Num(t, 0)})
+                    : mk::CallMethod(t, recv, "splice",
+                                     {mk::Num(t, 0), mk::Num(t, 1)});
+  } else if (choice == 2) {
+    call = mk::CallMethod(t, recv, "filter",
+                          {mk::ArrowExpr(t, {"x"}, mk::Bool(t, true))});
+  } else if (choice == 3) {
+    call = mk::CallMethod(t, recv, "map",
+                          {mk::ArrowExpr(t, {"x"}, mk::Id(t, "x"))});
+  } else {
+    call = mk::CallMethod(t, recv, "concat", {mk::Array(t, {mk::Num(t, 1)})});
+  }
+  cg.DeclareMaybeGuarded(
+      out, call, is_typed ? JsType::kTypedArray : JsType::kArray, "r", 1.0);
+}
 
 GEN(PrototypeSet) {
   Random& r = ctx.rng();
   Tree* t = T(ctx);
+  if (r.Chance(kPrototypeSetSpeciesChance())) {
+    EmitSpeciesOverride(ctx, cg, out);
+    return true;
+  }
   Expression* object = cg.ObjectLike();
   Expression* proto = r.Chance(kPrototypeSetNullChance())
                           ? static_cast<Expression*>(mk::Null(t))
@@ -2891,55 +3788,84 @@ REDLINE_TUNABLE(kProxyDeclMaxTraps, "generators.ProxyDecl.max_traps", 3, 1, 64,
 REDLINE_TUNABLE(kProxyDeclTrapMaxStatements,
                 "generators.ProxyDecl.trap_max_statements", 2, 0, 64,
                 "most statements in a trap body before its return");
+REDLINE_TUNABLE(kProxyDeclReuseHandlerChance,
+                "generators.ProxyDecl.reuse_handler_chance", 0.5, 0, 1,
+                "probability of reusing a visible object as the proxy handler");
 
 GEN(ProxyDecl) {
   Random& r = ctx.rng();
   Tree* t = T(ctx);
   Expression* target = cg.ObjectLike();
-  std::vector<Node*> handler;
-  int n = 1 + r.SmallCount(kProxyDeclMaxTraps.AsInt() - 1);
-  for (int i = 0; i < n; i++) {
-    const char* trap = r.Pick({"get", "set", "has", "deleteProperty", "ownKeys",
-                               "getOwnPropertyDescriptor", "apply", "construct",
-                               "getPrototypeOf", "defineProperty"});
-    std::string_view p1 = ctx.builder.FreshName("t");
-    std::string_view p2 = ctx.builder.FreshName("k");
-    GenContext nested = ctx.Nested(true, false, false, false);
-    nested.Declare(p1, JsType::kObject);
-    nested.Declare(p2, JsType::kUnknown);
-    CodeGen inner(nested);
-    Statements body =
-        inner.Body(nested, r.SmallCount(kProxyDeclTrapMaxStatements.AsInt()));
-    Expression* result = nullptr;
-    std::string_view trap_name = trap;
-    if (trap_name == "set" || trap_name == "has" ||
-        trap_name == "deleteProperty" || trap_name == "defineProperty") {
-      result = mk::Bool(t, true);
-    } else if (trap_name == "ownKeys") {
-      result =
-          mk::CallMethod(t, mk::Id(t, "Reflect"), "ownKeys", {mk::Id(t, p1)});
-    } else if (trap_name == "getOwnPropertyDescriptor") {
-      result =
-          mk::CallMethod(t, mk::Id(t, "Reflect"), "getOwnPropertyDescriptor",
-                         {mk::Id(t, p1), mk::Id(t, p2)});
-    } else if (trap_name == "getPrototypeOf") {
-      result = mk::CallMethod(t, mk::Id(t, "Reflect"), "getPrototypeOf",
-                              {mk::Id(t, p1)});
-    } else if (trap_name == "get") {
-      result = r.Coin() ? static_cast<Expression*>(
-                              mk::CallMethod(t, mk::Id(t, "Reflect"), "get",
-                                             {mk::Id(t, p1), mk::Id(t, p2)}))
-                        : inner.Value(JsType::kUnknown, 1);
-    } else {
-      result = inner.Value(JsType::kUnknown, 1);
-    }
-    body.push_back(mk::Return(t, result));
-    handler.push_back(
-        mk::Method(t, trap, mk::Function(t, "", {p1, p2}, std::move(body))));
+  Expression* handler_expr = nullptr;
+  if (r.Chance(kProxyDeclReuseHandlerChance())) {
+    handler_expr = cg.Variable(JsType::kObject);
   }
-  Push(out, cg.Declare(mk::New(t, mk::Id(t, "Proxy"),
-                               {target, mk::Object(t, std::move(handler))}),
+  if (handler_expr == nullptr) {
+    std::vector<Node*> handler;
+    int n = 1 + r.SmallCount(kProxyDeclMaxTraps.AsInt() - 1);
+    for (int i = 0; i < n; i++) {
+      const char* trap =
+          r.Pick({"get", "set", "has", "deleteProperty", "ownKeys",
+                  "getOwnPropertyDescriptor", "apply", "construct",
+                  "getPrototypeOf", "setPrototypeOf", "isExtensible",
+                  "preventExtensions", "defineProperty"});
+      std::string_view p1 = ctx.builder.FreshName("t");
+      std::string_view p2 = ctx.builder.FreshName("k");
+      GenContext nested = ctx.Nested(true, false, false, false);
+      nested.Declare(p1, JsType::kObject);
+      nested.Declare(p2, JsType::kUnknown);
+      CodeGen inner(nested);
+      Statements body =
+          inner.Body(nested, r.SmallCount(kProxyDeclTrapMaxStatements.AsInt()));
+      Expression* result = nullptr;
+      std::string_view trap_name = trap;
+      if (trap_name == "set" || trap_name == "has" ||
+          trap_name == "deleteProperty" || trap_name == "defineProperty") {
+        result = mk::Bool(t, true);
+      } else if (trap_name == "ownKeys" || trap_name == "getPrototypeOf" ||
+                 trap_name == "isExtensible" ||
+                 trap_name == "preventExtensions") {
+        result =
+            mk::CallMethod(t, mk::Id(t, "Reflect"), trap_name, {mk::Id(t, p1)});
+      } else if (trap_name == "getOwnPropertyDescriptor" ||
+                 trap_name == "setPrototypeOf") {
+        result = mk::CallMethod(t, mk::Id(t, "Reflect"), trap_name,
+                                {mk::Id(t, p1), mk::Id(t, p2)});
+      } else if (trap_name == "get") {
+        result = r.Coin() ? static_cast<Expression*>(
+                                mk::CallMethod(t, mk::Id(t, "Reflect"), "get",
+                                               {mk::Id(t, p1), mk::Id(t, p2)}))
+                          : inner.Value(JsType::kUnknown, 1);
+      } else {
+        result = inner.Value(JsType::kUnknown, 1);
+      }
+      body.push_back(mk::Return(t, result));
+      handler.push_back(
+          mk::Method(t, trap, mk::Function(t, "", {p1, p2}, std::move(body))));
+    }
+    handler_expr = mk::Object(t, std::move(handler));
+  }
+  Push(out, cg.Declare(mk::New(t, mk::Id(t, "Proxy"), {target, handler_expr}),
                        JsType::kObject, "proxy"));
+  return true;
+}
+
+bool IsSafeWithIdentifier(std::string_view s) {
+  if (!IsIdentifierName(s) || s == "__proto__" || s == "eval" ||
+      s == "arguments") {
+    return false;
+  }
+  static const char* const kReserved[] = {
+      "await",    "break",    "case",    "catch",  "class",      "const",
+      "continue", "debugger", "default", "delete", "do",         "else",
+      "enum",     "export",   "extends", "false",  "finally",    "for",
+      "function", "if",       "import",  "in",     "instanceof", "new",
+      "null",     "return",   "super",   "switch", "this",       "throw",
+      "true",     "try",      "typeof",  "var",    "void",       "while",
+      "with",     "yield"};
+  for (const char* kw : kReserved) {
+    if (s == kw) return false;
+  }
   return true;
 }
 
@@ -2951,9 +3877,26 @@ GEN(With) {
   Tree* t = T(ctx);
   WithStatement* w = t->New<WithStatement>();
   w->object = cg.ObjectLike();
-  Statements body =
+  Statements body;
+  int known_ops = 1 + r.SmallCount(2);
+  for (int i = 0; i < known_ops; i++) {
+    std::optional<KnownKey> key = RandomKnownKey(ctx, w->object, false);
+    if (!key.has_value() || !IsSafeWithIdentifier(key->name)) {
+      break;
+    }
+    if (key->arity >= 0 && r.Coin()) {
+      body.push_back(cg.Stmt(
+          mk::Call(t, mk::Id(t, key->name), cg.Arguments(0, key->arity))));
+    } else if (r.Coin()) {
+      body.push_back(
+          cg.Stmt(mk::Assign(t, mk::Id(t, key->name), cg.Value(key->type, 1))));
+    } else {
+      body.push_back(cg.Stmt(mk::Id(t, key->name)));
+    }
+  }
+  Statements rest =
       InnerBody(ctx, cg, false, false, kWithMaxStatements.AsInt());
-  (void)r;
+  body.insert(body.end(), rest.begin(), rest.end());
   w->body = mk::Block(t, std::move(body));
   Push(out, w);
   return true;
@@ -3017,6 +3960,11 @@ REDLINE_TUNABLE(kShapeChangeSharedPrefixConsumerChance,
                 1,
                 "probability of a function that loads the last field of each "
                 "sibling and is then optimized");
+REDLINE_TUNABLE(kShapeChangeConstructorOverrideChance,
+                "generators.ShapeChange.constructor_override_chance", 0.15, 0,
+                1,
+                "probability that ShapeChange overrides constructor or "
+                "Symbol.species");
 
 // A value for a field in the representation `rep`: 0 is a small integer, 1
 // a double, 2 a heap object and 3 a string.
@@ -3057,7 +4005,7 @@ void SharedPrefixFamily(GenContext& ctx, CodeGen& cg, Statements* out) {
   for (int i = 0; i < 2; i++) {
     Expression* value = cg.Value(JsType::kUnknown, 1);
     if (!value->Is<Identifier>() && !value->Is<NumericLiteral>()) {
-      Push(out, cg.Declare(value, Builder::GuessType(value)));
+      Push(out, cg.Declare(value, ctx.builder.GuessExpressionType(value)));
       value = mk::Id(t, LastDeclared(ctx));
     }
     prefix_values.push_back(value);
@@ -3252,6 +4200,10 @@ GEN(ShapeChange) {
     cg.DeclareMaybeGuarded(out,
                            mk::New(t, mk::Id(t, ctor_name), cg.Arguments(0, 2)),
                            JsType::kObject, "o", 1.0);
+    return true;
+  }
+  if (r.Chance(kShapeChangeConstructorOverrideChance())) {
+    EmitSpeciesOverride(ctx, cg, out);
     return true;
   }
   Identifier* object = cg.Variable(JsType::kObject);
@@ -3854,6 +4806,16 @@ REDLINE_TUNABLE(
 REDLINE_TUNABLE(kConstructorFunctionPrototypeMethodChance,
                 "generators.ConstructorFunction.prototype_method_chance", 0.3,
                 0, 1, "probability of adding a method to C.prototype");
+REDLINE_TUNABLE(kConstructorFunctionPolyGuardChance,
+                "generators.ConstructorFunction.poly_guard_chance", 0.4, 0, 1,
+                "probability that the new.target guard constructs "
+                "this?.constructor or Object");
+REDLINE_TUNABLE(kConstructorFunctionDirectCallChance,
+                "generators.ConstructorFunction.direct_call_chance", 0.25, 0, 1,
+                "probability that the constructor also runs without new");
+REDLINE_TUNABLE(kConstructorFunctionDirectGuardChance,
+                "generators.ConstructorFunction.direct_guard_chance", 0.5, 0, 1,
+                "probability that a direct constructor call runs in try-catch");
 
 // A constructor function in the old style, with `new.target`, `this.x =`
 // initialization, default and rest parameters, then instantiated.
@@ -3870,11 +4832,20 @@ GEN(ConstructorFunction) {
       cg.Parameters(nested, np, "a", &params, &types);
   CodeGen inner(nested);
   Statements body;
-  // if (!new.target) { throw ... } / return new C(...)
-  body.push_back(
-      mk::If(t, mk::Unary(t, UnaryOp::kNot, mk::NewTarget(t)),
-             mk::Block(t, {mk::Return(t, mk::New(t, mk::Id(t, name),
-                                                 {mk::Id(t, params[0])}))})));
+  if (r.Chance(kConstructorFunctionPolyGuardChance())) {
+    MemberExpression* opt_ctor = mk::Member(t, mk::This(t), "constructor");
+    opt_ctor->optional = true;
+    Expression* fallback = mk::Logical(
+        t, LogicalOp::kOr, mk::Chain(t, opt_ctor), mk::Id(t, "Object"));
+    body.push_back(
+        mk::If(t, mk::Unary(t, UnaryOp::kNot, mk::NewTarget(t)),
+               mk::Block(t, {mk::Return(t, mk::New(t, fallback, {}))})));
+  } else {
+    body.push_back(
+        mk::If(t, mk::Unary(t, UnaryOp::kNot, mk::NewTarget(t)),
+               mk::Block(t, {mk::Return(t, mk::New(t, mk::Id(t, name),
+                                                   {mk::Id(t, params[0])}))})));
+  }
   int fields = 1 + r.SmallCount(kConstructorFunctionMaxFields.AsInt() - 1);
   for (int i = 0; i < fields; i++) {
     Expression* value =
@@ -3899,12 +4870,14 @@ GEN(ConstructorFunction) {
   ctx.Declare(name, JsType::kClass);
   ctx.builder.RecordInfo(name).parameters = types;
   if (r.Chance(kConstructorFunctionPrototypeMethodChance())) {
-    // A prototype method that uses this.
+    // A prototype method that uses `this` or `this.constructor`.
     GenContext method_ctx = ctx.Nested(true, false, false, false);
     CodeGen method_cg(method_ctx);
     Statements mbody;
     mbody.push_back(mk::Return(
-        t, mk::Member(t, mk::This(t), ctx.env.property_names()[r.Index(12)])));
+        t, mk::Member(t, mk::This(t),
+                      r.Coin() ? "constructor"
+                               : ctx.env.property_names()[r.Index(12)])));
     Push(out, cg.Stmt(mk::Assign(
                   t,
                   mk::Member(t, mk::Member(t, mk::Id(t, name), "prototype"),
@@ -3915,6 +4888,11 @@ GEN(ConstructorFunction) {
   // and ConstructorCallGenerator, CodeGenerators.swift:666 and :2341).
   Push(out, cg.Declare(mk::New(t, mk::Id(t, name), cg.ArgumentsFor(types)),
                        JsType::kObject, "o"));
+  if (r.Chance(kConstructorFunctionDirectCallChance())) {
+    cg.DeclareMaybeGuarded(
+        out, mk::Call(t, mk::Id(t, name), cg.ArgumentsFor(types)),
+        JsType::kObject, "o", kConstructorFunctionDirectGuardChance());
+  }
   return true;
 }
 
@@ -4506,6 +5484,9 @@ GEN(IntlOps) {
 
 REDLINE_TUNABLE(kTypedArrayOpsMaxArgs, "generators.TypedArrayOps.max_args", 2,
                 0, 16, "most arguments passed to a typed array method");
+REDLINE_TUNABLE(kTypedArrayOpsDetachKeyChance,
+                "generators.TypedArrayOps.detach_key_chance", 0.2, 0, 1,
+                "probability of setting a detach key before detaching");
 
 GEN(TypedArrayOps) {
   Random& r = ctx.rng();
@@ -4543,14 +5524,34 @@ GEN(TypedArrayOps) {
       Push(out, cg.Declare(mk::Index(t, a, cg.Integer()), JsType::kNumber));
       break;
     case 2:
-      Push(out, cg.Stmt(mk::Native(t, "ArrayBufferDetach",
-                                   {mk::Member(t, a, "buffer")})));
+      if (r.Chance(kTypedArrayOpsDetachKeyChance())) {
+        std::string_view key = ctx.builder.FreshName("k");
+        Push(out, mk::Let(t, key, cg.Value(JsType::kUnknown, 1)));
+        ctx.Declare(key, JsType::kUnknown);
+        Push(out,
+             cg.Stmt(mk::Native(t, "ArrayBufferSetDetachKey",
+                                {mk::Member(t, a, "buffer"), mk::Id(t, key)})));
+        if (r.Chance(0.8)) {
+          Push(out, cg.Stmt(mk::Native(
+                        t, "ArrayBufferDetach",
+                        {mk::Member(t, a, "buffer"), mk::Id(t, key)})));
+        }
+      } else {
+        Push(out, cg.Stmt(mk::Native(t, "ArrayBufferDetach",
+                                     {mk::Member(t, a, "buffer")})));
+      }
       break;
     case 3:
-      Push(out, cg.Declare(mk::CallMethod(
-                               t, a, r.Pick({"fill", "map", "sort"}),
-                               cg.Arguments(0, kTypedArrayOpsMaxArgs.AsInt())),
-                           JsType::kUnknown));
+      if (r.Coin()) {
+        Push(out, cg.Declare(cg.MethodCall(a, JsType::kTypedArray),
+                             JsType::kUnknown));
+      } else {
+        Push(out,
+             cg.Declare(
+                 mk::CallMethod(t, a, r.Pick({"fill", "map", "sort"}),
+                                cg.Arguments(0, kTypedArrayOpsMaxArgs.AsInt())),
+                 JsType::kUnknown));
+      }
       break;
     case 4:
       // original new from buffer, modified to use all kinds
@@ -4648,24 +5649,41 @@ REDLINE_TUNABLE(kTemporalOpsGuardChance, "generators.TemporalOps.guard_chance",
                 0.9, 0, 1,
                 "probability that a call is wrapped in try/catch (values from "
                 "the program can make it throw)");
+REDLINE_TUNABLE(kTemporalOpsEdgeYearChance,
+                "generators.TemporalOps.edge_year_chance", 0.35, 0, 1,
+                "probability that TemporalOps picks a boundary year");
 
 GEN(TemporalOps) {
   Random& r = ctx.rng();
   Tree* t = T(ctx);
 
+  auto pick_year = [&](double fallback) -> double {
+    if (r.Chance(kTemporalOpsEdgeYearChance())) {
+      static constexpr double kEdgeYears[] = {1.0, 1970.0, 2000.0, 9999.0,
+                                              -1.0};
+      return kEdgeYears[r.Index(sizeof(kEdgeYears) / sizeof(kEdgeYears[0]))];
+    }
+    return fallback;
+  };
+
   auto create_temporal = [&](const char* ctor) -> Expression* {
     std::vector<Expression*> args;
     if (std::string_view(ctor) == "PlainDate") {
-      args = {mk::Num(t, 2023), mk::Num(t, static_cast<double>(r.Range(1, 13))),
-              mk::Num(t, static_cast<double>(r.Range(1, 29)))};
+      args = {mk::Num(t, pick_year(2023)),
+              mk::Num(t, static_cast<double>(r.Range(1, 12))),
+              mk::Num(t, static_cast<double>(r.Range(1, 28)))};
+    } else if (std::string_view(ctor) == "PlainYearMonth") {
+      args = {mk::Num(t, pick_year(2023)),
+              mk::Num(t, static_cast<double>(r.Range(1, 12)))};
     } else if (std::string_view(ctor) == "PlainTime") {
-      args = {mk::Num(t, static_cast<double>(r.Range(0, 24))),
-              mk::Num(t, static_cast<double>(r.Range(0, 60))),
-              mk::Num(t, static_cast<double>(r.Range(0, 60)))};
+      args = {mk::Num(t, static_cast<double>(r.Range(0, 23))),
+              mk::Num(t, static_cast<double>(r.Range(0, 59))),
+              mk::Num(t, static_cast<double>(r.Range(0, 59)))};
     } else if (std::string_view(ctor) == "PlainDateTime") {
-      args = {mk::Num(t, 2023), mk::Num(t, static_cast<double>(r.Range(1, 13))),
-              mk::Num(t, static_cast<double>(r.Range(1, 29))),
-              mk::Num(t, static_cast<double>(r.Range(0, 24)))};
+      args = {mk::Num(t, pick_year(2023)),
+              mk::Num(t, static_cast<double>(r.Range(1, 12))),
+              mk::Num(t, static_cast<double>(r.Range(1, 28))),
+              mk::Num(t, static_cast<double>(r.Range(0, 23)))};
     } else if (std::string_view(ctor) == "ZonedDateTime") {
       args = {mk::BigInt(t, "123456789"), mk::Str(t, "UTC")};
     } else if (std::string_view(ctor) == "Instant") {
@@ -4678,23 +5696,27 @@ GEN(TemporalOps) {
                    std::move(args));
   };
 
-  const char* ctors[] = {"PlainDate",     "PlainTime", "PlainDateTime",
-                         "ZonedDateTime", "Instant",   "Duration"};
+  const char* ctors[] = {"PlainDate",     "PlainYearMonth", "PlainTime",
+                         "PlainDateTime", "ZonedDateTime",  "Instant",
+                         "Duration"};
   const char* ctor = ctors[r.Index(sizeof(ctors) / sizeof(ctors[0]))];
 
   Expression* construct = create_temporal(ctor);
   Statement* decl = cg.Declare(construct, JsType::kObject, "temp");
   Push(out, decl);
-  Identifier* a = mk::Id(t, decl->Cast<VariableDeclaration>()
-                                ->declarations[0]
-                                ->target->Cast<Identifier>()
-                                ->name);
+  const std::string_view var = decl->Cast<VariableDeclaration>()
+                                   ->declarations[0]
+                                   ->target->Cast<Identifier>()
+                                   ->name;
 
   int calls = 1 + static_cast<int>(r.Index(
                       static_cast<size_t>(kTemporalOpsMaxCalls.AsInt())));
   for (int i = 0; i < calls; i++) {
-    std::vector<const char*> all_methods = {"add",   "subtract", "with",
-                                            "round", "compare",  "toString"};
+    std::vector<const char*> all_methods = {"add", "subtract", "with",
+                                            "compare", "toString"};
+    if (std::string_view(ctor) != "PlainYearMonth") {
+      all_methods.push_back("round");
+    }
     if (std::string_view(ctor) != "Duration") {
       all_methods.push_back("since");
       all_methods.push_back("until");
@@ -4703,45 +5725,59 @@ GEN(TemporalOps) {
     std::vector<Expression*> args;
 
     if (std::string_view(method) == "compare") {
-      args = {a, create_temporal(ctor)};
+      args = {mk::Id(t, var), create_temporal(ctor)};
       Expression* call =
           mk::CallMethod(t, mk::Member(t, mk::Id(t, "Temporal"), ctor), method,
                          std::move(args));
       cg.DeclareMaybeGuarded(out, call, JsType::kNumber, "r",
                              kTemporalOpsGuardChance());
     } else if (std::string_view(method) == "toString") {
-      if (r.Coin()) {
+      if (r.Coin() && std::string_view(ctor) != "PlainYearMonth") {
         args = {mk::Object(
             t, {mk::Prop(t, "fractionalSecondDigits", mk::Str(t, "auto"))})};
       }
-      Expression* call = mk::CallMethod(t, a, method, std::move(args));
+      Expression* call =
+          mk::CallMethod(t, mk::Id(t, var), method, std::move(args));
       cg.DeclareMaybeGuarded(out, call, JsType::kString, "r",
                              kTemporalOpsGuardChance());
     } else if (std::string_view(method) == "with") {
       if (std::string_view(ctor) == "PlainDate" ||
+          std::string_view(ctor) == "PlainYearMonth" ||
           std::string_view(ctor) == "PlainDateTime" ||
           std::string_view(ctor) == "ZonedDateTime") {
-        args = {mk::Object(t, {mk::Prop(t, "year", mk::Num(t, 2024))})};
+        args = {
+            mk::Object(t, {mk::Prop(t, "year", mk::Num(t, pick_year(2024)))})};
       } else if (std::string_view(ctor) == "PlainTime") {
         args = {mk::Object(t, {mk::Prop(t, "hour", mk::Num(t, 12))})};
       } else if (std::string_view(ctor) == "Duration") {
         args = {mk::Object(t, {mk::Prop(t, "hours", mk::Num(t, 5))})};
       } else {
-        args = {a};
+        args = {mk::Id(t, var)};
       }
-      Expression* call = mk::CallMethod(t, a, method, std::move(args));
+      Expression* call =
+          mk::CallMethod(t, mk::Id(t, var), method, std::move(args));
       cg.DeclareMaybeGuarded(out, call, JsType::kUnknown, "r",
                              kTemporalOpsGuardChance());
     } else if (std::string_view(method) == "add" ||
                std::string_view(method) == "subtract") {
-      args = {create_temporal("Duration")};
-      Expression* call = mk::CallMethod(t, a, method, std::move(args));
+      if (std::string_view(ctor) == "PlainYearMonth") {
+        args = {mk::Object(
+            t, {mk::Prop(t, "years",
+                         mk::Num(t, static_cast<double>(r.Range(0, 3)))),
+                mk::Prop(t, "months",
+                         mk::Num(t, static_cast<double>(r.Range(0, 12))))})};
+      } else {
+        args = {create_temporal("Duration")};
+      }
+      Expression* call =
+          mk::CallMethod(t, mk::Id(t, var), method, std::move(args));
       cg.DeclareMaybeGuarded(out, call, JsType::kUnknown, "r",
                              kTemporalOpsGuardChance());
     } else if (std::string_view(method) == "since" ||
                std::string_view(method) == "until") {
       args = {create_temporal(ctor)};
-      Expression* call = mk::CallMethod(t, a, method, std::move(args));
+      Expression* call =
+          mk::CallMethod(t, mk::Id(t, var), method, std::move(args));
       cg.DeclareMaybeGuarded(out, call, JsType::kUnknown, "r",
                              kTemporalOpsGuardChance());
     } else {
@@ -4753,7 +5789,8 @@ GEN(TemporalOps) {
         args = {
             mk::Object(t, {mk::Prop(t, "smallestUnit", mk::Str(t, "second"))})};
       }
-      Expression* call = mk::CallMethod(t, a, method, std::move(args));
+      Expression* call =
+          mk::CallMethod(t, mk::Id(t, var), method, std::move(args));
       cg.DeclareMaybeGuarded(out, call, JsType::kUnknown, "r",
                              kTemporalOpsGuardChance());
     }
@@ -4763,6 +5800,21 @@ GEN(TemporalOps) {
 
 REDLINE_TUNABLE(kMapSetOpsMaxOps, "generators.MapSetOps.max_ops", 4, 1, 64,
                 "most set/get/has/delete operations on the map or set");
+REDLINE_TUNABLE(kMapSetOpsInitChance, "generators.MapSetOps.init_chance", 0.5,
+                0, 1,
+                "probability that a new Map or Set starts with initial "
+                "elements");
+REDLINE_TUNABLE(kMapSetOpsSetMethodChance,
+                "generators.MapSetOps.set_method_chance", 0.5, 0, 1,
+                "probability that a Set step calls an ES2025 set method");
+REDLINE_TUNABLE(kMapSetOpsGetOrInsertChance,
+                "generators.MapSetOps.get_or_insert_chance", 0.35, 0, 1,
+                "probability that a Map step calls getOrInsert or "
+                "getOrInsertComputed");
+REDLINE_TUNABLE(kMapSetOpsGuardChance, "generators.MapSetOps.guard_chance", 0.8,
+                0, 1,
+                "probability that a callback or set-like call runs in "
+                "try-catch");
 
 GEN(MapSetOps) {
   Random& r = ctx.rng();
@@ -4770,9 +5822,23 @@ GEN(MapSetOps) {
   bool map = r.Coin();
   Identifier* m = cg.Variable(map ? JsType::kMap : JsType::kSet);
   if (m == nullptr) {
-    Statement* decl =
-        cg.Declare(mk::New(t, mk::Id(t, map ? "Map" : "Set"), {}),
-                   map ? JsType::kMap : JsType::kSet, map ? "map" : "set");
+    std::vector<Expression*> init_args;
+    if (r.Chance(kMapSetOpsInitChance())) {
+      int init_n = 1 + r.SmallCount(2);
+      std::vector<Expression*> entries;
+      for (int i = 0; i < init_n; i++) {
+        if (map) {
+          entries.push_back(mk::Array(t, {cg.Value(JsType::kUnknown, 1),
+                                          cg.Value(JsType::kUnknown, 1)}));
+        } else {
+          entries.push_back(cg.Value(JsType::kUnknown, 1));
+        }
+      }
+      init_args.push_back(mk::Array(t, std::move(entries)));
+    }
+    Statement* decl = cg.Declare(
+        mk::New(t, mk::Id(t, map ? "Map" : "Set"), std::move(init_args)),
+        map ? JsType::kMap : JsType::kSet, map ? "map" : "set");
     Push(out, decl);
     m = mk::Id(t, decl->Cast<VariableDeclaration>()
                       ->declarations[0]
@@ -4783,6 +5849,21 @@ GEN(MapSetOps) {
   for (int i = 0; i < n; i++) {
     Identifier* o = mk::Id(t, m->name);
     if (map) {
+      if (r.Chance(kMapSetOpsGetOrInsertChance())) {
+        if (r.Coin()) {
+          Push(out, cg.Declare(mk::CallMethod(t, o, "getOrInsert",
+                                              {cg.Value(JsType::kUnknown, 1),
+                                               cg.Value(JsType::kUnknown, 1)}),
+                               JsType::kUnknown));
+        } else {
+          Expression* call = mk::CallMethod(t, o, "getOrInsertComputed",
+                                            {cg.Value(JsType::kUnknown, 1),
+                                             cg.ArgumentFor(arg::Callback(1))});
+          cg.DeclareMaybeGuarded(out, call, JsType::kUnknown, "v",
+                                 kMapSetOpsGuardChance());
+        }
+        continue;
+      }
       switch (r.Index(4)) {
         case 0:
           Push(out, cg.Stmt(mk::CallMethod(t, o, "set",
@@ -4805,6 +5886,23 @@ GEN(MapSetOps) {
           break;
       }
     } else {
+      if (r.Chance(kMapSetOpsSetMethodChance())) {
+        static constexpr std::string_view kSetMethods[] = {
+            "union",         "intersection",
+            "difference",    "symmetricDifference",
+            "isSubsetOf",    "isSupersetOf",
+            "isDisjointFrom"};
+        const size_t idx =
+            r.Index(sizeof(kSetMethods) / sizeof(kSetMethods[0]));
+        const std::string_view method = kSetMethods[idx];
+        const bool returns_bool = idx >= 4;
+        Expression* call =
+            mk::CallMethod(t, o, method, {cg.ArgumentFor(arg::SetLike())});
+        cg.DeclareMaybeGuarded(
+            out, call, returns_bool ? JsType::kBoolean : JsType::kSet,
+            returns_bool ? "b" : "set", kMapSetOpsGuardChance());
+        continue;
+      }
       switch (r.Index(3)) {
         case 0:
           Push(out, cg.Stmt(mk::CallMethod(t, o, "add",
@@ -5831,45 +6929,134 @@ GEN(NewTargetExpr) {
 REDLINE_TUNABLE(kWorkerTerminateChance,
                 "generators.WorkerSpawn.terminate_chance", 0.5, 0, 1,
                 "chance to terminate the worker immediately");
+REDLINE_TUNABLE(kWorkerMaxStatements, "generators.WorkerSpawn.max_statements",
+                4, 1, 32, "most generated statements inside a worker handler");
 
 GEN(WorkerSpawn) {
+  static thread_local bool in_worker = false;
+  if (in_worker) {
+    return false;
+  }
+  struct WorkerGuard {
+    explicit WorkerGuard(bool* f) : flag(f) { *flag = true; }
+    ~WorkerGuard() { *flag = false; }
+    bool* flag;
+  } guard(&in_worker);
+
   Tree* t = T(ctx);
   Random& r = ctx.rng();
-
-  std::string_view w_name = ctx.builder.FreshName("w");
-  Expression* worker_src =
-      mk::Str(t, "onmessage = function(e) { postMessage(e.data); }");
-  Expression* worker_opts =
-      mk::Object(t, {mk::Prop(t, "type", mk::Str(t, "string"))});
+  std::string_view sab_name = ctx.builder.FreshName("sab");
+  std::string_view view_name = ctx.builder.FreshName("view");
   Push(out,
-       mk::Let(t, w_name,
-               mk::New(t, mk::Id(t, "Worker"), {worker_src, worker_opts})));
-  ctx.Declare(w_name, JsType::kUnknown);
+       mk::Let(t, sab_name,
+               mk::New(t, mk::Id(t, "SharedArrayBuffer"), {mk::Num(t, 16)})));
+  ctx.Declare(sab_name, JsType::kArrayBuffer);
+  Push(out,
+       mk::Let(t, view_name,
+               mk::New(t, mk::Id(t, "Int32Array"), {mk::Id(t, sab_name)})));
+  ctx.Declare(view_name, JsType::kTypedArray);
 
-  Push(out, cg.Stmt(mk::CallMethod(t, mk::Id(t, w_name), "postMessage",
-                                   {cg.Value(JsType::kUnknown, 1)})));
-
-  if (r.Chance(kWorkerTerminateChance())) {
-    Push(out, cg.Stmt(mk::CallMethod(t, mk::Id(t, w_name), "terminate", {})));
-  } else {
-    // If we don't terminate, we can call getMessage to block and wait for the
-    // message! But getMessage might hang if serialization fails! The
-    // instructions say: "Keep runs deterministic and bounded: no long-lived
-    // threads, and always terminate or await so programs finish within the 400
-    // ms timeout." Let's just always terminate it! But wait! The tunable says
-    // "chance to terminate immediately". If I don't terminate immediately, I
-    // can do some operations and THEN terminate it. Actually, d8 cleans up
-    // workers on exit, so if we just run, it terminates at the end. BUT to be
-    // safe, I will just call terminate() at the end unconditionally, and maybe
-    // getMessage() optionally.
-
-    if (r.Coin()) {
-      Push(out,
-           cg.Stmt(mk::CallMethod(t, mk::Id(t, w_name), "getMessage", {})));
-    }
-    Push(out, cg.Stmt(mk::CallMethod(t, mk::Id(t, w_name), "terminate", {})));
+  // Worker isolate sees no outer lexical bindings.
+  GenContext wctx(ctx.builder, ctx.generators, ctx.env);
+  wctx.syntax.in_function = true;
+  wctx.syntax.strict = ctx.syntax.strict;
+  wctx.syntax.has_this = true;
+  wctx.syntax.has_arguments = true;
+  wctx.depth = ctx.depth + 1;
+  wctx.max_depth = ctx.max_depth;
+  int argc = static_cast<int>(r.Range(1, 2));
+  std::vector<std::string_view> wparams;
+  std::vector<Expression*> init_args;
+  for (int i = 0; i < argc; i++) {
+    std::string_view p = ctx.builder.FreshName("a");
+    wparams.push_back(p);
+    JsType pt = r.Coin() ? JsType::kNumber : JsType::kBoolean;
+    wctx.Declare(p, pt);
+    init_args.push_back(pt == JsType::kNumber
+                            ? mk::Num(t, static_cast<double>(r.Range(-16, 64)))
+                            : cg.Boolean());
   }
 
+  std::string_view e_name = ctx.builder.FreshName("e");
+  std::string_view wview_name = ctx.builder.FreshName("v");
+  std::string_view data_name = ctx.builder.FreshName("d");
+  GenContext mctx = wctx;
+  mctx.Declare(e_name, JsType::kObject, /*is_constant=*/true);
+  mctx.Declare(wview_name, JsType::kTypedArray, /*is_constant=*/true);
+  mctx.Declare(data_name, JsType::kUnknown, /*is_constant=*/true);
+  CodeGen mcg(mctx);
+  Statements try_body = {
+      mk::Const(t, data_name, mk::Member(t, mk::Id(t, e_name), "data")),
+      mk::If(
+          t,
+          mk::Binary(t, BinaryOp::kInstanceof, mk::Id(t, data_name),
+                     mk::Id(t, "SharedArrayBuffer")),
+          mk::Block(
+              t, {mk::ExprStmt(t, mk::Assign(t, mk::Id(t, wview_name),
+                                             mk::New(t, mk::Id(t, "Int32Array"),
+                                                     {mk::Id(t, data_name)}))),
+                  mk::ExprStmt(
+                      t, mk::CallMethod(t, mk::Id(t, "Atomics"), "add",
+                                        {mk::Id(t, wview_name), mk::Num(t, 0),
+                                         mk::Num(t, 1)}))}))};
+  Statements mgen =
+      mcg.Body(mctx, 1 + r.SmallCount(kWorkerMaxStatements.AsInt() - 1));
+  try_body.insert(try_body.end(), mgen.begin(), mgen.end());
+
+  Expression* reply = mk::Cond(
+      t,
+      mk::Binary(t, BinaryOp::kStrictNotEq, mk::Id(t, wview_name), mk::Null(t)),
+      mk::CallMethod(t, mk::Id(t, "Atomics"), "load",
+                     {mk::Id(t, wview_name), mk::Num(t, 0)}),
+      mk::Num(t, 0));
+  Statements fin_body = {mk::Try(
+      t, {mk::ExprStmt(t, mk::Call(t, mk::Id(t, "postMessage"), {reply}))},
+      ctx.builder.FreshName("err"),
+      {mk::ExprStmt(t,
+                    mk::Call(t, mk::Id(t, "postMessage"), {mk::Num(t, 0)}))})};
+  Statements onmsg_body = {
+      mk::Let(t, wview_name, mk::Null(t)),
+      mk::Try(t, std::move(try_body), ctx.builder.FreshName("err"), {},
+              &fin_body)};
+
+  // Assign `onmessage` first so uncaught init statements cannot drop messages.
+  CodeGen wcg(wctx);
+  Statements winit = wcg.Body(wctx, 1 + r.SmallCount(1));
+  Statements fn_body = {
+      mk::ExprStmt(
+          t, mk::Assign(t, mk::Id(t, "onmessage"),
+                        mk::Function(t, "", {e_name}, std::move(onmsg_body)))),
+      mk::Try(t, std::move(winit), ctx.builder.FreshName("err"), {})};
+  Expression* worker_fn =
+      mk::Function(t, "", std::move(wparams), std::move(fn_body));
+  Expression* worker_opts = mk::Object(
+      t, {mk::Prop(t, "type", mk::Str(t, "function")),
+          mk::Prop(t, "arguments", mk::Array(t, std::move(init_args)))});
+
+  std::string_view w_name = ctx.builder.FreshName("w");
+  Push(out, mk::Let(t, w_name,
+                    mk::New(t, mk::Id(t, "Worker"), {worker_fn, worker_opts})));
+  ctx.Declare(w_name, JsType::kUnknown);
+
+  if (r.Chance(kWorkerTerminateChance())) {
+    if (r.Coin()) {
+      Push(out, cg.Stmt(mk::CallMethod(t, mk::Id(t, w_name), "postMessage",
+                                       {mk::Id(t, sab_name)})));
+    }
+    Push(out, cg.Stmt(mk::CallMethod(t, mk::Id(t, w_name), "terminate", {})));
+  } else {
+    Statements roundtrip = {
+        mk::ExprStmt(t, mk::CallMethod(t, mk::Id(t, w_name), "postMessage",
+                                       {mk::Id(t, sab_name)})),
+        mk::ExprStmt(t, mk::CallMethod(t, mk::Id(t, "Atomics"), "add",
+                                       {mk::Id(t, view_name), mk::Num(t, 0),
+                                        mk::Num(t, 1)})),
+        mk::ExprStmt(t,
+                     mk::CallMethod(t, mk::Id(t, w_name), "getMessage", {}))};
+    Push(out,
+         mk::Try(t, std::move(roundtrip), ctx.builder.FreshName("err"), {}));
+    Push(out, cg.Stmt(mk::CallMethod(t, mk::Id(t, w_name), "terminate", {})));
+  }
   return true;
 }
 
@@ -5963,8 +7150,8 @@ std::unique_ptr<GeneratorSet> GeneratorSet::CreateDefault() {
       kNoRequirement, GenStringOps);
   add("TypedArrayOps", "typed array element access, detach, views", 1.5,
       kNoRequirement, GenTypedArrayOps);
-  add("MapSetOps", "Map/Set set/get/has/delete", 1, kNoRequirement,
-      GenMapSetOps);
+  add("MapSetOps", "Map/Set basic and ES2025 set/insert operations", 1,
+      kNoRequirement, GenMapSetOps);
   add("IntlOps",
       "Intl services with valid locales and options, locale-aware primitive "
       "methods",
@@ -6086,7 +7273,7 @@ std::unique_ptr<GeneratorSet> GeneratorSet::CreateDefault() {
   for (const ApiGenerator& g : ApiGenerators()) {
     add(g.name, g.description, g.weight, g.requirements, g.fn);
   }
-  add("WorkerSpawn", "spawn a WebWorker", 1.0, kNoRequirement, GenWorkerSpawn);
+  add("WorkerSpawn", "spawn a WebWorker", 1.0, kRecursive, GenWorkerSpawn);
   add("ArrowStore", "store an object or smi to an arrow function", 1.0,
       kNoRequirement, GenArrowStore);
   add("DynamicFunctionTransition", "dynamic function with map transition", 1.0,

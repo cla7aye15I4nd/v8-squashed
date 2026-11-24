@@ -186,9 +186,11 @@ Like Fuzzilli's `CodeGenMutator`, `CodeGen` also inserts into existing class bod
 Generators record the facts for the variables that they declare. For variables of earlier mutations, the `Builder` derives them from the tree, for example from the arguments of the first call of a function.
 A new function gets parameter types that enough visible variables have, as in Fuzzilli. Calls then pass values of these types, so that the function gets stable feedback.
 `JitOptimize` and `LazyDeopt` reuse at most two argument lists for the warm-up calls and the optimized call. `HotLoop` calls a function 100 times with the same arguments.
+`JitOptimize`, `JitBaseline` and `HotLoop` can also compile a method, a getter, a setter or a class constructor of a visible variable.
+The calls then use the receiver (`o.m()`, `get.call(o)`, `new C()`). Thus `this` and the home object have their usual values in the compiled code.
 
-A **mutator** changes a program. Mutators insert generated code (`CodeGen`, `JitStress`), change code in place (`Input`, `Operation`, `Expression`, `Call`),
-copy code from a partner (`Splice`, `Combine`), change the structure (`Remove`, `Wrap`, `Duplicate`, `Reorder`), or ask the target (`Explore`, `Probing`).
+A **mutator** changes a program. Mutators insert generated code (`CodeGen`, `JitStress`) or change code in place (`Input`, `Operation`, `Expression`, `PropertyAccessor`, `Call`, `CallSiteStress`).
+Other mutators copy code from a partner (`Splice`, `Combine`), change the structure (`Remove`, `Wrap`, `Duplicate`, `Reorder`), or ask the target (`Explore`, `Probing`, `Fixup`).
 `redline mutate --list` shows the mutators and generators with their weights. A weight of 0 disables a mutator or a generator.
 
 One link of the chain works like this:
@@ -216,9 +218,12 @@ The prefix values are primitives, arrays, objects, regexps, symbols, typed array
 It also adds resizable buffers and special values such as `%GetHoleNaN()`.
 
 **Runtime-assisted mutators.** A type guess from the source does not tell which properties a value has. `Explore` and `Probing` ask the target instead.
-They insert probes, and the worker runs the instrumented program once with a helper script in front.
+They insert probes, and the worker runs the instrumented program once with a helper script in front, at 4 times the timeout.
 The helper writes its findings to the fuzzout channel. The mutator turns the findings into ordinary code and removes the probes.
 `Explore` examines a variable and does an action that fits its value. `Probing` installs properties that the program asks an object for but the object does not have.
+As in Fuzzilli, the probes of `Explore` and `Probing` go right after the definitions of some variables. A cap and a lower cap in loop bodies limit their number.
+There are no probes in a function that the program gives to `new Worker(...)`, because the helper does not exist in the worker.
+`Fixup` removes the `try/catch` guards of exception salvage whose handler does not run. A body that declares `let`, `const`, `class` or a function stays in a block.
 
 **Environment.** Generators use a hand-written model of the globals, methods and runtime functions of d8 (`core/environment.h`).
 The typed part of the model (`core/environment_typed.cc`, after Fuzzilli's JavaScriptEnvironment) gives a builtin its full parameter list.
@@ -282,7 +287,7 @@ For each execution, Redline writes the script, sends a command and waits for a s
   A mutant gets the flags of its parents (`Program::flags`, at most 6). A worker prefers a seed that shares a flag with its process (`flags.seed_affinity_tries`).
   Redline saves `Program::flags` in the `// redline-flags:` comment of a corpus file (5.7). A program that Redline reads again from `DIR/corpus` gets these flags back.
   If a process with new random flags stops before its handshake, Redline starts it again without them. `D8FlagBlacklist` then blocks the flag that stopped it for the rest of the session. A pinned process keeps its flags.
-- After an infrastructure failure, Redline tries the execution again once with a fresh target. Ten such failures in a row stop the session.
+- After an infrastructure failure, Redline tries the execution again once with a fresh target. A script larger than the REPRL channel limit fails at once without a retry. Ten such failures in a row stop the session.
 - At the start, `redline fuzz` makes the target fail a CHECK and a DCHECK on purpose (`Fuzzer::CheckTargetCrashes`), like the startup tests of Fuzzilli.
   If the CHECK does not crash the target, the session does not start. If the DCHECK does not crash it, the session also does not start.
   With `--allow-no-dcheck`, Redline only writes a warning for the DCHECK.
@@ -383,7 +388,7 @@ For a crash that reproduces alone, the oracle is "the program crashes with the s
 
 | Reducer | What it removes or replaces |
 |---|---|
-| `statements` | chunks of statements of halving size from the end of each statement list, down to single statements |
+| `statements` | balanced contiguous blocks on medium or large statement lists, then single statements from the end |
 | `unwrap` | a block, an `if`, a loop, a `try` or an immediately invoked function, replaced by its body |
 | `lists` | call arguments, array elements, object properties, class members, declarators and parameters |
 | `expressions` | an expression, replaced by one of its operands or by a constant |
@@ -391,14 +396,18 @@ For a crash that reproduces alone, the oracle is "the program crashes with the s
 | `dataflow` | the top-level statements that the rest of the program does not use, from a def-use graph of the scope analysis |
 
 The default order is `dataflow`, `statements`, `unwrap`, `lists`, `expressions` (`Minimizer::DefaultOrder`). `stages.minimize.reducers` sets another list.
-Each time that `expressions` starts, it can use only `expressions_share` of the remaining tests of a corpus program, because most of its tests keep no reduction.
-The crash minimizer gives `expressions` all of its tests.
+Each time that `expressions` starts on a corpus program, it uses at most `expressions_share` of the remaining tests.
+It also stops after `minimizer.expressions.max_consecutive_failures` rejected probes in a row.
+The crash minimizer sets `expressions_share` to 1, so it keeps `expressions` uncapped.
 The def-use graph only proposes a cut. The oracle decides, because globals, prototypes or getters can connect statements that share no binding.
 
 - The minimizer runs its reducers in rounds until a round changes nothing or the budget ends.
   A reducer edits the tree and asks the oracle. If the oracle says no, the reducer undoes the edit.
-- The budget limits the tests, the time and the rounds. It has fewer tests for slow programs (`target_time_ms`).
-  Crashes have a larger budget (`crash_minimizer`), because they are rare.
+- The budget limits the tests, the time and the rounds.
+  For corpus programs, the minimizer scales the test cap to `target_time_ms` divided by the measured probe run time, down to `min_tests`.
+  The crash minimizer sets `target_time_ms` to 0 so crashes stay uncapped.
+- On medium and large statement lists, `statements` tries balanced contiguous blocks from the end down to `minimizer.statements.min_chunk_size`.
+  It stops chunking early when `minimizer.statements.max_empty_levels` levels in a row keep no cut, then sweeps single statements.
 - Each test has a short timeout from the run time of the program (`probe_timeout_*`), because a reduction can make an endless loop.
   After each kept reduction, the timeout follows the run time of the probe of that reduction (`probe_timeout_tighten_*`).
   The timeout does not become longer than the first timeout.

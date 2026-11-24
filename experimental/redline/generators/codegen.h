@@ -108,7 +108,8 @@ class CodeGen {
                                               int depth = 1);
   // A new object of a builtin type of the model (`new DataView(buf)`,
   // `Temporal.PlainDate.from(...)`, `[].values()`), or nullptr.
-  fast::Expression* Instance(JsType type, int depth = 1);
+  fast::Expression* Instance(JsType type, int depth = 1,
+                             std::string_view hint = {});
   // `Name`, or `A.B` for a dotted global of the model (`Temporal.PlainDate`).
   fast::Expression* GlobalPath(std::string_view path);
   // A visible variable whose type has methods of its own in the model (not
@@ -171,6 +172,13 @@ class CodeGen {
   static fast::UnaryOp RandomUnaryOp(Random& rng);
   static fast::AssignOp RandomCompoundAssignOp(Random& rng);
   static fast::LogicalOp RandomLogicalOp(Random& rng);
+
+  // Valid-by-construction regular expression helpers shared with mutators.
+  static std::string RandomRegExpFlags(Random& rng);
+  static std::string RandomRegExpPattern(Random& rng, bool unicode, bool sets);
+  // A short pattern piece without capturing groups or backreferences, safe to
+  // combine with an existing pattern of the same `unicode` and `sets` mode.
+  static std::string RandomRegExpPiece(Random& rng, bool unicode, bool sets);
 
  private:
   struct ExprDepthGuard {

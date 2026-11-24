@@ -72,16 +72,15 @@ constexpr bool CanTriggerGC(T... properties) {
   F(AtomicsXor, 3, 1)                                  \
   F(SetAllowAtomicsWait, 1, 1)
 
-#define FOR_EACH_INTRINSIC_BIGINT(F, I)                               \
-  F(BigIntCompareToNumber, 3, 1)                                      \
-  F(BigIntCompareToString, 3, 1)                                      \
-  F(BigIntEqualToBigInt, 2, 1, RuntimeCallProperty::kCannotTriggerGC) \
-  F(BigIntEqualToNumber, 2, 1)                                        \
-  F(BigIntEqualToString, 2, 1)                                        \
-  F(BigIntExponentiate, 2, 1)                                         \
-  F(BigIntToNumber, 1, 1)                                             \
-  F(BigIntUnaryOp, 2, 1)                                              \
-  F(ToBigInt, 1, 1)                                                   \
+#define FOR_EACH_INTRINSIC_BIGINT(F, I) \
+  F(BigIntCompareToNumber, 3, 1)        \
+  F(BigIntCompareToString, 3, 1)        \
+  F(BigIntEqualToNumber, 2, 1)          \
+  F(BigIntEqualToString, 2, 1)          \
+  F(BigIntExponentiate, 2, 1)           \
+  F(BigIntToNumber, 1, 1)               \
+  F(BigIntUnaryOp, 2, 1)                \
+  F(ToBigInt, 1, 1)                     \
   F(ToBigIntConvertNumber, 1, 1)
 
 #define FOR_EACH_THROWING_INTRINSIC_CLASSES(F, I) \
@@ -696,7 +695,7 @@ constexpr bool CanTriggerGC(T... properties) {
   F(WaitForBackgroundOptimization, 0, 1)                                 \
   F(WaitUntilBlocked, 2, 1)                                              \
   I(DeoptimizeNow, 0, 1)                                                 \
-  F(LeakHole, 0, 1)                                                      \
+  F(LeakHole, -1 /* 0 || 1 */, 1)                                        \
   F(GetHoleNaNLower, 0, 1)                                               \
   F(GetHoleNaNUpper, 0, 1)                                               \
   F(GetHoleNaN, 0, 1)                                                    \

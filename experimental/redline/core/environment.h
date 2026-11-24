@@ -10,8 +10,10 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "experimental/redline/core/builder.h"
 
 namespace redline {
@@ -31,6 +33,7 @@ enum class ArgKind : uint8_t {
   kOptions,   // an options bag: the keys of Environment::Options(`name`)
   kEnum,      // one of the strings of Environment::Enum(`name`)
   kInstance,  // an object of the builtin type `type`
+  kSetLike,   // a Set, Map, or ES2025 set-like record `{size, has, keys}`
 };
 
 // One parameter of a builtin function, method or constructor.
@@ -57,10 +60,11 @@ constexpr ArgSpec Of(JsType type) { return Make(ArgKind::kValue, type); }
 constexpr ArgSpec Int() { return Make(ArgKind::kInteger, JsType::kNumber); }
 constexpr ArgSpec Index() { return Make(ArgKind::kIndex, JsType::kNumber); }
 constexpr ArgSpec Length() { return Make(ArgKind::kLength, JsType::kNumber); }
-constexpr ArgSpec Range(int min, int max) {
+constexpr ArgSpec Range(int min, int max, std::string_view name = {}) {
   ArgSpec a = Make(ArgKind::kRange, JsType::kNumber);
   a.min = min;
   a.max = max;
+  a.name = name;
   return a;
 }
 constexpr ArgSpec Iterable(JsType element = JsType::kUnknown) {
@@ -81,9 +85,12 @@ constexpr ArgSpec Enum(std::string_view list) {
   a.name = list;
   return a;
 }
-constexpr ArgSpec Instance(JsType type) {
-  return Make(ArgKind::kInstance, type);
+constexpr ArgSpec Instance(JsType type, std::string_view name = {}) {
+  ArgSpec a = Make(ArgKind::kInstance, type);
+  a.name = name;
+  return a;
 }
+constexpr ArgSpec SetLike() { return Make(ArgKind::kSetLike, JsType::kObject); }
 constexpr ArgSpec Opt(ArgSpec a) {
   a.optional = true;
   return a;
@@ -108,11 +115,19 @@ struct BuiltinFunction {
   std::span<const ArgSpec> params = {};
 };
 
+// One property of a builtin type, with its coarse type guess.
+struct PropertyInfo {
+  std::string_view name;
+  JsType type = JsType::kUnknown;
+};
+
 // Methods and properties available on values of a given coarse type.
 struct BuiltinType {
   JsType type = JsType::kUnknown;
   std::vector<BuiltinFunction> methods;
   std::vector<std::string_view> properties;
+  // Typed property guesses for environment-backed type inference.
+  std::vector<PropertyInfo> property_types = {};
   // The properties that a store changes: data properties, not the getters
   // of the prototype. Empty if the model does not know them.
   std::vector<std::string_view> writable = {};
@@ -220,6 +235,18 @@ class Environment {
 
   const BuiltinType* ForType(JsType type) const;
   const BuiltinGlobal* Global(std::string_view name) const;
+  // O(1) type-inference lookups built once at `Environment` construction.
+  JsType LookupGlobalCtorType(std::string_view name) const;
+  JsType LookupNamespaceCtorType(std::string_view ns,
+                                 std::string_view name) const;
+  JsType LookupGlobalCallReturnType(std::string_view name) const;
+  JsType LookupNamespaceCallReturnType(std::string_view ns,
+                                       std::string_view name) const;
+  JsType LookupMethodReturnType(JsType recv,
+                                std::string_view method_name) const;
+  JsType LookupPropertyType(JsType recv, std::string_view prop_name) const;
+  JsType LookupNamespacePropertyType(std::string_view ns,
+                                     std::string_view prop_name) const;
   // Globals whose instance_type is `type` and that are constructible.
   std::vector<const BuiltinGlobal*> ConstructorsOf(JsType type) const;
   // Number of discovered members (statics + methods + getters), for logs.
@@ -253,6 +280,8 @@ class Environment {
   // Adds the typed part of the model (environment_typed.cc): parameter
   // lists, enums, options bags and the types that the coarse tables lack.
   void AddTypedModel();
+  // Builds O(1) index tables after all model tables finalize.
+  void BuildLookupTables();
   // Keeps a parameter list alive as long as the environment.
   std::span<const ArgSpec> KeepParams(std::vector<ArgSpec> params);
 
@@ -271,6 +300,20 @@ class Environment {
   std::vector<EnumList> enums_;
   std::vector<OptionsBag> options_;
   std::vector<DiscoveredSignatureEntry> discovered_signatures_;
+  absl::flat_hash_map<JsType, size_t> type_index_;
+  absl::flat_hash_map<std::string_view, size_t> global_index_;
+  absl::flat_hash_map<std::string_view, JsType> global_ctor_types_;
+  absl::flat_hash_map<std::pair<std::string_view, std::string_view>, JsType>
+      namespace_ctor_types_;
+  absl::flat_hash_map<std::string_view, JsType> global_call_types_;
+  absl::flat_hash_map<std::pair<std::string_view, std::string_view>, JsType>
+      namespace_call_types_;
+  absl::flat_hash_map<std::pair<JsType, std::string_view>, JsType>
+      method_return_types_;
+  absl::flat_hash_map<std::pair<JsType, std::string_view>, JsType>
+      property_types_;
+  absl::flat_hash_map<std::pair<std::string_view, std::string_view>, JsType>
+      namespace_property_types_;
 };
 
 }  // namespace redline

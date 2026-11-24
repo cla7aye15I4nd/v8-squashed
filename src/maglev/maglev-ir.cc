@@ -242,6 +242,21 @@ std::ostream& operator<<(std::ostream& os, const StringEqualInputMode mode) {
 
 bool Phi::is_loop_phi() const { return merge_state()->is_loop(); }
 
+bool Phi::is_unwrappable_single_input() const {
+  // Single-input loop phis are either resumable or unreachable loops whose sole
+  // input is the backedge (potentially defined inside the loop or
+  // self-referential).
+  return input_count() == 1 && !is_loop_phi();
+}
+
+NodeType Phi::type(compiler::JSHeapBroker* broker) {
+  DCHECK(is_tagged());
+  if (is_unwrappable_single_input()) {
+    return IntersectType(type_, input_node(0)->GetStaticType(broker));
+  }
+  return type_;
+}
+
 namespace {
 template <typename UnwrapFunction>
 ValueNode* UnwrapSinglePhis(ValueNode* node, UnwrapFunction&& unwrap) {
@@ -250,10 +265,7 @@ ValueNode* UnwrapSinglePhis(ValueNode* node, UnwrapFunction&& unwrap) {
     prev = node;
     node = unwrap(node);
     if (Phi* phi = node->TryCast<Phi>()) {
-      // We skip resumable loop phis since their single input could actually be
-      // defined within the loop itself.
-      if (phi->input_count() == 1 && !phi->is_exception_phi() &&
-          !(phi->is_loop_phi() && phi->merge_state()->is_resumable_loop())) {
+      if (phi->is_unwrappable_single_input()) {
         // This is a Phi with a single input ==> replacing with the input
         // itself.
         node = phi->input_node(0);
@@ -807,11 +819,31 @@ NodeType ValueNode::GetStaticType(compiler::JSHeapBroker* broker) {
     case ValueRepresentation::kIntPtr:
       return NodeType::kNumber;
     case ValueRepresentation::kHoleyFloat64:
-      if (const HoleyFloat64Constant* cst = TryCast<HoleyFloat64Constant>()) {
-        return cst->value().is_undefined_or_hole_nan() ? NodeType::kUndefined
-                                                       : NodeType::kNumber;
+      switch (opcode()) {
+        case Opcode::kHoleyFloat64Constant:
+          return Cast<HoleyFloat64Constant>()
+                         ->value()
+                         .is_undefined_or_hole_nan()
+                     ? NodeType::kUndefined
+                     : NodeType::kNumber;
+        case Opcode::kChangeInt32ToHoleyFloat64:
+        case Opcode::kChangeUint32ToHoleyFloat64:
+        case Opcode::kChangeFloat64ToHoleyFloat64:
+          return NodeType::kNumber;
+        case Opcode::kPhi: {
+          // Do not read Phi::type_ for HoleyFloat64 phis: type_ was computed
+          // while tagged and may exclude kSmi even though re-tagging can
+          // canonicalize to Smi.
+          Phi* phi = Cast<Phi>();
+          if (phi->is_unwrappable_single_input()) {
+            return IntersectType(NodeType::kNumberOrOddball,
+                                 phi->input_node(0)->GetStaticType(broker));
+          }
+          return NodeType::kNumberOrOddball;
+        }
+        default:
+          return NodeType::kNumberOrOddball;
       }
-      return NodeType::kNumberOrOddball;
     case ValueRepresentation::kTagged:
       break;
     case ValueRepresentation::kNone:
@@ -5461,6 +5493,7 @@ void MaybeGrowFastElements::GenerateCode(MaglevAssembler* masm,
   Register index = ToRegister(IndexInput());
   Register elements_length = ToRegister(ElementsLengthInput());
   DCHECK_EQ(elements, ToRegister(result()));
+  DCHECK_NE(elements, object);
 
   ZoneLabelRef done(masm);
 
@@ -6410,6 +6443,31 @@ void StringLocaleCompareIntl::GenerateCode(MaglevAssembler* masm,
   __ CallBuiltin<Builtin::kStringFastLocaleCompare>(
       masm->native_context().object(),  // context
       LocaleCompareFnInput(), LeftInput(), RightInput(), LocalesInput());
+  masm->DefineExceptionHandlerAndLazyDeoptPoint(this);
+}
+
+void StringToLowerCaseIntl::SetValueLocationConstraints() {
+  using D = CallInterfaceDescriptorFor<Builtin::kStringToLowerCaseIntl>::type;
+  UseFixed(StringInput(), D::GetRegisterParameter(D::kString));
+  DefineAsFixed(this, kReturnRegister0);
+}
+void StringToLowerCaseIntl::GenerateCode(MaglevAssembler* masm,
+                                         const ProcessingState& state) {
+  __ CallBuiltin<Builtin::kStringToLowerCaseIntl>(
+      masm->native_context().object(),  // context
+      StringInput());
+  masm->DefineExceptionHandlerAndLazyDeoptPoint(this);
+}
+
+void StringToUpperCaseIntl::SetValueLocationConstraints() {
+  UseAny(StringInput());
+  DefineAsFixed(this, kReturnRegister0);
+}
+void StringToUpperCaseIntl::GenerateCode(MaglevAssembler* masm,
+                                         const ProcessingState& state) {
+  __ Push(StringInput());
+  __ Move(kContextRegister, masm->native_context().object());
+  __ CallRuntime(Runtime::kStringToUpperCaseIntl, 1);
   masm->DefineExceptionHandlerAndLazyDeoptPoint(this);
 }
 #endif  // V8_INTL_SUPPORT
@@ -9626,7 +9684,7 @@ void ReduceInterruptBudgetForLoop::PrintParams(std::ostream& os) const {
   os << "(" << amount() << ", " << osr_offset().ToInt() << ")";
 }
 
-void ReduceInterruptBudgetForReturn::PrintParams(std::ostream& os) const {
+void ReduceInterruptBudgetForEntry::PrintParams(std::ostream& os) const {
   os << "(" << amount() << ")";
 }
 

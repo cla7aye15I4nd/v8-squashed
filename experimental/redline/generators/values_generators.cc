@@ -489,7 +489,7 @@ bool GenBuiltinInstanceDecl(GenContext& ctx, CodeGen& cg, Statements* out) {
       break;
   }
   if (type == JsType::kUnknown) {
-    type = Builder::GuessType(value);
+    type = ctx.builder.GuessExpressionType(value);
   }
   Push(out, cg.Declare(value, type, "o"));
   return true;
@@ -519,11 +519,24 @@ REDLINE_TUNABLE(kConstructorFunctionDeclVariableChance,
                 "generators.ConstructorFunctionDecl.variable_chance", 0.8, 0, 1,
                 "probability that a stored value is a visible variable or a "
                 "parameter rather than an integer literal");
+REDLINE_TUNABLE(kConstructorFunctionDeclNewTargetChance,
+                "generators.ConstructorFunctionDecl.new_target_chance", 0.35, 0,
+                1, "probability that the constructor adds a new.target guard");
+REDLINE_TUNABLE(kConstructorFunctionDeclThisCtorChance,
+                "generators.ConstructorFunctionDecl.this_ctor_chance", 0.3, 0,
+                1,
+                "probability that the constructor inspects new.target or "
+                "this.constructor");
+REDLINE_TUNABLE(kConstructorFunctionDeclDirectCallChance,
+                "generators.ConstructorFunctionDecl.direct_call_chance", 0.35,
+                0, 1,
+                "probability that a guarded constructor also runs without new");
 
-// `function C(a, b) { this.x = a; this.y = v; }` and 1-4 instances, after
-// Fuzzilli's ObjectConstructorGenerator (CodeGenerators.swift:666). The
-// body only stores values, so the constructor calls cannot throw.
+// `function C(a, b) { this.x = a; this.y = v; }` and 1 to 4 instances, after
+// Fuzzilli's `ObjectConstructorGenerator` (`CodeGenerators.swift:666`). The
+// body stores values and optionally guards `new.target`, so calls stay safe.
 bool GenConstructorFunctionDecl(GenContext& ctx, CodeGen& cg, Statements* out) {
+  const bool outer_cannot_throw = ctx.cannot_throw;
   CannotThrowScope safe(ctx);
   Random& r = ctx.rng();
   Tree* t = T(ctx);
@@ -551,6 +564,28 @@ bool GenConstructorFunctionDecl(GenContext& ctx, CodeGen& cg, Statements* out) {
       1 + r.SmallCount(kConstructorFunctionDeclMaxProperties.AsInt() - 1);
   std::vector<std::string_view> used;
   Statements body;
+  const bool has_guard = r.Chance(kConstructorFunctionDeclNewTargetChance());
+  if (has_guard) {
+    MemberExpression* opt_ctor = mk::Member(t, mk::This(t), "constructor");
+    opt_ctor->optional = true;
+    Expression* fallback = mk::Logical(
+        t, LogicalOp::kOr, mk::Chain(t, opt_ctor), mk::Id(t, "Object"));
+    body.push_back(
+        mk::If(t, mk::Unary(t, UnaryOp::kNot, mk::NewTarget(t)),
+               mk::Block(t, {mk::Return(t, mk::New(t, fallback, {}))})));
+  }
+  if (r.Chance(kConstructorFunctionDeclThisCtorChance())) {
+    if (r.Coin()) {
+      std::string_view nt = ctx.builder.FreshName("nt");
+      body.push_back(mk::Const(t, nt, mk::NewTarget(t)));
+      nested.Declare(nt, JsType::kClass, true);
+    } else {
+      std::string_view tc = ctx.builder.FreshName("tc");
+      body.push_back(
+          mk::Const(t, tc, mk::Member(t, mk::This(t), "constructor")));
+      nested.Declare(tc, JsType::kClass, true);
+    }
+  }
   for (int i = 0; i < count; i++) {
     std::string_view property = ctx.env.property_names()[r.Index(pool)];
     if (std::find(used.begin(), used.end(), property) != used.end() ||
@@ -582,6 +617,15 @@ bool GenConstructorFunctionDecl(GenContext& ctx, CodeGen& cg, Statements* out) {
       args.push_back(cg.Value(JsType::kUnknown, 1));
     }
     Push(out, cg.Declare(mk::New(t, mk::Id(t, name), std::move(args)),
+                         JsType::kObject, "o"));
+  }
+  if (has_guard && !outer_cannot_throw &&
+      r.Chance(kConstructorFunctionDeclDirectCallChance())) {
+    std::vector<Expression*> args;
+    for (int k = 0; k < np; k++) {
+      args.push_back(cg.Value(JsType::kUnknown, 1));
+    }
+    Push(out, cg.Declare(mk::Call(t, mk::Id(t, name), std::move(args)),
                          JsType::kObject, "o"));
   }
   return true;
@@ -853,7 +897,7 @@ bool GenResizableBufferDecl(GenContext& ctx, CodeGen& cg, Statements* out) {
   Tree* t = T(ctx);
   const BufferPlan plan = RandomBufferPlan(ctx);
   Expression* buffer = NewResizableBuffer(t, plan);
-  Push(out, cg.Declare(buffer, Builder::GuessType(buffer),
+  Push(out, cg.Declare(buffer, ctx.builder.GuessExpressionType(buffer),
                        plan.shared ? "gsab" : "rab"));
   std::string_view name = LastDeclared(ctx);
   Expression* view =
@@ -933,7 +977,14 @@ Expression* SpecialString(GenContext& ctx, CodeGen& cg) {
 // A Wasm GC object (V8CommonProfile.swift:290-296). It is opaque: loads
 // give undefined, and stores and conversions throw.
 Expression* SpecialObject(GenContext& ctx) {
-  return mk::Native(T(ctx), ctx.rng().Coin() ? "WasmStruct" : "WasmArray", {});
+  switch (ctx.rng().Index(3)) {
+    case 0:
+      return mk::Native(T(ctx), "WasmStruct", {});
+    case 1:
+      return mk::Native(T(ctx), "WasmArray", {});
+    default:
+      return mk::Native(T(ctx), "GetUndetectable", {});
+  }
 }
 
 REDLINE_TUNABLE(kSpecialValueDeclObjectChance,
@@ -1335,7 +1386,7 @@ bool GenResizableBuffer(GenContext& ctx, CodeGen& cg, Statements* out) {
   } else {
     const BufferPlan plan = RandomBufferPlan(ctx);
     Expression* init = NewResizableBuffer(t, plan);
-    Push(out, cg.Declare(init, Builder::GuessType(init),
+    Push(out, cg.Declare(init, ctx.builder.GuessExpressionType(init),
                          plan.shared ? "gsab" : "rab"));
     buffer.name = LastDeclared(ctx);
     buffer.shared = plan.shared;
@@ -1358,7 +1409,7 @@ bool GenResizableBuffer(GenContext& ctx, CodeGen& cg, Statements* out) {
       init = mk::New(t, mk::Id(t, view.kind ? view.kind->name : "DataView"),
                      {mk::Id(t, buffer.name)});
     }
-    Push(out, cg.Declare(init, Builder::GuessType(init),
+    Push(out, cg.Declare(init, ctx.builder.GuessExpressionType(init),
                          view.kind != nullptr ? "ta" : "dv"));
     view.name = LastDeclared(ctx);
     views.push_back(view);
@@ -1783,6 +1834,29 @@ bool NativeArgumentsFor(CodeGen& cg, std::string_view name,
                             kDispatchTableGcMinInterval.AsInt(),
                             std::max(kDispatchTableGcMinInterval.AsInt(),
                                      kDispatchTableGcMaxInterval.AsInt()))))};
+  } else if (name == "SetForceSlowPath") {
+    *args = {cg.Boolean()};
+  } else if (name == "DisableEagerInlining") {
+    Identifier* fn = cg.Variable(JsType::kFunction);
+    *args = {fn != nullptr ? static_cast<Expression*>(fn)
+                           : cg.Value(JsType::kFunction, 1)};
+  } else if (name == "ShareObject") {
+    *args = {cg.Value(JsType::kUnknown, 1)};
+  } else if (name == "ArrayBufferSetDetachKey") {
+    Expression* buf = VariableOfTypes(ctx, {JsType::kArrayBuffer});
+    if (buf == nullptr) {
+      buf = cg.Instance(JsType::kArrayBuffer, 1);
+    }
+    if (buf == nullptr) {
+      buf = mk::New(t, mk::Id(t, "ArrayBuffer"), {mk::Num(t, 16)});
+    }
+    *args = {buf, cg.Value(JsType::kUnknown, 1)};
+  } else if (name == "OptimizeOsr") {
+    if (ctx.rng().Index(6) == 0) {
+      *args = {mk::Num(t, 1)};
+    } else {
+      args->clear();
+    }
   } else {
     return false;
   }

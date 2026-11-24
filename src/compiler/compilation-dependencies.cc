@@ -1365,6 +1365,11 @@ bool CompilationDependencies::DependOnArraySpeciesProtector() {
       broker_, broker_->isolate()->factory()->array_species_protector()));
 }
 
+bool CompilationDependencies::DependOnRegExpSpeciesProtector() {
+  return DependOnProtector(MakeRef(
+      broker_, broker_->isolate()->factory()->regexp_species_protector()));
+}
+
 bool CompilationDependencies::DependOnNoElementsProtector() {
   return DependOnProtector(
       MakeRef(broker_, broker_->isolate()->factory()->no_elements_protector()));
@@ -1448,6 +1453,9 @@ V8_INLINE void TraceInvalidCompilationDependency(
 }
 
 bool CompilationDependencies::Commit(Handle<Code> code) {
+  DCHECK_IMPLIES(
+      !broker_->is_context_slot_not_assigned_unreliable(),
+      !broker_->isolate()->is_context_slot_not_assigned_unreliable());
   if (!PrepareInstall()) return false;
 
   {
