@@ -579,6 +579,12 @@ void MaglevReducer<BaseT>::UpdateRange(NodeT* node) {
 template <typename BaseT>
 std::optional<ValueNode*> MaglevReducer<BaseT>::TryGetConstantAlternative(
     ValueNode* node) {
+  // Constants already carry their value and must not return themselves as an
+  // alternative (callers recurse on the returned constant).
+  // TODO(victorgomes): Fold UnwrapForDeopt into Unwrap in a follow-up (today
+  // Unwrap unwraps identities, returned values, and conversions, but not
+  // single-input phis).
+  if (IsConstantNode(node->UnwrapForDeopt()->opcode())) return {};
   const NodeInfo* info = known_node_aspects().TryGetInfoFor(node);
   if (info) {
     if (auto c = info->alternative().checked_value()) {
@@ -2276,8 +2282,7 @@ bool MaglevReducer<BaseT>::CanInlineCall(
     TRACE_CANNOT_INLINE("stack overflow");
     return false;
   }
-  if (static_cast<int>(graph()->inlined_functions().size()) >=
-      SourcePosition::MaxInliningId()) {
+  if (graph()->HasReachedMaxInliningId()) {
     graph()->compilation_info()->set_could_not_inline_all_candidates();
     TRACE_CANNOT_INLINE("maximum inlining ids");
     return false;
@@ -2471,6 +2476,11 @@ void MaglevReducer<BaseT>::SetKnownValue(ValueNode* node,
                                          NodeType new_node_type) {
   DCHECK(!node->Is<HeapConstant>());
   DCHECK(!node->Is<RootConstant>());
+  // Constants already carry their value and must not attach a checked_value
+  // alternative (TryGetConstantAlternative ignores constants, so repeated
+  // checks would otherwise overwrite checked_value).
+  // TODO(victorgomes): Fold UnwrapForDeopt into Unwrap in a follow-up.
+  if (IsConstantNode(node->UnwrapForDeopt()->opcode())) return;
   NodeInfo* known_info = GetOrCreateInfoFor(node);
   // ref type should be compatible with type.
   DCHECK(NodeTypeIs(StaticTypeForConstant(broker(), ref), new_node_type));
@@ -7261,7 +7271,7 @@ MaybeReduceResult MaglevReducer<BaseT>::TryReduceStringPrototypeCharAt(
   DCHECK_EQ(current_speculation_mode_, SpeculationMode::kAllowSpeculation);
   RETURN_IF_ABORT(TryBuildCheckInt32Condition(
       index, length, AssertCondition::kUnsignedLessThan,
-      DeoptimizeReason::kOutOfBounds));
+      DeoptimizeReason::kSpeculativeBoundsCheckFailed));
   return GetCharAt();
 }
 
@@ -7315,9 +7325,10 @@ MaybeReduceResult MaglevReducer<BaseT>::TryReduceStringPrototypeCharCodeAt(
         });
   }
 
+  DCHECK_EQ(current_speculation_mode_, SpeculationMode::kAllowSpeculation);
   RETURN_IF_ABORT(TryBuildCheckInt32Condition(
       index, length, AssertCondition::kUnsignedLessThan,
-      DeoptimizeReason::kOutOfBounds));
+      DeoptimizeReason::kSpeculativeBoundsCheckFailed));
   return BuildGetCharCodeAt(receiver, index);
 }
 
@@ -7364,9 +7375,10 @@ MaybeReduceResult MaglevReducer<BaseT>::TryReduceStringPrototypeCodePointAt(
         });
   }
 
+  DCHECK_EQ(current_speculation_mode_, SpeculationMode::kAllowSpeculation);
   RETURN_IF_ABORT(TryBuildCheckInt32Condition(
       index, length, AssertCondition::kUnsignedLessThan,
-      DeoptimizeReason::kOutOfBounds));
+      DeoptimizeReason::kSpeculativeBoundsCheckFailed));
   return GetCodePointAt();
 }
 
