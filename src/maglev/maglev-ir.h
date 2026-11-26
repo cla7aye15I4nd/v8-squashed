@@ -356,6 +356,8 @@ class ExceptionHandlerInfo;
   V(Phi)                                      \
   V(RegisterInput)                            \
   V(CheckedInternalizedString)                \
+  V(CheckedFloat64ToIndex)                    \
+  V(CheckedHoleyFloat64ToIndex)               \
   V(TruncateCheckedNumberAsSafeIntToInt32)    \
   V(TruncateUnsafeNumberAsSafeIntToInt32)     \
   V(TruncateFloat64AsSafeIntToInt32)          \
@@ -470,6 +472,7 @@ class ExceptionHandlerInfo;
   V(CheckInstanceType)                        \
   V(Dead)                                     \
   V(DebugBreak)                               \
+  V(Retain)                                   \
   V(MajorGCForCompilerTesting)                \
   V(FunctionEntryStackCheck)                  \
   V(GeneratorStore)                           \
@@ -2766,7 +2769,7 @@ class ValueNode : public Node {
         input.node()->SetTaggedResultNeedsDecompress();
       }
     } else if (Is<Identity>()) {
-      DCHECK_EQ(input_count(), 0);
+      DCHECK_EQ(input_count(), 1);
       input(0).node()->SetTaggedResultNeedsDecompress();
     }
   }
@@ -2824,24 +2827,17 @@ class ValueNode : public Node {
   inline void MaybeRecordUseReprHint(UseRepresentationSet repr);
   inline void MaybeRecordUseReprHint(UseRepresentation repr);
 
-  ValueNode* UnwrapIdentities();
-  const ValueNode* UnwrapIdentities() const;
+  // Unwraps identities and single-input non-loop phis (aliases).
+  ValueNode* UnwrapAliases();
+  const ValueNode* UnwrapAliases() const;
 
   ValueNode* UnwrapIdentitiesAndReturnedValues();
 
-  // Like UnwrapIdentities, but also unwraps phis with a single input (which are
-  // not exception phis or resumable loop phis), since the optimizer replaces
-  // those with their input.
-  // TODO(dmercadier): Remove this if https://crrev.com/c/7117478 ever lands.
-  ValueNode* UnwrapIdentitiesAndPhis();
   ValueNode* UnwrapIdentitiesReturnedValuesAndPhis();
 
-  // Unwrap identities and conversions.
+  // Unwrap identities, returned values, conversions, and single-input non-loop
+  // phis.
   ValueNode* Unwrap();
-
-  // Like Unwrap, but also unwraps single-input phis (cf.
-  // UnwrapIdentitiesAndPhis).
-  V8_EXPORT_PRIVATE ValueNode* UnwrapForDeopt();
 
   ValueNode* UnwrapIdentitiesAndUpdateUseCountForDeopt();
   ValueNode* UnwrapAndUpdateUseCountForDeopt();
@@ -2860,7 +2856,10 @@ class ValueNode : public Node {
   int use_count_;
 
  private:
+  inline ValueNode* UnwrapIdentitiesReturnedValuesAndConversions();
+  V8_EXPORT_PRIVATE ValueNode* UnwrapAliasesSlow();
   V8_EXPORT_PRIVATE ValueNode* UnwrapIdentitiesReturnedValuesAndPhisSlow();
+  V8_EXPORT_PRIVATE ValueNode* UnwrapSlow();
 };
 
 inline void NodeBase::initialize_input_null(int index) {
@@ -2910,16 +2909,17 @@ ValueLocation& Node::result() {
   return Cast<ValueNode>()->regalloc_info()->result();
 }
 
-inline ValueNode* ValueNode::UnwrapIdentities() {
+inline ValueNode* ValueNode::UnwrapAliases() {
   ValueNode* node = this;
   while (node->Is<Identity>()) node = node->input(0).node();
+  if (V8_UNLIKELY(node->Is<Phi>() && node->input_count() == 1)) {
+    return node->UnwrapAliasesSlow();
+  }
   return node;
 }
 
-inline const ValueNode* ValueNode::UnwrapIdentities() const {
-  const ValueNode* node = this;
-  while (node->Is<Identity>()) node = node->input(0).node();
-  return node;
+inline const ValueNode* ValueNode::UnwrapAliases() const {
+  return const_cast<ValueNode*>(this)->UnwrapAliases();
 }
 
 inline ValueNode* ValueNode::UnwrapIdentitiesAndReturnedValues() {
@@ -2938,7 +2938,7 @@ inline ValueNode* ValueNode::UnwrapIdentitiesReturnedValuesAndPhis() {
   return node;
 }
 
-inline ValueNode* ValueNode::Unwrap() {
+inline ValueNode* ValueNode::UnwrapIdentitiesReturnedValuesAndConversions() {
   ValueNode* node = this;
   while (node->Is<Identity>() || node->Is<ReturnedValue>() ||
          node->is_conversion()) {
@@ -2947,10 +2947,18 @@ inline ValueNode* ValueNode::Unwrap() {
   return node;
 }
 
-// Unwraps identities on the current node and, if unwrapping succeeds,
+inline ValueNode* ValueNode::Unwrap() {
+  ValueNode* node = UnwrapIdentitiesReturnedValuesAndConversions();
+  if (V8_UNLIKELY(node->Is<Phi>() && node->input_count() == 1)) {
+    return node->UnwrapSlow();
+  }
+  return node;
+}
+
+// Unwraps aliases on the current node and, if unwrapping succeeds,
 // decrements its use-count and increments the use-count of the unwrapped node.
 inline ValueNode* ValueNode::UnwrapIdentitiesAndUpdateUseCountForDeopt() {
-  ValueNode* unwrapped = UnwrapIdentities();
+  ValueNode* unwrapped = UnwrapAliases();
   if (unwrapped != this) {
     // TODO(dmercadier): instead of a simple `remove_use` here, we could instead
     // recursively remove uses in VirtualObjects (basically doing the oppositve
@@ -2964,7 +2972,7 @@ inline ValueNode* ValueNode::UnwrapIdentitiesAndUpdateUseCountForDeopt() {
 // Unwraps the current node and, if unwrapping succeeds, decrements its
 // use-count and increments the use-count of the unwrapped node.
 inline ValueNode* ValueNode::UnwrapAndUpdateUseCountForDeopt() {
-  ValueNode* unwrapped = UnwrapForDeopt();
+  ValueNode* unwrapped = Unwrap();
   if (unwrapped != this) {
     // TODO(dmercadier): instead of a simple `remove_use` here, we could instead
     // recursively remove uses in VirtualObjects (basically doing the oppositve
@@ -5868,7 +5876,7 @@ class VirtualObject : public FixedInputValueNodeT<0, VirtualObject> {
 
   ValueNode* get_by_index(uint32_t i) const {
     SBXCHECK_LT(i, slot_count());
-    return slots_[i] ? slots_[i]->UnwrapIdentities() : nullptr;
+    return slots_[i] ? slots_[i]->UnwrapAliases() : nullptr;
   }
 
   ValueNode* get(uint32_t offset) const {
@@ -6522,7 +6530,7 @@ void ValueNode::remove_use() {
 // VirtualObject snapshot inserted by TurbolevEscapeAnalysis, or an
 // InlinedAllocation marked as elided by Maglev's escape analysis.
 inline VirtualObject* ValueNode::TryGetVirtualObject() {
-  ValueNode* unwrapped = UnwrapIdentities();
+  ValueNode* unwrapped = UnwrapAliases();
   if (VirtualObject* vo = unwrapped->TryCast<VirtualObject>()) {
     return vo;
   }
@@ -6539,7 +6547,7 @@ inline VirtualObject* ValueNode::TryGetVirtualObject() {
 // visitors must conservatively descend into every InlinedAllocation's
 // VirtualObject in case the allocation is later elided.
 inline VirtualObject* ValueNode::TryGetDeoptVirtualObject() {
-  ValueNode* unwrapped = UnwrapIdentities();
+  ValueNode* unwrapped = UnwrapAliases();
   if (VirtualObject* vo = unwrapped->TryCast<VirtualObject>()) {
     return vo;
   }
@@ -6559,7 +6567,7 @@ inline void VirtualObject::ForEachNestedRuntimeInput(
   if (ancestors == nullptr) ancestors = &root_ancestors;
   ForEachSlot(
       [&](ValueNode* value, const vobj::Field& desc) -> bool {
-        value = value->UnwrapIdentities();
+        value = value->UnwrapAliases();
         if (IsConstantNode(value->opcode())) {
           // No location assigned to constants.
           return true;
@@ -6986,6 +6994,8 @@ class AssertRangeInt32 : public FixedInputNodeT<1, AssertRangeInt32> {
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
   void PrintParams(std::ostream&) const;
 
+  auto options() const { return std::tuple{range_}; }
+
   Range range() const { return range_; }
 
  private:
@@ -7002,6 +7012,8 @@ class AssertRangeFloat64 : public FixedInputNodeT<1, AssertRangeFloat64> {
   void SetValueLocationConstraints();
   void GenerateCode(MaglevAssembler*, const ProcessingState&);
   void PrintParams(std::ostream&) const;
+
+  auto options() const { return std::tuple{range_}; }
 
   Range range() const { return range_; }
 
@@ -7740,6 +7752,25 @@ class AssumeType : public NodeT<AssumeType> {
   const NodeType asserted_type_;
 };
 
+class Retain : public FixedInputNodeT<1, Retain> {
+ public:
+  explicit Retain(uint64_t bitfield) : Base(bitfield) {}
+
+  static constexpr OpProperties kProperties = OpProperties::NotIdempotent();
+
+  DECLARE_INPUTS(Value)
+  DECLARE_INPUT_TYPES(Tagged)
+
+#ifdef V8_COMPRESS_POINTERS
+  void MarkTaggedInputsAsDecompressing() {
+    // Don't need to decompress just to keep the object alive.
+  }
+#endif
+
+  void SetValueLocationConstraints();
+  void GenerateCode(MaglevAssembler*, const ProcessingState&);
+};
+
 class TurbofanStaticAssert : public FixedInputNodeT<1, TurbofanStaticAssert> {
  public:
   explicit TurbofanStaticAssert(uint64_t bitfield) : Base(bitfield) {}
@@ -7887,6 +7918,29 @@ class CheckedObjectToIndex
  private:
   using CheckTypeBitField = NextBitField<CheckType, 1>;
 };
+
+// Converts a Float64 element index to Int32. Unlike CheckedFloat64ToInt32 this
+// accepts -0 and returns 0, so the result is not interchangeable with the
+// input and this is not a conversion node.
+#define DEFINE_FLOAT64_TO_INDEX_NODE(name, from_repr)               \
+  class name : public FixedInputValueNodeT<1, name> {               \
+   public:                                                          \
+    explicit name(uint64_t bitfield) : Base(bitfield) {}            \
+                                                                    \
+    static constexpr OpProperties kProperties =                     \
+        OpProperties::EagerDeopt() | OpProperties::Int32();         \
+    static_assert(!kProperties.is_conversion());                    \
+    DECLARE_INPUTS(Value)                                           \
+    DECLARE_INPUT_TYPES(from_repr)                                  \
+                                                                    \
+    Range range() const { return input_node(0)->GetStaticRange(); } \
+    void SetValueLocationConstraints();                             \
+    void GenerateCode(MaglevAssembler*, const ProcessingState&);    \
+  };
+
+DEFINE_FLOAT64_TO_INDEX_NODE(CheckedFloat64ToIndex, Float64)
+DEFINE_FLOAT64_TO_INDEX_NODE(CheckedHoleyFloat64ToIndex, HoleyFloat64)
+#undef DEFINE_FLOAT64_TO_INDEX_NODE
 
 class GetTemplateObject : public FixedInputValueNodeT<1, GetTemplateObject> {
  public:

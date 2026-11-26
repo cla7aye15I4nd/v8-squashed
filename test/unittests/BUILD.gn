@@ -568,6 +568,7 @@ v8_cluster_source_set("v8_unittests_sources") {
     "runtime/runtime-debug-unittest.cc",
     "sandbox/bytecode-verifier-unittest.cc",
     "sandbox/code-cache-unittest.cc",
+    "sandbox/context-snapshot-unittest.cc",
     "sandbox/generated-code-validator-unittest.cc",
     "sandbox/libcxx-hardening-unittest.cc",
     "sandbox/pointer-table-unittest.cc",
@@ -600,6 +601,7 @@ v8_cluster_source_set("v8_unittests_sources") {
     "utils/detachable-vector-unittest.cc",
     "utils/identity-map-unittest.cc",
     "utils/locked-queue-unittest.cc",
+    "utils/sha-256-unittest.cc",
     "utils/sparse-bit-vector-unittest.cc",
     "utils/utils-unittest.cc",
     "utils/version-unittest.cc",
@@ -631,9 +633,11 @@ v8_cluster_source_set("v8_unittests_sources") {
     "heap/cppgc-js/unified-heap-snapshot-unittest.cc",
     "heap/cppgc-js/unified-heap-unittest.cc",
     "heap/memory-reducer-unittest.cc",  # MockTaskRunner.
+    "heap/shared-heap-unittest.cc",
     "objects/concurrent-descriptor-array-unittest.cc",
     "objects/concurrent-transition-array-unittest.cc",
     "objects/descriptor-array-unittest.cc",
+    "wasm/deopt-fuzztest.cc",  # ref, refNull.
     "wasm/float32-cross-compiler-determinism-fuzztest.cc",
     "wasm/gc-unittest.cc",  # ref, refNull.
     "wasm/liftoff-inspection-unittest.cc",  # Register() hides class Register.
@@ -762,6 +766,7 @@ v8_cluster_source_set("v8_unittests_sources") {
       "compiler/turboshaft/loop-unrolling-analyzer-unittest.cc",
       "compiler/turboshaft/machine-lowering-reducer-unittest.cc",
       "compiler/turboshaft/machine-optimization-reducer-unittest.cc",
+      "compiler/turboshaft/memory-optimization-reducer-unittest.cc",
       "compiler/turboshaft/opmask-unittest.cc",
       "compiler/turboshaft/reducer-test.cc",
       "compiler/turboshaft/reducer-test.h",

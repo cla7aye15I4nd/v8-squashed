@@ -13683,19 +13683,25 @@ TEST_F(ApiUninitializedTest, SetInSandboxAllocator) {
   create_params.array_buffer_allocator = array_buffer_allocator.get();
 
   v8::Isolate* isolate = v8::Isolate::New(group, create_params);
+  const int baseline_allocate_count = allocator->allocate_count();
+  const int baseline_allocate_uninitialized_count =
+      allocator->allocate_uninitialized_count();
+
   std::unique_ptr<v8::BackingStore> backing_store =
       v8::ArrayBuffer::NewBackingStore(isolate, 200);
   CHECK_EQ(backing_store->Data(), allocator->allocated_address());
-  CHECK_EQ(allocator->allocate_count(), 1);
-  CHECK_EQ(allocator->allocate_uninitialized_count(), 0);
+  CHECK_EQ(allocator->allocate_count(), baseline_allocate_count + 1);
+  CHECK_EQ(allocator->allocate_uninitialized_count(),
+           baseline_allocate_uninitialized_count);
   backing_store.reset();
 
   std::unique_ptr<v8::BackingStore> uninitialized_backing_store =
       v8::ArrayBuffer::NewBackingStore(
           isolate, 200, v8::BackingStoreInitializationMode::kUninitialized);
   CHECK_EQ(uninitialized_backing_store->Data(), allocator->allocated_address());
-  CHECK_EQ(allocator->allocate_count(), 1);
-  CHECK_EQ(allocator->allocate_uninitialized_count(), 1);
+  CHECK_EQ(allocator->allocate_count(), baseline_allocate_count + 1);
+  CHECK_EQ(allocator->allocate_uninitialized_count(),
+           baseline_allocate_uninitialized_count + 1);
   uninitialized_backing_store.reset();
 
   isolate->Dispose();
@@ -18338,6 +18344,50 @@ THREADED_TEST(ApiTest, FunctionGetBoundFunction) {
   CHECK_EQ(f->GetScriptLineNumber(), original_function->GetScriptLineNumber());
   CHECK_EQ(f->GetScriptColumnNumber(),
            original_function->GetScriptColumnNumber());
+}
+
+THREADED_TEST(ApiTest, FunctionGetScriptName) {
+  LocalContext env;
+  v8::Isolate* isolate = env.isolate();
+  v8::HandleScope scope(isolate);
+  v8::ScriptOrigin origin =
+      v8::ScriptOrigin(v8_str("https://example.com/a.js"));
+  v8::Local<v8::String> script = v8_str(
+      "function f() {}\n"
+      "var bound = f.bind(null);\n"
+      "var eval_fn = eval('(function e() {})\\n//# "
+      "sourceURL=https://leaked.example/eval.js');\n"
+      "//# sourceURL=https://leaked.example/secret.js");
+  v8::Script::Compile(env.local(), script, &origin)
+      .ToLocalChecked()
+      ->Run(env.local())
+      .ToLocalChecked();
+
+  v8::Local<v8::Function> f = v8::Local<v8::Function>::Cast(
+      env->Global()->Get(env.local(), v8_str("f")).ToLocalChecked());
+  CHECK_EQ(v8::String::Utf8Value(isolate, f->GetScriptOrigin().ResourceName())
+               .as_view(),
+           "https://leaked.example/secret.js");
+  CHECK_EQ(v8::String::Utf8Value(isolate, f->GetScriptName()).as_view(),
+           "https://example.com/a.js");
+
+  v8::Local<v8::Function> bound = v8::Local<v8::Function>::Cast(
+      env->Global()->Get(env.local(), v8_str("bound")).ToLocalChecked());
+  CHECK(bound->GetScriptName()->IsUndefined());
+
+  v8::Local<v8::Function> eval_fn = v8::Local<v8::Function>::Cast(
+      env->Global()->Get(env.local(), v8_str("eval_fn")).ToLocalChecked());
+  CHECK_EQ(
+      v8::String::Utf8Value(isolate, eval_fn->GetScriptOrigin().ResourceName())
+          .as_view(),
+      "https://leaked.example/eval.js");
+  CHECK(eval_fn->GetScriptName()->IsUndefined());
+
+  v8::Local<v8::Function> api_fn =
+      v8::Function::New(env.local(),
+                        [](const v8::FunctionCallbackInfo<v8::Value>&) {})
+          .ToLocalChecked();
+  CHECK(api_fn->GetScriptName()->IsUndefined());
 }
 
 THREADED_TEST(ApiTest, FunctionProtoToString) {

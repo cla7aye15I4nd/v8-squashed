@@ -67,7 +67,9 @@
 #include "src/objects/scope-info.h"
 #include "src/objects/swiss-name-dictionary.h"
 #include "src/objects/tagged.h"
+#include "src/objects/trusted-object.h"
 #include "src/objects/turbofan-types.h"
+#include "src/sandbox/trusted-pointer.h"
 #include "src/utils/ostreams.h"
 #include "src/utils/utils.h"
 
@@ -2979,9 +2981,13 @@ class AssemblerOpInterface : public Next {
     return LoadProtectedPointerField(base, OpIndex::Invalid(), kind, offset);
   }
 
-  // Load a trusted (indirect) pointer. Returns Smi or ExposedTrustedObject.
-  V<Object> LoadTrustedPointer(V<HeapObject> base, LoadOp::Kind kind,
-                               TrustedPointerTagRange tag_range, int offset) {
+  // Load a trusted (indirect) pointer. Returns an ExposedTrustedObject.
+  // TODO(dmercadier): Remove this non-templated overload (moving its body into
+  // the templated overload below) once TurboFan is removed.
+  V<ExposedTrustedObject> LoadTrustedPointer(V<HeapObject> base,
+                                             LoadOp::Kind kind,
+                                             TrustedPointerTagRange tag_range,
+                                             int offset) {
 #if V8_ENABLE_SANDBOX
     static_assert(COMPRESS_POINTERS_BOOL);
     V<WordPtr> table_address =
@@ -2990,21 +2996,20 @@ class AssemblerOpInterface : public Next {
         Load(table_address, LoadOp::Kind::RawAligned().Immutable(),
              MemoryRepresentation::UintPtr(),
              Internals::kExternalEntityTableBasePointerOffset);
-    return LoadTrustedPointer(base, table, kind, tag_range, offset);
+    return ReduceIfReachableLoadTrustedPointer(base, table, kind, tag_range,
+                                               offset);
 #else
     return Load(base, kind, MemoryRepresentation::TaggedPointer(), offset);
 #endif  // V8_ENABLE_SANDBOX
   }
 
-#if V8_ENABLE_SANDBOX
-  V<Object> LoadTrustedPointer(V<HeapObject> base, V<WordPtr> table,
-                               LoadOp::Kind kind,
-                               TrustedPointerTagRange tag_range,
-                               int32_t offset) {
-    return ReduceIfReachableLoadTrustedPointer(base, table, kind, tag_range,
-                                               offset);
+  template <TrustedPointerTagRange tag_range>
+  V<TrustedTypeFor<tag_range>> LoadTrustedPointer(V<HeapObject> base,
+                                                  LoadOp::Kind kind,
+                                                  int offset) {
+    return V<TrustedTypeFor<tag_range>>::CastIfNeeded(
+        LoadTrustedPointer(base, kind, tag_range, offset));
   }
-#endif
 
   V<WordPtr> LoadExternalPointerFromObject(V<Object> object, int offset,
                                            ExternalPointerTag tag) {
@@ -4808,27 +4813,37 @@ class AssemblerOpInterface : public Next {
   }
 
   V<BigInt> BigIntBinop(V<BigInt> left, V<BigInt> right,
-                        V<EagerFrameState> frame_state,
+                        V<EagerFrameState> eager_frame_state,
+                        OptionalV<LazyFrameState> lazy_frame_state,
                         BigIntBinopOp::Kind kind) {
-    return ReduceIfReachableBigIntBinop(left, right, frame_state, kind);
+    return ReduceIfReachableBigIntBinop(left, right, eager_frame_state,
+                                        lazy_frame_state, kind);
   }
-#define BIGINT_BINOP(kind)                                 \
-  V<BigInt> BigInt##kind(V<BigInt> left, V<BigInt> right,  \
-                         V<EagerFrameState> frame_state) { \
-    return BigIntBinop(left, right, frame_state,           \
-                       BigIntBinopOp::Kind::k##kind);      \
+#define BIGINT_BINOP(kind)                                       \
+  V<BigInt> BigInt##kind(V<BigInt> left, V<BigInt> right,        \
+                         V<EagerFrameState> eager_frame_state) { \
+    return BigIntBinop(left, right, eager_frame_state, {},       \
+                       BigIntBinopOp::Kind::k##kind);            \
+  }
+#define TERMINATING_BIGINT_BINOP(kind)                                   \
+  V<BigInt> BigInt##kind(V<BigInt> left, V<BigInt> right,                \
+                         V<EagerFrameState> eager_frame_state,           \
+                         V<LazyFrameState> lazy_frame_state) {           \
+    return BigIntBinop(left, right, eager_frame_state, lazy_frame_state, \
+                       BigIntBinopOp::Kind::k##kind);                    \
   }
   BIGINT_BINOP(Add)
   BIGINT_BINOP(Sub)
-  BIGINT_BINOP(Mul)
-  BIGINT_BINOP(Div)
-  BIGINT_BINOP(Mod)
+  TERMINATING_BIGINT_BINOP(Mul)
+  TERMINATING_BIGINT_BINOP(Div)
+  TERMINATING_BIGINT_BINOP(Mod)
   BIGINT_BINOP(BitwiseAnd)
   BIGINT_BINOP(BitwiseOr)
   BIGINT_BINOP(BitwiseXor)
   BIGINT_BINOP(ShiftLeft)
   BIGINT_BINOP(ShiftRightArithmetic)
 #undef BIGINT_BINOP
+#undef TERMINATING_BIGINT_BINOP
 
   V<Boolean> BigIntComparison(V<BigInt> left, V<BigInt> right,
                               BigIntComparisonOp::Kind kind) {
@@ -5681,8 +5696,8 @@ class AssemblerOpInterface : public Next {
   //   compile-time constant instance from the PipelineData and embed it.
   V<WasmTrustedInstanceData> WasmInstanceData() {
     if (Asm().data()->is_wasm()) {
-      return Parameter(wasm::kWasmInstanceDataParameterIndex,
-                       RegisterRepresentation::Tagged());
+      return Parameter<WasmTrustedInstanceData>(
+          wasm::kWasmInstanceDataParameterIndex);
     } else {
       DCHECK(!Asm().data()->wasm_instance().is_null());
       return HeapConstant(Asm().data()->wasm_instance());

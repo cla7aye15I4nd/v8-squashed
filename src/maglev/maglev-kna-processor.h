@@ -154,7 +154,7 @@ class RecomputeKnownNodeAspectsProcessor {
         DCHECK_GE(phi->input_count(), 1);
         NodeType new_type = NodeType::kNone;
         for (int i = 0; i < phi->input_count(); ++i) {
-          ValueNode* input = phi->input_node(i)->UnwrapIdentities();
+          ValueNode* input = phi->input_node(i)->UnwrapAliases();
           NodeType input_type =
               known_node_aspects_->GetTypeUnchecked(broker(), input);
           new_type = UnionType(new_type, input_type);
@@ -363,6 +363,10 @@ class RecomputeKnownNodeAspectsProcessor {
     return RecordType(node->input_node(0), NodeType::kNumber);
   }
 
+  ProcessResult ProcessNode(CheckedHoleyFloat64ToIndex* node) {
+    return RecordType(node->input_node(0), NodeType::kNumber);
+  }
+
 #define SAFE_CONVERSION_LIST(V)                                       \
   V(CheckedSmiUntag, int32, Smi)                                      \
   V(CheckedSmiTagInt32, tagged, Smi)                                  \
@@ -492,6 +496,21 @@ class RecomputeKnownNodeAspectsProcessor {
     if (!map.is_stable()) {
       known_node_aspects().MarkSideEffectsRequireInvalidation();
     }
+    return ProcessResult::kContinue;
+  }
+
+  ProcessResult ProcessNode(EnsureWritableFastElements* node) {
+    compiler::MapRef fixed_array_map = broker()->fixed_array_map();
+    DCHECK(fixed_array_map.is_stable());
+    if (!GetOrCreateInfoFor(node)->SetPossibleMaps(
+            PossibleMaps{fixed_array_map}, false,
+            StaticTypeForMap(fixed_array_map, broker()), broker(),
+            known_node_aspects())) {
+      return OnContradiction();
+    }
+    auto& props_for_key = known_node_aspects().GetLoadedPropertiesForKey(
+        PropertyConstness::kMutable, PropertyKey::Elements());
+    props_for_key[node->ObjectInput().node()] = node;
     return ProcessResult::kContinue;
   }
 

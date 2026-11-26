@@ -208,8 +208,7 @@ MaglevPhiRepresentationSelector::ProcessPhi(Phi* node) {
       DCHECK(input->is_tagged());
       // If we want to untag {node}, then we'll drop the conversion and use its
       // input instead.
-      ValueNode* unwrapped_conv_input =
-          input->input(0).node()->UnwrapIdentities();
+      ValueNode* unwrapped_conv_input = input->input(0).node()->UnwrapAliases();
       input_reprs.Add(
           unwrapped_conv_input->properties().value_representation());
       untagging_kinds[i] = UntaggingKind::kConversion;
@@ -813,7 +812,7 @@ void MaglevPhiRepresentationSelector::UntagConversionInput(
   // Unwrapping the conversion.
   DCHECK_EQ(input->value_representation(), ValueRepresentation::kTagged);
   // Needs to insert a new conversion.
-  ValueNode* bypassed_input = input->input(0).node()->UnwrapIdentities();
+  ValueNode* bypassed_input = input->input(0).node()->UnwrapAliases();
   ValueRepresentation from_repr = bypassed_input->value_representation();
   ValueNode* new_input;
   if (from_repr == repr) {
@@ -1270,6 +1269,15 @@ ProcessResult MaglevPhiRepresentationSelector::UpdateUntaggingOfPhi(
       // {phi} is a HoleyFloat64 (and thus, it could be a hole), but the
       // original untagging did not allow holes.
       needed_conversion = Opcode::kCheckedHoleyFloat64ToFloat64;
+    }
+  }
+
+  if (old_untagging->Is<CheckedObjectToIndex>()) {
+    // Keep accepting -0, unlike the generic Float64 to Int32 conversions.
+    if (needed_conversion == Opcode::kCheckedFloat64ToInt32) {
+      needed_conversion = Opcode::kCheckedFloat64ToIndex;
+    } else if (needed_conversion == Opcode::kCheckedHoleyFloat64ToInt32) {
+      needed_conversion = Opcode::kCheckedHoleyFloat64ToIndex;
     }
   }
 

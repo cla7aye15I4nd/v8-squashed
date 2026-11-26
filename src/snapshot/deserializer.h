@@ -67,7 +67,6 @@ class Deserializer : public SerializerDeserializer {
 
   void DeserializeDeferredObjects();
   void DeserializeFixedTrustedSection();
-  // For code caches. The untrusted section has the root and is read first.
   DirectHandle<HeapObject> DeserializeUntrustedSection();
   void DeserializeTrustedSection();
 
@@ -80,8 +79,12 @@ class Deserializer : public SerializerDeserializer {
 
   // This returns the address of an object that has been described in the
   // snapshot by object vector index.
-  Handle<HeapObject> GetBackReferencedObject();
   Handle<HeapObject> GetBackReferencedObject(uint32_t index);
+  // Returns an object of the untrusted section by back reference index.
+  Handle<HeapObject> GetUntrustedBackReferencedObject(uint32_t index) const {
+    DCHECK_EQ(section_, Section::kTrusted);
+    return untrusted_back_refs_[index];
+  }
 
   // Add an object to back an attached reference. The order to add objects must
   // mirror the order they are added in the serializer.
@@ -326,7 +329,12 @@ class Deserializer : public SerializerDeserializer {
   std::vector<EncodedExternalReference> external_references_;
   std::vector<JSDispatchHandle> trusted_dispatch_handles_;
   std::vector<IndirectHandle<HeapObject>> untrusted_back_refs_;
-  std::vector<std::pair<uint32_t, UnresolvedForwardRef>> trusted_export_refs_;
+  struct TrustedExportRef {
+    uint32_t index;
+    IndirectHandle<HeapObject> object;
+    int offset;
+  };
+  std::vector<TrustedExportRef> trusted_export_refs_;
 
   // With the sandbox, the SnapshotTrustLevel decides which sections a snapshot
   // has. Without the sandbox, every snapshot has a single section that combines
