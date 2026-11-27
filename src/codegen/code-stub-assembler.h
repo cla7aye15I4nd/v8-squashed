@@ -2944,7 +2944,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   // JSProxy or an object with interceptors.
   TNode<BoolT> InstanceTypeEqual(TNode<Int32T> instance_type, int type);
   TNode<BoolT> IsNoElementsProtectorCellInvalid();
-  TNode<BoolT> IsMegaDOMProtectorCellInvalid();
   TNode<BoolT> IsArrayIteratorProtectorCellInvalid();
   TNode<BoolT> IsBigIntInstanceType(TNode<Int32T> instance_type);
   TNode<BoolT> IsBigInt(TNode<HeapObject> object);
@@ -3116,7 +3115,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> IsTypedArraySpeciesProtectorCellInvalid();
   TNode<BoolT> IsRegExpSpeciesProtectorCellInvalid();
   TNode<BoolT> IsPromiseSpeciesProtectorCellInvalid();
-  TNode<BoolT> IsNumberStringNotRegexpLikeProtectorCellInvalid();
   TNode<BoolT> IsSetIteratorProtectorCellInvalid();
   TNode<BoolT> IsMapIteratorProtectorCellInvalid();
   TNode<BoolT> IsStringWrapperToPrimitiveProtectorCellInvalid();
@@ -4623,10 +4621,6 @@ class V8_EXPORT_PRIVATE CodeStubAssembler
   TNode<BoolT> IsContextPromiseHookEnabled(TNode<Uint32T> flags);
 #endif
   TNode<BoolT> IsIsolatePromiseHookEnabled(TNode<Uint32T> flags);
-  TNode<BoolT> IsAnyPromiseHookEnabled(TNode<Uint32T> flags);
-  TNode<BoolT> IsAnyPromiseHookEnabled() {
-    return IsAnyPromiseHookEnabled(PromiseHookFlags());
-  }
   TNode<BoolT> IsIsolatePromiseHookEnabledOrHasAsyncEventDelegate(
       TNode<Uint32T> flags);
   TNode<BoolT> IsIsolatePromiseHookEnabledOrHasAsyncEventDelegate() {

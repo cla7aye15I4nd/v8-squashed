@@ -42,6 +42,8 @@
 #include "include/v8-sandbox.h"
 #include "include/v8-snapshot.h"
 #include "src/api/api-inl.h"
+#include "src/base/memory.h"
+#include "src/base/numerics/safe_conversions.h"
 #include "src/base/platform/platform.h"
 #include "src/base/unique-array.h"
 #include "src/codegen/compilation-cache.h"
@@ -2100,6 +2102,86 @@ TEST_F(SerializeTest, CodeSerializerWithProfiler) {
 
   isolate->SetIsProfiling(false);
   delete cache;
+}
+
+TEST_F(SerializeTest, CodeSerializerSkipsScriptCachedFields) {
+  FlagScope<bool> lazy(&v8_flags.lazy, true);
+  FlagScope<bool> stress_lazy(&v8_flags.stress_lazy, false);
+
+  Isolate* isolate = i_isolate();
+  isolate->compilation_cache()->DisableScriptAndEval();
+
+  v8::HandleScope scope(v8_isolate());
+
+  const char* source = "function inner() {\n  return 42;\n}\ninner();\n";
+  Handle<String> orig_source =
+      isolate->factory()->NewStringFromUtf8(source).ToHandleChecked();
+  Handle<String> copy_source =
+      isolate->factory()->NewStringFromUtf8(source).ToHandleChecked();
+
+  ScriptDetails default_script_details;
+  ScriptCompiler::CompilationDetails details;
+  DirectHandle<SharedFunctionInfo> sfi =
+      Compiler::GetSharedFunctionInfoForScript(
+          isolate, orig_source, default_script_details,
+          v8::ScriptCompiler::kProduceCompileHints,
+          ScriptCompiler::kNoCacheNoReason, NOT_NATIVES_CODE, &details)
+          .ToHandleChecked();
+  DirectHandle<Script> script(Cast<Script>(sfi->script()), isolate);
+  Script::InitLineEnds(isolate, script);
+  ASSERT_TRUE(script->has_line_ends());
+
+  DirectHandle<JSFunction> top_level =
+      Factory::JSFunctionBuilder{isolate, sfi, isolate->native_context()}
+          .Build();
+  DirectHandle<JSObject> global(isolate->context()->global_object(), isolate);
+  DirectHandle<Object> orig_result =
+      Execution::CallScript(isolate, top_level, global,
+                            isolate->factory()->empty_fixed_array())
+          .ToHandleChecked();
+  ASSERT_EQ(42, Cast<Smi>(*orig_result).value());
+  ASSERT_TRUE(IsArrayList(script->compiled_lazy_function_positions()));
+
+  DirectHandle<UnionOf<FixedArray, Smi>> line_ends_before(script->line_ends(),
+                                                          isolate);
+  DirectHandle<UnionOf<ArrayList, Undefined>> compile_hints_before(
+      script->compiled_lazy_function_positions(), isolate);
+
+  std::unique_ptr<ScriptCompiler::CachedData> cached_data(
+      ScriptCompiler::CreateCodeCache(ToApiHandle<UnboundScript>(sfi)));
+  ASSERT_NE(cached_data, nullptr);
+
+  // Serialization must leave cached fields untouched on the live Script.
+  EXPECT_EQ(script->line_ends(), *line_ends_before);
+  EXPECT_EQ(script->compiled_lazy_function_positions(), *compile_hints_before);
+
+  // The serialized payload itself must still omit line_ends and compile hints,
+  // while keeping all surrounding Script fields intact.
+  uint8_t* buffer = NewArray<uint8_t>(cached_data->length);
+  MemCopy(buffer, cached_data->data, cached_data->length);
+  AlignedCachedData aligned_cache(buffer, cached_data->length);
+  aligned_cache.AcquireDataOwnership();
+  DirectHandle<SharedFunctionInfo> deserialized =
+      CompileScript(isolate, copy_source, default_script_details,
+                    &aligned_cache, v8::ScriptCompiler::kConsumeCodeCache);
+  DirectHandle<Script> deserialized_script(Cast<Script>(deserialized->script()),
+                                           isolate);
+  EXPECT_NE(*deserialized_script, *script);
+  if (!isolate->NeedsSourcePositions()) {
+    EXPECT_FALSE(deserialized_script->has_line_ends());
+  }
+  EXPECT_TRUE(
+      IsUndefined(deserialized_script->compiled_lazy_function_positions()));
+
+  DirectHandle<JSFunction> deserialized_fun =
+      Factory::JSFunctionBuilder{isolate, deserialized,
+                                 isolate->native_context()}
+          .Build();
+  DirectHandle<Object> deserialized_result =
+      Execution::CallScript(isolate, deserialized_fun, global,
+                            isolate->factory()->empty_fixed_array())
+          .ToHandleChecked();
+  EXPECT_EQ(42, Cast<Smi>(*deserialized_result).value());
 }
 
 void TestCodeSerializerOnePlusOneImpl(Isolate* isolate,
@@ -8188,6 +8270,120 @@ TEST_F(UninitializedSerializeTest, SerializeWeakRootArrayConstantsLeak) {
   }
   delete[] blob.data;
   FreeCurrentEmbeddedBlob();
+}
+
+TEST_F(SerializeTest, DeserializeProtectedPointerFromStartupObjectCache) {
+  struct SnapshotBytecodes : public SerializerDeserializer {
+    using SerializerDeserializer::FixedRawDataWithSize;
+    using SerializerDeserializer::kInitializeSelfTrustedPointer;
+    using SerializerDeserializer::kNop;
+    using SerializerDeserializer::kProtectedPointerPrefix;
+    using SerializerDeserializer::kRootArray;
+    using SerializerDeserializer::kStartupObjectCache;
+    using SerializerDeserializer::kSynchronize;
+    using SerializerDeserializer::NewObject;
+  };
+
+  auto pad = [](SnapshotByteSink* sink) {
+    for (int i = 0; i < 3; i++) sink->Put(SnapshotBytecodes::kNop, "padding");
+    while (!IsAligned(sink->Position(), kPointerAlignment)) {
+      sink->Put(SnapshotBytecodes::kNop, "padding");
+    }
+  };
+
+  HandleScope scope(i_isolate());
+  DirectHandle<Context> default_context =
+      v8::Utils::OpenDirectHandle(*v8_context());
+  v8::Local<v8::Value> fun_val = CompileRun(
+      v8_isolate(),
+      "(function() { function f() { return 1; } f(); return f; })()");
+  DirectHandle<JSFunction> fun =
+      Cast<JSFunction>(v8::Utils::OpenDirectHandle(*fun_val));
+  DirectHandle<BytecodeArray> bytecode =
+      i_isolate()->factory()->CopyBytecodeArray(direct_handle(
+          fun->shared()->GetBytecodeArray(i_isolate()), i_isolate()));
+
+  std::vector<Tagged<Object>>* cache = i_isolate()->startup_object_cache();
+  CHECK(!cache->empty());
+  Tagged<Object> undefined = ReadOnlyRoots(i_isolate()).undefined_value();
+  CHECK(cache->back().SafeEquals(undefined));
+  uint32_t context_idx = base::checked_cast<uint32_t>(cache->size() - 1);
+  uint32_t bytecode_idx = context_idx + 1;
+  (*cache)[context_idx] = *default_context;
+  cache->push_back(*bytecode);
+  cache->push_back(undefined);
+
+  SnapshotByteSink untrusted;
+  untrusted.Put(SnapshotBytecodes::kStartupObjectCache, "context");
+  untrusted.PutUint30(context_idx, "context_idx");
+  untrusted.Put(SnapshotBytecodes::kSynchronize, "end_deferred");
+  untrusted.Put(SnapshotBytecodes::kSynchronize, "end_untrusted");
+  pad(&untrusted);
+
+  uint8_t zero_slot[kTaggedSize] = {};
+  SnapshotByteSink trusted;
+  trusted.PutUint30(0, "external_ref_count");
+  trusted.Put(SnapshotBytecodes::NewObject::Encode(SnapshotSpace::kTrusted),
+              "InterpreterData");
+  trusted.Put(SnapshotBytecodes::kRootArray, "InterpreterDataMap");
+  trusted.PutUint30(static_cast<uint32_t>(RootIndex::kInterpreterDataMap),
+                    "map");
+#ifdef V8_ENABLE_SANDBOX
+  trusted.Put(SnapshotBytecodes::kInitializeSelfTrustedPointer, "self");
+#endif
+  trusted.Put(SnapshotBytecodes::kProtectedPointerPrefix, "protected");
+  trusted.Put(SnapshotBytecodes::kStartupObjectCache, "bytecode");
+  trusted.PutUint30(bytecode_idx, "bytecode_idx");
+  trusted.Put(SnapshotBytecodes::FixedRawDataWithSize::Encode(1), "trampoline");
+  trusted.PutRaw(zero_slot, sizeof(zero_slot), "trampoline");
+  trusted.Put(SnapshotBytecodes::kSynchronize, "end_trusted");
+  pad(&trusted);
+
+  constexpr uint32_t kHeaderSize =
+      SnapshotData::kTrustedPayloadLengthOffset + kUInt32Size;
+  uint32_t trusted_len = base::checked_cast<uint32_t>(trusted.data()->size());
+  uint32_t payload_len =
+      trusted_len + base::checked_cast<uint32_t>(untrusted.data()->size());
+  std::vector<uint8_t> bytes(kHeaderSize + payload_len);
+  auto set_u32 = [&](uint32_t off, uint32_t val) {
+    base::WriteLittleEndianValue<uint32_t>(
+        reinterpret_cast<Address>(bytes.data() + off), val);
+  };
+  set_u32(SnapshotData::kMagicNumberOffset, SnapshotData::kMagicNumber);
+  set_u32(SnapshotData::kPayloadLengthOffset, payload_len);
+  set_u32(SnapshotData::kTrustedPayloadLengthOffset, trusted_len);
+  std::copy(trusted.data()->begin(), trusted.data()->end(),
+            bytes.begin() + kHeaderSize);
+  std::copy(untrusted.data()->begin(), untrusted.data()->end(),
+            bytes.begin() + kHeaderSize + trusted_len);
+
+  SnapshotData snapshot(base::VectorOf(bytes));
+  DirectHandle<JSGlobalProxy> global_proxy =
+      i_isolate()->factory()->NewUninitializedJSGlobalProxy(
+          JSGlobalProxy::SizeWithEmbedderFields(0));
+  DirectHandle<Context> result =
+      ContextDeserializer::DeserializeContext(
+          i_isolate(), &snapshot, 0, false, global_proxy,
+          DeserializeEmbedderFieldsCallback())
+          .ToHandleChecked();
+  CHECK_EQ(*result, *default_context);
+
+  cache->resize(context_idx + 1);
+  (*cache)[context_idx] = undefined;
+
+  HeapObjectIterator it(i_isolate()->heap());
+  DisallowGarbageCollection no_gc;
+  bool found = false;
+  for (Tagged<HeapObject> obj = it.Next(); !obj.is_null(); obj = it.Next()) {
+    if (!IsInterpreterData(obj)) continue;
+    Tagged<InterpreterData> data = TrustedCast<InterpreterData>(obj);
+    if (data->bytecode_array() == *bytecode) {
+      CHECK(!data->has_interpreter_trampoline());
+      found = true;
+      break;
+    }
+  }
+  CHECK(found);
 }
 
 }  // namespace serialize_unittest

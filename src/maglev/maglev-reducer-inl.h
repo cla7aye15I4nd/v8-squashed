@@ -171,15 +171,14 @@ ReduceResult MaglevReducer<BaseT>::AddNewNode(
   DCHECK_EQ(inputs.size(), NodeT::kInputCount);
   if constexpr (Node::participate_in_cse(Node::opcode_of<NodeT>) &&
                 ReducerBaseWithKNA<BaseT>) {
-    if (v8_flags.maglev_cse) {
-      return AddNewNodeOrGetEquivalent<NodeT>(true, inputs,
-                                              std::forward<Args>(args)...);
-    }
+    return AddNewNodeOrGetEquivalent<NodeT>(true, inputs,
+                                            std::forward<Args>(args)...);
+  } else {
+    NodeT* node = NodeBase::New<NodeT>(zone(), inputs.size(),
+                                       std::forward<Args>(args)...);
+    RETURN_IF_ABORT(SetNodeInputs(node, inputs));
+    return AttachExtraInfoAndAddToGraph(node);
   }
-  NodeT* node =
-      NodeBase::New<NodeT>(zone(), inputs.size(), std::forward<Args>(args)...);
-  RETURN_IF_ABORT(SetNodeInputs(node, inputs));
-  return AttachExtraInfoAndAddToGraph(node);
 }
 
 template <typename BaseT>
@@ -190,18 +189,17 @@ NodeT* MaglevReducer<BaseT>::AddNewNodeNoInputConversion(
   DCHECK_EQ(inputs.size(), NodeT::kInputCount);
   if constexpr (Node::participate_in_cse(Node::opcode_of<NodeT>) &&
                 ReducerBaseWithKNA<BaseT>) {
-    if (v8_flags.maglev_cse) {
-      ReduceResult result = AddNewNodeOrGetEquivalent<NodeT>(
-          false, inputs, std::forward<Args>(args)...);
-      // Without input conversion, AddNewNodeOrGetEquivalent cannot bail out.
-      DCHECK(result.IsDoneWithPayload());
-      return result.node()->Cast<NodeT>();
-    }
+    ReduceResult result = AddNewNodeOrGetEquivalent<NodeT>(
+        false, inputs, std::forward<Args>(args)...);
+    // Without input conversion, AddNewNodeOrGetEquivalent cannot bail out.
+    DCHECK(result.IsDoneWithPayload());
+    return result.node()->Cast<NodeT>();
+  } else {
+    NodeT* node = NodeBase::New<NodeT>(zone(), inputs.size(),
+                                       std::forward<Args>(args)...);
+    SetNodeInputsNoConversion(node, inputs);
+    return AttachExtraInfoAndAddToGraph(node);
   }
-  NodeT* node =
-      NodeBase::New<NodeT>(zone(), inputs.size(), std::forward<Args>(args)...);
-  SetNodeInputsNoConversion(node, inputs);
-  return AttachExtraInfoAndAddToGraph(node);
 }
 
 template <typename BaseT>
@@ -251,7 +249,6 @@ template <typename NodeT, typename... Args>
 ReduceResult MaglevReducer<BaseT>::AddNewNodeOrGetEquivalent(
     bool convert_inputs, std::initializer_list<ValueNode*> raw_inputs,
     Args&&... args) {
-  DCHECK(v8_flags.maglev_cse);
   static constexpr Opcode op = Node::opcode_of<NodeT>;
   static_assert(Node::participate_in_cse(op));
   using options_result =
@@ -279,34 +276,43 @@ ReduceResult MaglevReducer<BaseT>::AddNewNodeOrGetEquivalent(
       }
       i++;
     }
-    cse::CanonicalizeCommutative<NodeT>(inputs);
   }
 
-  uint32_t hash = static_cast<uint32_t>(cse::fast_hash_combine(
-      cse::fast_hash_combine(base::hash_value(op), std::forward<Args>(args)...),
-      inputs));
-  NodeT* node = known_node_aspects().template FindExpression<NodeT>(
-      hash, inputs, std::forward<Args>(args)...);
-  if (node) return node;
+  uint32_t hash = 0;
+  if (v8_flags.maglev_cse) {
+    if constexpr (NodeT::kInputCount > 0) {
+      cse::CanonicalizeCommutative<NodeT>(inputs);
+    }
+    hash = static_cast<uint32_t>(cse::fast_hash_combine(
+        cse::fast_hash_combine(base::hash_value(op),
+                               std::forward<Args>(args)...),
+        inputs));
+    NodeT* node = known_node_aspects().template FindExpression<NodeT>(
+        hash, inputs, std::forward<Args>(args)...);
+    if (node) return node;
 
-  if constexpr (Node::opcode_of<NodeT> == Opcode::kLoadFixedArrayElement) {
-    if (LoadFixedArrayElement* cached =
-            known_node_aspects().TryFindTaggedKeyedProperty(inputs[0],
-                                                            inputs[1])) {
-      if (cached->options() ==
-          std::forward_as_tuple(std::forward<Args>(args)...)) {
-        return cached;
+    if constexpr (Node::opcode_of<NodeT> == Opcode::kLoadFixedArrayElement) {
+      if (LoadFixedArrayElement* cached =
+              known_node_aspects().TryFindTaggedKeyedProperty(inputs[0],
+                                                              inputs[1])) {
+        if (cached->options() ==
+            std::forward_as_tuple(std::forward<Args>(args)...)) {
+          return cached;
+        }
       }
     }
   }
 
-  node =
+  NodeT* node =
       NodeBase::New<NodeT>(zone(), inputs.size(), std::forward<Args>(args)...);
   SetNodeInputsNoConversion(node, inputs);
   DCHECK_EQ(node->options(), std::tuple{std::forward<Args>(args)...});
-  known_node_aspects().AddExpression(hash, node);
-  if constexpr (Node::opcode_of<NodeT> == Opcode::kLoadFixedArrayElement) {
-    known_node_aspects().RecordTaggedKeyedProperty(inputs[0], inputs[1], node);
+  if (v8_flags.maglev_cse) {
+    known_node_aspects().AddExpression(hash, node);
+    if constexpr (Node::opcode_of<NodeT> == Opcode::kLoadFixedArrayElement) {
+      known_node_aspects().RecordTaggedKeyedProperty(inputs[0], inputs[1],
+                                                     node);
+    }
   }
   return AttachExtraInfoAndAddToGraph(node);
 }
@@ -694,7 +700,7 @@ bool MaglevReducer<BaseT>::CanElideWriteBarrier(ValueNode* object,
   // a Smi when tagged.
   if (ValueNode* tagged_alt = known_node_aspects().TryGetAlternativeFor(
           value, UseRepresentation::kTagged)) {
-    DCHECK(tagged_alt->is_conversion() || tagged_alt->Is<ReturnedValue>());
+    DCHECK(tagged_alt->is_conversion());
     return CheckType(tagged_alt, NodeType::kSmi);
   }
   return false;
@@ -2450,6 +2456,9 @@ ReduceResult MaglevReducer<BaseT>::BuildCheckValueByReference(
     DeoptimizeReason reason) {
   DCHECK(!ref.IsSmi());
   DCHECK(!ref.IsHeapNumber());
+  // We cannot guarantee that a non-internalized string's canonical identity
+  // stays the same due to internalization and ThinStrings.
+  DCHECK(!ref.IsString() || ref.IsInternalizedString());
 
   if (!IsInstanceOfNodeType(ref.map(broker()), GetType(node), broker())) {
     return EmitUnconditionalDeopt(reason);
@@ -2473,6 +2482,7 @@ void MaglevReducer<BaseT>::SetKnownValue(ValueNode* node,
                                          NodeType new_node_type) {
   DCHECK(!node->Is<HeapConstant>());
   DCHECK(!node->Is<RootConstant>());
+  DCHECK(!ref.IsString() || ref.IsInternalizedString());
   // Constants already carry their value and must not attach a checked_value
   // alternative (TryGetConstantAlternative ignores constants, so repeated
   // checks would otherwise overwrite checked_value).
@@ -7818,8 +7828,7 @@ inline bool IsSmallFunction(int bytecode_length,
   const bool has_heapnumber_input_output =
       use_repr_hints.contains_any(kHeapNumRepresentations) ||
       std::ranges::any_of(arguments, [](ValueNode* input) {
-        DCHECK(!input->is_conversion() && !input->Is<Identity>() &&
-               !input->Is<ReturnedValue>());
+        DCHECK(!input->is_conversion() && !input->Is<Identity>());
         return IsFloat64OrHeapNumberConstant(input);
       });
 

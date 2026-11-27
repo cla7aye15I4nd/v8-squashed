@@ -134,6 +134,11 @@ v8_flag(
 
 v8_flag(name = "v8_enable_object_print")
 
+v8_flag(
+    name = "v8_enable_promise_hooks",
+    default = True,
+)
+
 v8_flag(name = "v8_enable_slow_dchecks")
 
 v8_flag(name = "v8_enable_snapshot_code_comments")
@@ -624,6 +629,7 @@ v8_config(
         "v8_enable_future": "V8_ENABLE_FUTURE",
         "v8_enable_lazy_source_positions": "V8_ENABLE_LAZY_SOURCE_POSITIONS",
         "v8_enable_object_print": "OBJECT_PRINT",
+        "v8_enable_promise_hooks": "V8_ENABLE_PROMISE_HOOKS",
         "v8_enable_slow_dchecks": "ENABLE_SLOW_DCHECKS",
         "v8_enable_runtime_call_stats": "V8_RUNTIME_CALL_STATS",
         "v8_enable_snapshot_native_code_counters": "V8_SNAPSHOT_NATIVE_CODE_COUNTERS",
@@ -1416,7 +1422,6 @@ filegroup(
         "src/objects/literal-objects.tq",
         "src/objects/managed.tq",
         "src/objects/map.tq",
-        "src/objects/megadom-handler.tq",
         "src/objects/microtask.tq",
         "src/objects/module.tq",
         "src/objects/name.tq",
@@ -2046,8 +2051,6 @@ filegroup(
         "src/heap/marking-worklist-inl.h",
         "src/heap/memory-allocator.cc",
         "src/heap/memory-allocator.h",
-        "src/heap/memory-balancer.cc",
-        "src/heap/memory-balancer.h",
         "src/heap/mutable-page.cc",
         "src/heap/mutable-page.h",
         "src/heap/mutable-page-inl.h",
@@ -2402,8 +2405,6 @@ filegroup(
         "src/objects/map-updater.h",
         "src/objects/maybe-object.h",
         "src/objects/maybe-object-inl.h",
-        "src/objects/megadom-handler.h",
-        "src/objects/megadom-handler-inl.h",
         "src/objects/microtask.h",
         "src/objects/microtask-inl.h",
         "src/objects/module.cc",

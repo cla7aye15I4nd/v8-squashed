@@ -76,7 +76,6 @@ constexpr bool ShouldResetProtectorForReprl(ProtectorId id) {
     case ProtectorId::kIsConcatSpreadableLookupChain:
     case ProtectorId::kMapIteratorLookupChain:
     case ProtectorId::kNoElements:
-    case ProtectorId::kNumberStringNotRegexpLike:
     case ProtectorId::kPromiseResolveLookupChain:
     case ProtectorId::kPromiseSpeciesLookupChain:
     case ProtectorId::kPromiseThenLookupChain:
@@ -104,10 +103,6 @@ constexpr bool ShouldResetProtectorForReprl(ProtectorId id) {
     // Isolate-level state that can remain active across iterations.
     case ProtectorId::kNoProfiling:
     case ProtectorId::kPromiseHook:
-      return false;
-
-    // Embedder DOM IC protector, conservatively kept unreset.
-    case ProtectorId::kMegaDOM:
       return false;
 
     // Once invalidated, detaching stops updating views in place; resetting

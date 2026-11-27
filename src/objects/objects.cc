@@ -68,7 +68,6 @@
 #include "src/objects/lookup-inl.h"
 #include "src/objects/map-inl.h"
 #include "src/objects/map.h"
-#include "src/objects/megadom-handler-inl.h"
 #include "src/objects/microtask-inl.h"
 #include "src/objects/module-inl.h"
 #include "src/objects/object-conversions-inl.h"
@@ -2005,10 +2004,6 @@ void Struct::BriefPrintDetails(std::ostream& os) {}
 
 void Tuple2::BriefPrintDetails(std::ostream& os) {
   os << " " << Brief(value1()) << ", " << Brief(value2());
-}
-
-void MegaDomHandler::BriefPrintDetails(std::ostream& os) {
-  os << " " << Brief(accessor(kAcquireLoad)) << ", " << Brief(context());
 }
 
 void ClassPositions::BriefPrintDetails(std::ostream& os) {
@@ -5087,8 +5082,8 @@ MaybeHandle<JSPromise> JSPromise::PerformPromiseAll(
 
   if (length >= static_cast<int>(PropertyArray::HashField::kMax)) {
     DirectHandle<Object> error = factory->NewRangeError(
-        MessageTemplate::kTooManyElementsInPromiseCombinator,
-        factory->NewStringFromAsciiChecked("all"));
+        MessageTemplate::kTooManyElements,
+        factory->NewStringFromAsciiChecked("Promise.all"));
     RETURN_ON_EXCEPTION(isolate, Execution::Call(isolate, capability_reject,
                                                  factory->undefined_value(),
                                                  base::VectorOf(&error, 1)));

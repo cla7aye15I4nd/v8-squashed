@@ -433,6 +433,13 @@ static_assert(!V8_DICT_PROTOTYPES_BOOL || V8_DICT_PROPERTY_CONST_TRACKING_BOOL);
 #define V8_X64_16BYTE_STACK_ALIGNMENT_BOOL false
 #endif
 
+// JavaScript Promise hooks require C++ Promise hooks support.
+#if defined(V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS) && \
+    !defined(V8_ENABLE_PROMISE_HOOKS)
+#error Inconsistent build configuration: To build V8 with JavaScript Promise \
+hooks, set V8_ENABLE_PROMISE_HOOKS as well.
+#endif
+
 #ifdef V8_ENABLE_EXPERIMENTAL_TQ_TO_TSA
 #ifndef V8_ENABLE_EXPERIMENTAL_TSA_BUILTINS
 #error "tq-to-tsa is not supported without tsa builtins"
@@ -1966,8 +1973,6 @@ enum class InlineCacheState {
   RECOMPUTE_HANDLER,
   // Multiple receiver types have been seen.
   POLYMORPHIC,
-  // Many DOM receiver types have been seen for the same accessor.
-  MEGADOM,
   // Many receiver types have been seen with the same handler.
   HOMOMORPHIC,
   // Many receiver types have been seen.
@@ -1997,8 +2002,6 @@ inline const char* InlineCacheState2String(InlineCacheState state) {
       return "HOMOMORPHIC";
     case InlineCacheState::MEGAMORPHIC:
       return "MEGAMORPHIC";
-    case InlineCacheState::MEGADOM:
-      return "MEGADOM";
     case InlineCacheState::GENERIC:
       return "GENERIC";
   }

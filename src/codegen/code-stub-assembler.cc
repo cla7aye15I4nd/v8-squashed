@@ -9,6 +9,7 @@
 #include <array>
 #include <functional>
 #include <optional>
+#include <type_traits>
 
 #include "include/v8-internal.h"
 #include "src/base/iterator.h"
@@ -4882,7 +4883,7 @@ TNode<BigInt> CodeStubAssembler::AllocateRawBigInt(TNode<IntPtrT> length) {
   TNode<HeapObject> raw_result = Allocate(size);
   StoreMapNoWriteBarrier(raw_result, RootIndex::kBigIntMap);
 #ifdef BIGINT_NEEDS_PADDING
-  static_assert(arraysize(BigInt::padding_) == sizeof(int32_t));
+  static_assert(std::extent_v<decltype(BigInt::padding_)> == sizeof(int32_t));
   StoreObjectFieldNoWriteBarrier(raw_result, offsetof(BigInt, padding_),
                                  Int32Constant(0));
 #endif
@@ -8453,14 +8454,6 @@ TNode<BoolT> CodeStubAssembler::IsNoElementsProtectorCellInvalid() {
   return TaggedEqual(cell_value, invalid);
 }
 
-TNode<BoolT> CodeStubAssembler::IsMegaDOMProtectorCellInvalid() {
-  TNode<Smi> invalid = SmiConstant(Protectors::kProtectorInvalid);
-  TNode<PropertyCell> cell = MegaDOMProtectorConstant();
-  TNode<Object> cell_value =
-      LoadObjectField(cell, offsetof(PropertyCell, value_));
-  return TaggedEqual(cell_value, invalid);
-}
-
 TNode<BoolT> CodeStubAssembler::IsArrayIteratorProtectorCellInvalid() {
   TNode<Smi> invalid = SmiConstant(Protectors::kProtectorInvalid);
   TNode<PropertyCell> cell = ArrayIteratorProtectorConstant();
@@ -8520,16 +8513,6 @@ TNode<BoolT> CodeStubAssembler::IsRegExpSpeciesProtectorCellInvalid() {
 TNode<BoolT> CodeStubAssembler::IsPromiseSpeciesProtectorCellInvalid() {
   TNode<Smi> invalid = SmiConstant(Protectors::kProtectorInvalid);
   TNode<PropertyCell> cell = PromiseSpeciesProtectorConstant();
-  TNode<Object> cell_value =
-      LoadObjectField(cell, offsetof(PropertyCell, value_));
-  return TaggedEqual(cell_value, invalid);
-}
-
-// TODO(petamoriken): delete this unused function
-TNode<BoolT>
-CodeStubAssembler::IsNumberStringNotRegexpLikeProtectorCellInvalid() {
-  TNode<Smi> invalid = SmiConstant(Protectors::kProtectorInvalid);
-  TNode<PropertyCell> cell = NumberStringNotRegexpLikeProtectorConstant();
   TNode<Object> cell_value =
       LoadObjectField(cell, offsetof(PropertyCell, value_));
   return TaggedEqual(cell_value, invalid);
@@ -12776,7 +12759,7 @@ TNode<Object> CodeStubAssembler::CallGetterIfAccessorAndBailoutOnLazyClosures(
     Label* if_bailout, GetOwnPropertyMode mode) {
   TVARIABLE(Object, var_value, value);
   Label done(this), if_accessor_info(this, Label::kDeferred), if_data(this),
-      if_not_data(this);
+      if_not_data(this, Label::kDeferred);
 
   TNode<Uint32T> kind = DecodeWord32<PropertyDetails::KindField>(details);
   Branch(
@@ -19600,7 +19583,7 @@ TNode<UintPtrT>
 CodeStubAssembler::LoadVariableLengthJSArrayBufferViewByteLength(
     TNode<JSArrayBufferView> array, TNode<JSArrayBuffer> buffer,
     TypedArrayAccessMode mode, Label* fail) {
-  Label is_gsab(this), is_rab(this), end(this);
+  Label is_gsab(this, Label::kDeferred), is_rab(this), end(this);
   TVARIABLE(UintPtrT, result);
   TNode<UintPtrT> array_byte_offset = LoadJSArrayBufferViewByteOffset(array);
 
@@ -20085,15 +20068,13 @@ TNode<Uint32T> CodeStubAssembler::PromiseHookFlags() {
     ExternalReference::promise_hook_flags_address(isolate())));
 }
 
-TNode<BoolT> CodeStubAssembler::IsAnyPromiseHookEnabled(TNode<Uint32T> flags) {
-  uint32_t mask = Isolate::PromiseHookFields::HasContextPromiseHook::kMask |
-                  Isolate::PromiseHookFields::HasIsolatePromiseHook::kMask;
-  return IsSetWord32(flags, mask);
-}
-
 TNode<BoolT> CodeStubAssembler::IsIsolatePromiseHookEnabled(
     TNode<Uint32T> flags) {
+#ifdef V8_ENABLE_PROMISE_HOOKS
   return IsSetWord32<Isolate::PromiseHookFields::HasIsolatePromiseHook>(flags);
+#else
+  return Int32FalseConstant();
+#endif  // V8_ENABLE_PROMISE_HOOKS
 }
 
 #ifdef V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
@@ -20106,19 +20087,29 @@ TNode<BoolT> CodeStubAssembler::IsContextPromiseHookEnabled(
 TNode<BoolT>
 CodeStubAssembler::IsIsolatePromiseHookEnabledOrHasAsyncEventDelegate(
     TNode<Uint32T> flags) {
+#ifdef V8_ENABLE_PROMISE_HOOKS
   uint32_t mask = Isolate::PromiseHookFields::HasIsolatePromiseHook::kMask |
                   Isolate::PromiseHookFields::HasAsyncEventDelegate::kMask;
   return IsSetWord32(flags, mask);
+#else
+  return IsSetWord32<Isolate::PromiseHookFields::HasAsyncEventDelegate>(flags);
+#endif  // V8_ENABLE_PROMISE_HOOKS
 }
 
 // LINT.IfChange(PromiseHookFlags)
 TNode<BoolT> CodeStubAssembler::
     IsIsolatePromiseHookEnabledOrDebugIsActiveOrHasAsyncEventDelegate(
         TNode<Uint32T> flags) {
+#ifdef V8_ENABLE_PROMISE_HOOKS
   uint32_t mask = Isolate::PromiseHookFields::HasIsolatePromiseHook::kMask |
                   Isolate::PromiseHookFields::HasAsyncEventDelegate::kMask |
                   Isolate::PromiseHookFields::IsDebugActive::kMask;
   return IsSetWord32(flags, mask);
+#else
+  // Without V8_ENABLE_PROMISE_HOOKS, only HasAsyncEventDelegate and
+  // IsDebugActive can ever be set in promise_hook_flags_.
+  return NeedsAnyPromiseHooks(flags);
+#endif  // V8_ENABLE_PROMISE_HOOKS
 }
 // LINT.ThenChange(../compiler/turboshaft/wasm-wrappers.h:PromiseHookFlags)
 

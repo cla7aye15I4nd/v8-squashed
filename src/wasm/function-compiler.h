@@ -17,6 +17,7 @@
 #include "src/codegen/compiler.h"
 #include "src/wasm/baseline/liftoff-bailout-reasons.h"
 #include "src/wasm/compilation-environment.h"
+#include "src/wasm/effect-handler.h"
 #include "src/wasm/function-body-decoder.h"
 #include "src/wasm/wasm-code-manager.h"
 #include "src/wasm/wasm-deopt-data.h"
@@ -26,6 +27,7 @@
 
 namespace v8::internal::wasm {
 
+class LiftoffCompilationContext;
 class NativeModule;
 struct WasmFunction;
 
@@ -74,6 +76,9 @@ struct WasmCompilationResult {
   explicit operator bool() const { return succeeded(); }
 
   CodeDesc code_desc = {};
+  // Owns the memory {code_desc.buffer} points to. Is nullptr for Liftoff code
+  // compiled with a {LiftoffCompilationContext}; that code lives in the context
+  // until {LiftoffCompilationContext::ReleaseCode}.
   std::unique_ptr<AssemblerBuffer> instr_buffer = nullptr;
   uint32_t frame_slot_count = 0;
   uint32_t ool_spill_count = 0;
@@ -82,7 +87,7 @@ struct WasmCompilationResult {
   base::UniqueArray<uint8_t> inlining_positions = {};
   base::UniqueArray<uint8_t> trapping_instructions_data = {};
   base::UniqueArray<uint8_t> deopt_data = {};
-  base::UniqueArray<uint8_t> effect_handlers = {};
+  base::UniqueArray<EffectHandlerEntry> effect_handlers = {};
   std::unique_ptr<AssumptionsJournal> assumptions = nullptr;
   std::unique_ptr<LiftoffFrameDescriptionForDeopt> liftoff_frame_descriptions =
       nullptr;
@@ -103,10 +108,12 @@ class V8_EXPORT_PRIVATE WasmCompilationUnit final {
         for_debugging_(for_debugging),
         validation_(validation) {}
 
-  WasmCompilationResult ExecuteCompilation(CompilationEnv*,
-                                           const WireBytesStorage*,
-                                           DelayedCounterUpdates*,
-                                           WasmDetectedFeatures*);
+  // {liftoff_context} is optional. If passed, Liftoff reuses memory across
+  // functions, and the code of the returned result lives in that context.
+  WasmCompilationResult ExecuteCompilation(
+      CompilationEnv*, const WireBytesStorage*, DelayedCounterUpdates*,
+      WasmDetectedFeatures*,
+      LiftoffCompilationContext* liftoff_context = nullptr);
 
   ExecutionTier tier() const { return tier_; }
   ForDebugging for_debugging() const { return for_debugging_; }

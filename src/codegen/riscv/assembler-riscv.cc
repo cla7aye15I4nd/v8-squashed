@@ -904,6 +904,16 @@ inline int64_t SignExtend(uint64_t V, int N) {
 
 #if V8_TARGET_ARCH_RISCV64
 void Assembler::RV_li(Register rd, int64_t imm) {
+  // A non-zero multiple of 4KiB whose page index fits the signed 6-bit
+  // immediate of c.lui (values within +/-128KiB) is materialized with a single
+  // compressed instruction instead of a full-width lui. Handle it here, before
+  // the GeneralLi/RecursiveLi dispatch, so the choice does not depend on which
+  // of the two (equal instruction count) paths would be selected.
+  if (CpuFeatures::IsSupported(RVC) && rd != zero_reg && rd != sp && imm != 0 &&
+      (imm & 0xfff) == 0 && is_int6(imm >> 12)) {
+    c_lui(rd, static_cast<int8_t>(imm >> 12));
+    return;
+  }
   UseScratchRegisterScope temps(this);
   if (RecursiveLiCount(imm) > GeneralLiCount(imm, temps.CanAcquire())) {
     GeneralLi(rd, imm);
@@ -917,6 +927,18 @@ int Assembler::RV_li_count(int64_t imm, bool is_get_temp_reg) {
     return GeneralLiCount(imm, is_get_temp_reg);
   } else {
     return RecursiveLiCount(imm);
+  }
+}
+
+// Shift emitted inside RV_li constant materialization. rd == rs always holds
+// at the call sites. These sequences are never reloc-tracked (see the li()
+// dispatch in MacroAssembler), so shrinking them cannot break a patch point.
+void Assembler::TryCSlli(Register rd, uint8_t shamt) {
+  if (CpuFeatures::IsSupported(RVC) && rd != zero_reg && shamt != 0 &&
+      is_uint6(shamt)) {
+    c_slli(rd, shamt);
+  } else {
+    slli(rd, rd, shamt);
   }
 }
 
@@ -984,7 +1006,7 @@ void Assembler::GeneralLi(Register rd, int64_t imm) {
         // Bit 31 is 1. Either an overflow or a negative 64 bit
         if (up_32 == 0) {
           // Positive number, but overflow because of the add 0x800
-          slli(rd, rd, 32);
+          TryCSlli(rd, 32);
           srli(rd, rd, 32);
           return;
         }
@@ -1012,7 +1034,7 @@ void Assembler::GeneralLi(Register rd, int64_t imm) {
         addi(temp_reg, zero_reg, low_12);
       }
       // Put it at the bgining of register
-      slli(temp_reg, temp_reg, 32);
+      TryCSlli(temp_reg, 32);
       if (low_32 != 0) {
         add(rd, rd, temp_reg);
       }
@@ -1047,7 +1069,7 @@ void Assembler::GeneralLi(Register rd, int64_t imm) {
         shift_val++;
         if (i == 31) {
           // rest is zero
-          slli(rd, rd, shift_val);
+          TryCSlli(rd, static_cast<uint8_t>(shift_val));
         }
         continue;
       }
@@ -1056,13 +1078,13 @@ void Assembler::GeneralLi(Register rd, int64_t imm) {
       if ((i + 11) < 32) {
         // Pick 11 bits
         part = (static_cast<uint32_t>(low_32 << i) >> i) >> (32 - (i + 11));
-        slli(rd, rd, shift_val + 11);
+        TryCSlli(rd, static_cast<uint8_t>(shift_val + 11));
         ori(rd, rd, part);
         i += 10;
         mask >>= 11;
       } else {
         part = static_cast<uint32_t>(low_32 << i) >> i;
-        slli(rd, rd, shift_val + (32 - i));
+        TryCSlli(rd, static_cast<uint8_t>(shift_val + (32 - i)));
         ori(rd, rd, part);
         break;
       }
@@ -1245,14 +1267,26 @@ void Assembler::AdjustBaseAndOffset(MemOperand* src, Register scratch,
              src->offset() < 0) {
     addi(scratch, src->rm(), -kMinOffsetForSimpleAdjustment);
     src->offset_ += kMinOffsetForSimpleAdjustment;
-  } else if (access_type == OffsetAccessType::SINGLE_ACCESS) {
-    RV_li(scratch, (static_cast<intptr_t>(src->offset()) + 0x800) >> 12 << 12);
-    add(scratch, scratch, src->rm());
-    src->offset_ = src->offset() << 20 >> 20;
   } else {
-    RV_li(scratch, src->offset());
-    add(scratch, scratch, src->rm());
-    src->offset_ = 0;
+    if (access_type == OffsetAccessType::SINGLE_ACCESS) {
+      intptr_t page_offset =
+          (static_cast<intptr_t>(src->offset()) + 0x800) >> 12 << 12;
+      // The rounded offset is a non-zero multiple of 4KiB; RV_li emits c.lui
+      // for it when the page index fits the compressed immediate.
+      RV_li(scratch, page_offset);
+      src->offset_ = src->offset() << 20 >> 20;
+    } else {
+      RV_li(scratch, src->offset());
+      src->offset_ = 0;
+    }
+    // The destination equals the first source operand, so c.add (CR format,
+    // any non-zero register pair) can replace the full-width add.
+    if (CpuFeatures::IsSupported(RVC) && scratch != zero_reg &&
+        src->rm() != zero_reg) {
+      c_add(scratch, src->rm());
+    } else {
+      add(scratch, scratch, src->rm());
+    }
   }
   src->rm_ = scratch;
 }
@@ -1979,7 +2013,7 @@ void Assembler::RecursiveLiImpl(Register rd, int64_t Val) {
 
   if (Unsigned) {
   } else {
-    slli(rd, rd, ShiftAmount);
+    TryCSlli(rd, static_cast<uint8_t>(ShiftAmount));
   }
   if (Lo12) {
     addi(rd, rd, Lo12);

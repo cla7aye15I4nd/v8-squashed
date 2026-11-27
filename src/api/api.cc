@@ -5873,8 +5873,9 @@ Location Function::GetScriptLocation() const {
   if (i::IsScript(shared->script())) {
     i::DirectHandle<i::Script> script(i::Cast<i::Script>(shared->script()),
                                       i::Isolate::Current());
-    return {i::Script::GetLineNumber(script, shared->StartPosition()),
-            i::Script::GetColumnNumber(script, shared->StartPosition())};
+    i::Script::PositionInfo info;
+    i::Script::GetPositionInfo(script, shared->StartPosition(), &info);
+    return {info.line, info.column};
   }
   return {-1, -1};
 }
@@ -10716,8 +10717,13 @@ void Isolate::RemoveCallCompletedCallback(CallCompletedCallback callback) {
 }
 
 void Isolate::SetPromiseHook(PromiseHook hook) {
+#ifdef V8_ENABLE_PROMISE_HOOKS
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(this);
   i_isolate->SetPromiseHook(hook);
+#else
+  Utils::ApiCheck(hook == nullptr, "v8::Isolate::SetPromiseHook",
+                  "V8 was compiled without Promise hooks");
+#endif
 }
 
 void Isolate::SetPromiseRejectCallback(PromiseRejectCallback callback) {

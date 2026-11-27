@@ -2445,8 +2445,12 @@ void MarkCompactCollector::ProcessTopOptimizedFrame(ObjectVisitor* visitor,
 
 void MarkCompactCollector::RecordObjectStats() {
   if (V8_LIKELY(!TracingFlags::is_gc_stats_enabled())) return;
-  // Cannot run during bootstrapping due to incomplete objects.
-  if (heap_->isolate()->bootstrapper()->IsActive()) return;
+  // Cannot run during bootstrapping or deserialization due to incomplete
+  // objects.
+  if (heap_->isolate()->bootstrapper()->IsActive() ||
+      heap_->isolate()->has_active_deserializer()) {
+    return;
+  }
   TRACE_EVENT(TRACE_GC_CATEGORIES, "V8.GC_OBJECT_DUMP_STATISTICS");
   heap_->CreateObjectStats();
   ObjectStatsCollector collector(heap_, heap_->live_object_stats_.get(),
@@ -3356,6 +3360,9 @@ void MarkCompactCollector::FlushBytecodeFromSFI(
       chunk, compiled_data_start, compiled_data_start + compiled_data_size,
       SlotSet::FREE_EMPTY_BUCKETS);
   RememberedSet<TRUSTED_TO_TRUSTED>::RemoveRange(
+      chunk, compiled_data_start, compiled_data_start + compiled_data_size,
+      SlotSet::FREE_EMPTY_BUCKETS);
+  RememberedSet<TRUSTED_TO_SHARED_TRUSTED>::RemoveRange(
       chunk, compiled_data_start, compiled_data_start + compiled_data_size,
       SlotSet::FREE_EMPTY_BUCKETS);
 
@@ -5792,6 +5799,10 @@ void ReRecordPage(Heap* heap, Address failed_start, NormalPage* page) {
       page, page->area_start(), failed_start, SlotSet::FREE_EMPTY_BUCKETS);
   RememberedSet<OLD_TO_SHARED>::RemoveRangeTyped(page, page->area_start(),
                                                  failed_start);
+
+  RememberedSet<TRUSTED_TO_SHARED_TRUSTED>::RemoveRange(
+      page, page->area_start(), failed_start, SlotSet::FREE_EMPTY_BUCKETS);
+  DCHECK_NULL(page->typed_slot_set<TRUSTED_TO_SHARED_TRUSTED>());
 
   // Re-record slots and recompute live bytes.
   EvacuateRecordOnlyVisitor visitor(heap);

@@ -533,6 +533,7 @@
   'regress/regress-crbug-941743': [SKIP],
   'regress/regress-create-exception': [SKIP],
   'maglev/regress-431665299': [SKIP],
+  'parser/scanner-simd-identifiers-strings': [SKIP],
 
   # These tests run out of stack space in debug mode.
   'big-array-literal': [SKIP],
@@ -1169,6 +1170,7 @@
   'wasm/fp16-load-mul': [SKIP],
   'wasm/fp16-oob-trap': [SKIP],
   'wasm/fp16-store': [SKIP],
+  'wasm/simd-revec-f16-qfma-extract': [SKIP],
   'wasm/simd-fp16': [SKIP],
 
   # --wasm-rab-integration
@@ -2346,6 +2348,7 @@
   # These tests trigger profiling, which can trigger non-deterministic
   # allocations.
   'regress/regress-1394663': [SKIP],
+  'regress/regress-590419631': [SKIP],
   'regress/wasm/regress-crbug-1502180': [SKIP],
   'regress/wasm/regress-574704749': [SKIP],
   'wasm/log-wasm-to-js-wrapper-callref': [SKIP],
@@ -3355,6 +3358,7 @@
   'regress-332570754': [SKIP],
   'regress/regress-490446682': [SKIP],
   'regress/regress-1394663': [SKIP],
+  'regress/regress-590419631': [SKIP],
   'regress/wasm/regress-crbug-1502180': [SKIP],
   'regress/wasm/regress-392928805': [SKIP],
   'regress/wasm/regress-406043349': [SKIP],
@@ -3563,4 +3567,22 @@
   'sandbox/regress/regress-571204561': [SKIP],
   'sandbox/regress/regress-580248117': [SKIP],
 }],  # not test_only_sync_points
+
+##############################################################################
+['not promise_hooks', {
+  # Requires --expose-async-hooks / C++ PromiseHook:
+  'async-hooks/*': [SKIP],
+  'regress/regress-1115354': [SKIP],
+  'regress/regress-578383284-resolve-hook': [SKIP],
+  'regress/regress-crbug-1015945': [SKIP],
+  'regress/regress-crbug-1238467': [SKIP],
+  'regress/regress-crbug-1239907': [SKIP],
+  'regress/regress-crbug-1424699': [SKIP],
+  'regress/regress-crbug-1443001': [SKIP],
+  'regress/regress-crbug-860788': [SKIP],
+  'regress/regress-crbug-865892': [SKIP],
+  'regress/regress-crbug-866315': [SKIP],
+  'regress/regress-crbug-896700': [SKIP],
+  'regress/regress-crbug-897406': [SKIP],
+}],  # not promise_hooks
 ]

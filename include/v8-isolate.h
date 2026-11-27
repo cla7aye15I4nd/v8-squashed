@@ -604,13 +604,15 @@ class V8_EXPORT Isolate {
     kWasmBulkMemory = 109,
     kWasmMultiValue = 110,
     kWasmExceptionHandling = 111,
-    kInvalidatedMegaDOMProtector = 112,
+    kInvalidatedMegaDOMProtector V8_DEPRECATE_SOON(
+        "The MegaDOMProtector has been removed") = 112,
     kFunctionPrototypeArguments = 113,
     kFunctionPrototypeCaller = 114,
     kTurboFanOsrCompileStarted = 115,
     kAsyncStackTaggingCreateTaskCall = 116,
     kDurationFormat = 117,
-    kInvalidatedNumberStringNotRegexpLikeProtector = 118,
+    kInvalidatedNumberStringNotRegexpLikeProtector V8_DEPRECATE_SOON(
+        "The NumberStringNotRegexpLikeProtector has been removed") = 118,
     kOBSOLETE_RegExpUnicodeSetIncompatibilitiesWithUnicodeMode = 119,
     kOBSOLETE_ImportAssertionDeprecatedSyntax = 120,
     kLocaleInfoObsoletedGetters = 121,
@@ -1404,9 +1406,16 @@ class V8_EXPORT Isolate {
   void RemoveCallCompletedCallback(CallCompletedCallback callback);
 
   /**
-   * Set the PromiseHook callback for various promise lifecycle
-   * events.
+   * Set the PromiseHook callback for various promise lifecycle events.
+   * Passing a non-null hook requires building V8 with
+   * v8_enable_promise_hooks = true. Changing the default for
+   * v8_enable_promise_hooks to false is planned for Chrome M164 / V8 16.4
+   * (branching Feb 8, 2027).
    */
+  V8_DEPRECATE_SOON(
+      "v8_enable_promise_hooks is planned to default to false in Chrome M164 / "
+      "V8 16.4 (branching Feb 8, 2027); build with v8_enable_promise_hooks = "
+      "true if needed.")
   void SetPromiseHook(PromiseHook hook);
 
   /**

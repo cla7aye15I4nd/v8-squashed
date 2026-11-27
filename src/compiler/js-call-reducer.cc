@@ -3495,7 +3495,8 @@ Reduction JSCallReducer::ReduceFunctionPrototypeCall(Node* node) {
   HeapObjectMatcher m(target);
   if (m.HasResolvedValue() && m.Ref(broker()).IsJSFunction()) {
     JSFunctionRef function = m.Ref(broker()).AsJSFunction();
-    context = jsgraph()->ConstantNoHole(function.context(broker()), broker());
+    context =
+        jsgraph()->HeapConstantNoHole(function.context(broker()).object());
   } else {
     context = effect = graph()->NewNode(
         simplified()->LoadField(AccessBuilder::ForJSFunctionContext()), target,
@@ -4514,7 +4515,7 @@ Reduction JSCallReducer::ReduceCallApiFunction(Node* node,
     //
     receiver = effect = graph()->NewNode(
         simplified()->ConvertReceiver(p.convert_mode()), receiver,
-        jsgraph()->ConstantNoHole(native_context(), broker()), global_proxy,
+        jsgraph()->HeapConstantNoHole(native_context().object()), global_proxy,
         effect, control);
   } else {
     // Try to infer the {receiver} maps from the graph.
@@ -4607,8 +4608,8 @@ Reduction JSCallReducer::ReduceCallApiFunction(Node* node,
       // first if necessary.
       receiver = effect = graph()->NewNode(
           simplified()->ConvertReceiver(p.convert_mode()), receiver,
-          jsgraph()->ConstantNoHole(native_context(), broker()), global_proxy,
-          effect, control);
+          jsgraph()->HeapConstantNoHole(native_context().object()),
+          global_proxy, effect, control);
 
       Callable callable = Builtins::CallableFor(isolate(), builtin_name);
       auto call_descriptor = Linkage::GetStubCallDescriptor(
@@ -4908,8 +4909,15 @@ JSCallReducer::ReduceCallOrConstructWithArrayLikeOrSpreadOfCreateArguments(
   // we can only optimize this in case the {node} was already inlined into
   // some other function (and same for the {arguments_list}).
   CreateArgumentsType const type = CreateArgumentsTypeOf(arguments_list->op());
-  FrameState frame_state =
-      FrameState{NodeProperties::GetFrameStateInput(arguments_list)};
+  Node* const frame_state_node =
+      NodeProperties::GetFrameStateInput(arguments_list);
+  if (frame_state_node->opcode() == IrOpcode::kDeadValue) {
+    // {arguments_list} may still be on the GraphReducer stack while its
+    // FrameState input has already been replaced with DeadValue by
+    // DeadCodeElimination.
+    return NoChange();
+  }
+  FrameState frame_state{frame_state_node};
 
   int formal_parameter_count;
   {
@@ -7318,7 +7326,7 @@ Reduction JSCallReducer::ReduceGeneratorPrototypeNext(Node* node) {
         simplified()->LoadField(AccessBuilder::ForMapNativeContext()),
         receiver_context_map, effect, control);
     Node* target_native_context =
-        jsgraph()->ConstantNoHole(native_context(), broker());
+        jsgraph()->HeapConstantNoHole(native_context().object());
     Node* check_realm =
         graph()->NewNode(simplified()->ReferenceEqual(),
                          receiver_native_context, target_native_context);
@@ -8382,7 +8390,7 @@ Reduction JSCallReducer::ReducePromisePrototypeFinally(Node* node) {
   Node* catch_true;
   Node* then_true;
   {
-    Node* context = jsgraph()->ConstantNoHole(native_context(), broker());
+    Node* context = jsgraph()->HeapConstantNoHole(native_context().object());
     Node* constructor = jsgraph()->ConstantNoHole(
         native_context().promise_function(broker()), broker());
 

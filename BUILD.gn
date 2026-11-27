@@ -449,7 +449,13 @@ declare_args() {
   # Enable map packing & unpacking (sets -DV8_MAP_PACKING).
   v8_enable_map_packing = false
 
+  # Enable C++ PromiseHooks (v8::Isolate::SetPromiseHook).
+  # Changing the default to false is planned for Chrome M164 / V8 16.4
+  # (branching February 8, 2027).
+  v8_enable_promise_hooks = true
+
   # Allow for JS promise hooks (instead of just C++).
+  # Requires v8_enable_promise_hooks.
   v8_enable_javascript_promise_hooks = false
 
   # Allow embedder data to be saved on continuations. Used to support
@@ -775,6 +781,8 @@ if (v8_enable_atomic_object_field_writes == "") {
 if (v8_enable_single_generation) {
   v8_allocation_site_tracking = false
 }
+assert(!v8_enable_javascript_promise_hooks || v8_enable_promise_hooks,
+       "JavaScript Promise hooks require v8_enable_promise_hooks.")
 assert(!v8_enable_concurrent_marking || v8_enable_atomic_object_field_writes,
        "Concurrent marking requires atomic object field writes.")
 if (v8_enable_trace_unoptimized == "") {
@@ -1667,6 +1675,9 @@ config("features") {
   if (v8_dict_prototypes) {
     defines += [ "V8_DICT_PROTOTYPES" ]
   }
+  if (v8_enable_promise_hooks) {
+    defines += [ "V8_ENABLE_PROMISE_HOOKS" ]
+  }
   if (v8_enable_javascript_promise_hooks) {
     defines += [ "V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS" ]
   }
@@ -2228,8 +2239,6 @@ if (v8_postmortem_support) {
       "src/objects/map.cc",
       "src/objects/map.h",
       "src/objects/map-inl.h",
-      "src/objects/megadom-handler.h",
-      "src/objects/megadom-handler-inl.h",
       "src/objects/name.h",
       "src/objects/name-inl.h",
       "src/objects/number-string-cache.h",
@@ -2467,7 +2476,6 @@ torque_files = [
   "src/objects/literal-objects.tq",
   "src/objects/managed.tq",
   "src/objects/map.tq",
-  "src/objects/megadom-handler.tq",
   "src/objects/microtask.tq",
   "src/objects/module.tq",
   "src/objects/name.tq",
@@ -3673,6 +3681,7 @@ action("v8_dump_build_config") {
     "official_build=$is_official_build",
     "pointer_compression=$v8_enable_pointer_compression",
     "pointer_compression_shared_cage=$v8_enable_pointer_compression_shared_cage",
+    "promise_hooks=$v8_enable_promise_hooks",
     "runtime_call_stats=$v8_enable_runtime_call_stats",
     "sandbox=$v8_enable_sandbox",
     "sandbox_hardware_support=$v8_enable_sandbox_hardware_support",
@@ -3733,6 +3742,7 @@ generated_file("v8_generate_features_json") {
     v8_enable_pointer_compression = v8_enable_pointer_compression
     v8_enable_pointer_compression_shared_cage =
         v8_enable_pointer_compression_shared_cage
+    v8_enable_promise_hooks = v8_enable_promise_hooks
     v8_enable_sandbox = v8_enable_sandbox
     v8_enable_short_builtin_calls = v8_enable_short_builtin_calls
     v8_enable_v8_checks = v8_enable_v8_checks
@@ -4733,7 +4743,6 @@ v8_header_set("v8_internal_headers") {
     "src/heap/marking-worklist.h",
     "src/heap/marking.h",
     "src/heap/memory-allocator.h",
-    "src/heap/memory-balancer.h",
     "src/heap/memory-chunk-constants.h",
     "src/heap/memory-chunk-inl.h",
     "src/heap/memory-chunk-layout.h",
@@ -4972,8 +4981,6 @@ v8_header_set("v8_internal_headers") {
     "src/objects/map.h",
     "src/objects/maybe-object-inl.h",
     "src/objects/maybe-object.h",
-    "src/objects/megadom-handler-inl.h",
-    "src/objects/megadom-handler.h",
     "src/objects/microtask-inl.h",
     "src/objects/microtask.h",
     "src/objects/module-inl.h",
@@ -6653,7 +6660,6 @@ v8_cluster_source_set("v8_base_without_compiler") {
     "src/heap/marking-worklist.cc",
     "src/heap/marking.cc",
     "src/heap/memory-allocator.cc",
-    "src/heap/memory-balancer.cc",
     "src/heap/memory-chunk.cc",
     "src/heap/memory-measurement.cc",
     "src/heap/memory-pool.cc",

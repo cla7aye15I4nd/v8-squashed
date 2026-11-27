@@ -160,7 +160,6 @@ class RootVisitor;
   V(Map, global_dictionary_map, GlobalDictionaryMap)                           \
   V(Map, interceptor_info_map, InterceptorInfoMap)                             \
   V(Map, many_closures_cell_map, ManyClosuresCellMap)                          \
-  V(Map, mega_dom_handler_map, MegaDomHandlerMap)                              \
   V(Map, module_info_map, ModuleInfoMap)                                       \
   V(Map, name_dictionary_map, NameDictionaryMap)                               \
   V(Map, name_to_index_hash_table_map, NameToIndexHashTableMap)                \
@@ -373,7 +372,6 @@ class RootVisitor;
   V(Script, empty_script, EmptyScript)                                         \
   /* Protectors */                                                             \
   V(PropertyCell, no_elements_protector, NoElementsProtector)                  \
-  V(PropertyCell, mega_dom_protector, MegaDOMProtector)                        \
   V(PropertyCell, no_profiling_protector, NoProfilingProtector)                \
   V(PropertyCell, no_undetectable_objects_protector,                           \
     NoUndetectableObjectsProtector)                                            \
@@ -397,8 +395,6 @@ class RootVisitor;
   V(PropertyCell, string_iterator_protector, StringIteratorProtector)          \
   V(PropertyCell, string_wrapper_to_primitive_protector,                       \
     StringWrapperToPrimitiveProtector)                                         \
-  V(PropertyCell, number_string_not_regexp_like_protector,                     \
-    NumberStringNotRegexpLikeProtector)                                        \
   /* Caches */                                                                 \
   V(FixedArray, string_split_cache, StringSplitCache)                          \
   V(FixedArray, regexp_multiple_cache, RegExpMultipleCache)                    \

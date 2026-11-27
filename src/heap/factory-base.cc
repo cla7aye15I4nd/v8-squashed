@@ -189,6 +189,7 @@ template <typename Impl>
 Handle<FixedArray> FactoryBase<Impl>::NewFixedArrayWithFiller(
     DirectHandle<Map> map, uint32_t length, DirectHandle<HeapObject> filler,
     AllocationType allocation) {
+  DCHECK_LT(0, length);
   Tagged<HeapObject> result = AllocateRawFixedArray(length, allocation);
   DisallowGarbageCollection no_gc;
   DCHECK(ReadOnlyHeap::Contains(*map));
@@ -427,7 +428,8 @@ template <typename Impl>
 Handle<SharedFunctionInfo> FactoryBase<Impl>::CloneSharedFunctionInfo(
     DirectHandle<SharedFunctionInfo> other) {
   return indirect_handle(
-      New<SharedFunctionInfo, AllocationType::kOld>(other, isolate()),
+      New<SharedFunctionInfo, AllocationType::kOld>(
+          other, isolate()->GetAndIncNextUniqueSfiId(), isolate()),
       isolate());
 }
 

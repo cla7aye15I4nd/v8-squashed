@@ -26,7 +26,6 @@
 #include "src/objects/foreign.h"
 #include "src/objects/heap-number.h"
 #include "src/objects/heap-object-inl.h"
-#include "src/objects/megadom-handler.h"
 #include "src/objects/module.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/property-details.h"
@@ -304,56 +303,6 @@ void AccessorAssembler::TryHomomorphicCase(TNode<Object> lookup_start_object,
     GotoIfNot(IsJSArrayMap(lookup_start_object_map), miss);
     exit_point->Return(LoadJSArrayLength(CAST(lookup_start_object)));
   }
-}
-
-void AccessorAssembler::TryMegaDOMCase(TNode<Context> caller_context,
-                                       TNode<Object> lookup_start_object,
-                                       TNode<Map> lookup_start_object_map,
-                                       TVariable<MaybeObject>* var_handler,
-                                       TNode<Object> vector,
-                                       TNode<TaggedIndex> slot, Label* miss,
-                                       ExitPoint* exit_point) {
-  // Check if the receiver is a JS_API_OBJECT
-  GotoIfNot(IsJSApiObjectMap(lookup_start_object_map), miss);
-
-  // Check if receiver requires access check
-  GotoIf(IsSetWord32<Map::Bits1::IsAccessCheckNeededBit>(
-             LoadMapBitField(lookup_start_object_map)),
-         miss);
-
-  CSA_DCHECK(this, TaggedEqual(LoadFeedbackVectorSlot(CAST(vector), slot),
-                               MegaDOMSymbolConstant()));
-
-  // In some cases, we load the
-  TNode<MegaDomHandler> handler;
-  if (var_handler->IsBound()) {
-    handler = CAST(var_handler->value());
-  } else {
-    TNode<MaybeObject> maybe_handler =
-        LoadFeedbackVectorSlot(CAST(vector), slot, kTaggedSize);
-    CSA_DCHECK(this, IsStrong(maybe_handler));
-    handler = CAST(maybe_handler);
-  }
-
-  // Check if dom protector cell is still valid
-  GotoIf(IsMegaDOMProtectorCellInvalid(), miss);
-
-  // Load the getter
-  TNode<MaybeObject> maybe_getter = LoadMegaDomHandlerAccessor(handler);
-  CSA_DCHECK(this, IsWeakOrCleared(maybe_getter));
-  TNode<FunctionTemplateInfo> getter =
-      CAST(GetHeapObjectAssumeWeak(maybe_getter, miss));
-
-  // Load the accessor context
-  TNode<MaybeObject> maybe_context = LoadMegaDomHandlerContext(handler);
-  CSA_DCHECK(this, IsWeakOrCleared(maybe_context));
-  TNode<Context> context = CAST(GetHeapObjectAssumeWeak(maybe_context, miss));
-
-  // TODO(gsathya): This builtin throws an exception on interface check fail but
-  // we should miss to the runtime.
-  exit_point->Return(CallBuiltin(Builtin::kCallFunctionTemplate_Generic,
-                                 context, getter, Int32Constant(1),
-                                 caller_context, lookup_start_object));
 }
 
 void AccessorAssembler::TryEnumeratedKeyedLoad(
@@ -656,9 +605,10 @@ void AccessorAssembler::HandleLoadICSmiHandlerCase(
       DecodeWord32<LoadHandler::KindBits>(handler_word);
 
   if (support_elements == kSupportElements) {
-    Label if_element(this), if_transition(this), if_indexed_string(this),
-        if_property(this), if_hole(this), unimplemented_elements_kind(this),
-        if_oob(this, Label::kDeferred), try_string_to_array_index(this),
+    Label if_element(this), if_transition(this, Label::kDeferred),
+        if_indexed_string(this), if_property(this), if_hole(this),
+        unimplemented_elements_kind(this), if_oob(this, Label::kDeferred),
+        try_string_to_array_index(this, Label::kDeferred),
         emit_element_load(this);
     TVARIABLE(IntPtrT, var_intptr_index);
     GotoIf(Word32Equal(handler_kind, LOAD_KIND(kElement)), &if_element);
@@ -2682,7 +2632,8 @@ void AccessorAssembler::EmitElementLoad(
     ExitPoint* exit_point, LoadAccessMode access_mode) {
   Label if_rab_gsab_typed_array(this), if_typed_array(this), if_fast(this),
       if_fast_packed(this), if_fast_holey(this), if_fast_double(this),
-      if_fast_holey_double(this), if_nonfast(this), if_dictionary(this);
+      if_fast_holey_double(this), if_nonfast(this),
+      if_dictionary(this, Label::kDeferred);
   Branch(Int32GreaterThan(elements_kind,
                           Int32Constant(LAST_ANY_NONEXTENSIBLE_ELEMENTS_KIND)),
          &if_nonfast, &if_fast);
@@ -3167,13 +3118,9 @@ void AccessorAssembler::GenericPropertyLoad(
     ExpectedReceiverMode expected_receiver_mode =
         p->IsLoadSuperIC() ? kExpectingAnyReceiver : kExpectingJSReceiver;
 
-    TNode<JSAnyOrSharedFunctionInfo> value =
-        CAST(CallGetterIfAccessorAndBailoutOnLazyClosures(
-            var_value.value(), CAST(lookup_start_object), var_details.value(),
-            p->context(), p->receiver(), expected_receiver_mode, p->name(),
-            slow));
-
-    GotoIfLazyClosure(value, slow);
+    TNode<Object> value = CallGetterIfAccessorAndBailoutOnLazyClosures(
+        var_value.value(), CAST(lookup_start_object), var_details.value(),
+        p->context(), p->receiver(), expected_receiver_mode, p->name(), slow);
 
     Return(value);
   }
@@ -3201,7 +3148,8 @@ void AccessorAssembler::GenericPropertyLoad(
       TNode<Uint16T> proto_instance_type = LoadMapInstanceType(proto_map);
       var_holder_map = proto_map;
       var_holder_instance_type = proto_instance_type;
-      Label next_proto(this), return_value(this, &var_value), goto_slow(this);
+      Label next_proto(this), return_value(this, &var_value),
+          goto_slow(this, Label::kDeferred);
       TryGetOwnProperty(p->context(), p->receiver(), CAST(proto), proto_map,
                         proto_instance_type, name, &return_value, &var_value,
                         &next_proto, &goto_slow);
@@ -3215,8 +3163,6 @@ void AccessorAssembler::GenericPropertyLoad(
       Goto(slow);
 
       BIND(&return_value);
-
-      GotoIfLazyClosure(CAST(var_value.value()), slow);
       Return(var_value.value());
     }
 
@@ -3689,11 +3635,10 @@ void AccessorAssembler::LoadIC_Noninlined(const LoadICParameters* p,
   DCHECK_EQ(MachineRepresentation::kTagged, var_handler->rep());
 
   {
-    Label try_megamorphic(this), try_homomorphic(this), try_megadom(this);
+    Label try_megamorphic(this), try_homomorphic(this);
     GotoIf(TaggedEqual(feedback, MegamorphicSymbolConstant()),
            &try_megamorphic);
     GotoIf(IsWeakHomomorphicFixedArrayMap(LoadMap(feedback)), &try_homomorphic);
-    GotoIf(TaggedEqual(feedback, MegaDOMSymbolConstant()), &try_megadom);
     Goto(miss);
 
     BIND(&try_megamorphic);
@@ -3709,13 +3654,6 @@ void AccessorAssembler::LoadIC_Noninlined(const LoadICParameters* p,
                          CAST(p->name()), p->vector(), p->slot(), miss,
                          exit_point);
     }
-
-    BIND(&try_megadom);
-    {
-      TryMegaDOMCase(p->context(), p->lookup_start_object(),
-                     lookup_start_object_map, var_handler, p->vector(),
-                     p->slot(), miss, exit_point);
-    }
   }
 }
 
@@ -3730,7 +3668,10 @@ void AccessorAssembler::LoadIC_NoFeedback(const LoadICParameters* p,
   {
     // Special case for Function.prototype load, because it's very common
     // for ICs that are only executed once (MyFunc.prototype.foo = ...).
-    Label not_function_prototype(this, Label::kDeferred);
+    // Do not mark |not_function_prototype| deferred, otherwise FrameElider
+    // cannot prevent deferred calls inside GenericPropertyLoad from bleeding
+    // frame construction into the common own-property load path.
+    Label not_function_prototype(this);
     GotoIfNot(IsPrototypeString(p->name()), &not_function_prototype);
 
     GotoIfPrototypeRequiresRuntimeLookup(CAST(lookup_start_object),
@@ -4087,8 +4028,8 @@ void AccessorAssembler::KeyedLoadICGeneric(const LoadICParameters* p) {
   {
     TVARIABLE(IntPtrT, var_index);
     TVARIABLE(Name, var_unique);
-    Label if_index(this), if_unique_name(this, &var_name), if_notunique(this),
-        if_other(this, Label::kDeferred);
+    Label if_index(this), if_unique_name(this, &var_name),
+        if_notunique(this, Label::kDeferred), if_other(this, Label::kDeferred);
 
     TryToName(var_name.value(), &if_index, &var_index, &if_unique_name,
               &var_unique, &if_other, &if_notunique);

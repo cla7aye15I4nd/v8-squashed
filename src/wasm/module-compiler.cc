@@ -24,6 +24,7 @@
 #include "src/logging/metrics.h"
 #include "src/objects/managed.h"
 #include "src/tracing/trace-event.h"
+#include "src/wasm/baseline/liftoff-compiler.h"
 #include "src/wasm/code-space-access.h"
 #include "src/wasm/compilation-environment-inl.h"
 #include "src/wasm/jump-table-assembler.h"
@@ -1173,9 +1174,13 @@ void CompileLazy(Isolate* isolate, NativeModule* native_module,
       is_in_debug_state ? kForDebugging : kNotForDebugging, kAlreadyValidated};
   CompilationEnv env = CompilationEnv::ForModule(native_module);
   WasmDetectedFeatures detected_features;
+  LiftoffCompilationContext* liftoff_context =
+      tiers.blocking_tier == ExecutionTier::kLiftoff
+          ? isolate->wasm_liftoff_context()
+          : nullptr;
   WasmCompilationResult result = blocking_unit.ExecuteCompilation(
       &env, compilation_state->GetWireBytesStorage().get(),
-      native_module->counter_updates(), &detected_features);
+      native_module->counter_updates(), &detected_features, liftoff_context);
   if (!result.succeeded()) {
     DCHECK_EQ(ExecutionTier::kLiftoff, tiers.blocking_tier);
     DCHECK(!v8_flags.liftoff_only);
@@ -1193,9 +1198,10 @@ void CompileLazy(Isolate* isolate, NativeModule* native_module,
   // compilation cannot fail.
   CHECK(result.succeeded());
 
+  UnpublishedWasmCode unpublished_code = native_module->AddCompiledCode(result);
+  if (liftoff_context) liftoff_context->ReleaseCode();
   WasmCodeRefScope code_ref_scope;
-  WasmCode* code =
-      native_module->PublishCode(native_module->AddCompiledCode(result));
+  WasmCode* code = native_module->PublishCode(std::move(unpublished_code));
   if (code == nullptr) {
     // Publishing only fails when well-known import assumptions in TurboFan code
     // were invalidated concurrently. Simply return; jumping to the jump table
@@ -1983,6 +1989,9 @@ CompilationExecutionResult ExecuteCompilationUnits(
   }
   TRACE_COMPILE("ExecuteCompilationUnits (task id %d)\n", task_id);
 
+  // Reuses memory across all Liftoff compilations of this task. The code of
+  // the results lives in this context until it was added to the native module.
+  LiftoffCompilationContext liftoff_context;
   std::vector<WasmCompilationResult> results_to_publish;
   while (true) {
     ExecutionTier current_tier = unit->tier();
@@ -1995,7 +2004,7 @@ CompilationExecutionResult ExecuteCompilationUnits(
       // (asynchronous): Execute the compilation.
       WasmCompilationResult result = unit->ExecuteCompilation(
           &env.value(), wire_bytes.get(), &counter_updates,
-          &per_function_detected_features);
+          &per_function_detected_features, &liftoff_context);
       global_detected_features.Add(per_function_detected_features);
       bool compilation_succeeded = result.succeeded();
       // We don't eagerly compile import wrappers any more.
@@ -2055,6 +2064,7 @@ CompilationExecutionResult ExecuteCompilationUnits(
               compile_scope.native_module()->AddCompiledCode(
                   base::VectorOf(results_to_publish));
           results_to_publish.clear();
+          liftoff_context.ReleaseCode();
           compile_scope.compilation_state()->SchedulePublishCompilationResults(
               std::move(unpublished_code), phase);
         }
@@ -2075,6 +2085,7 @@ CompilationExecutionResult ExecuteCompilationUnits(
             compile_scope.native_module()->AddCompiledCode(
                 base::VectorOf(results_to_publish));
         results_to_publish.clear();
+        liftoff_context.ReleaseCode();
         // Flush detected features before publishing code, which may trigger
         // {kFinishedBlockingCompilation} and publish detected features.
         compile_scope.compilation_state()->OnDetectedFeatures(

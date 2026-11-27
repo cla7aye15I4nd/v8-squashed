@@ -200,6 +200,7 @@ namespace wasm {
 #if V8_ENABLE_DRUMBRAKE
 class WasmExecutionTimer;
 #endif  // V8_ENABLE_DRUMBRAKE
+class LiftoffCompilationContext;
 class WasmCodeLookupCache;
 class WasmOrphanedGlobalHandle;
 }
@@ -893,6 +894,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   //   objects which are partially deserialized.
   // - The snapshot generator being invoked on GC can trigger DCHECKs where the
   //   graph is not yet consistent.
+  // - ObjectStatsCollector cannot walk partially deserialized objects.
   //
   // TODO(leszeks): Make the verifier a bit more deserialization compatible.
   void RegisterDeserializerStarted() { ++num_active_deserializers_; }
@@ -1433,6 +1435,8 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   }
   wasm::WasmOrphanedGlobalHandle* NewWasmOrphanedGlobalHandle();
   wasm::StackPool& stack_pool() { return stack_pool_; }
+  wasm::LiftoffCompilationContext* wasm_liftoff_context();
+  void ReleaseWasmLiftoffContext();
 #endif  // V8_ENABLE_WEBASSEMBLY
 
   GlobalHandles* global_handles() const { return global_handles_; }
@@ -1732,8 +1736,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   }
   void UpdateTypedArraySpeciesLookupChainProtectorOnSetPrototype(
       DirectHandle<JSObject> object);
-  void UpdateNumberStringNotRegexpLikeProtectorOnSetPrototype(
-      DirectHandle<JSObject> object);
   void UpdateNoElementsProtectorOnNormalizeElements(
       DirectHandle<JSObject> object) {
     UpdateNoElementsProtectorOnSetElement(object);
@@ -1906,8 +1908,12 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 #endif  // V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
 
   bool HasContextPromiseHooks() const {
+#ifdef V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
     return PromiseHookFields::HasContextPromiseHook::decode(
         promise_hook_flags_);
+#else
+    return false;
+#endif  // V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
   }
 
   Address promise_hook_flags_address() {
@@ -1916,10 +1922,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 
   static constexpr int promise_hook_flags_offset() {
     return offsetof(Isolate, promise_hook_flags_);
-  }
-
-  Address promise_hook_address() {
-    return reinterpret_cast<Address>(&promise_hook_);
   }
 
   Address async_event_delegate_address() {
@@ -1939,11 +1941,18 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   void RunReleaseCppHeapCallback(std::unique_ptr<v8::CppHeap> cpp_heap);
   std::shared_ptr<bool> cpp_heap_isolate_alive_token() const;
 
+#ifdef V8_ENABLE_PROMISE_HOOKS
   void SetPromiseHook(PromiseHook hook);
   void RunPromiseHook(PromiseHookType type, DirectHandle<JSPromise> promise,
                       DirectHandle<Object> parent);
   void RunAllPromiseHooks(PromiseHookType type, DirectHandle<JSPromise> promise,
                           DirectHandle<Object> parent);
+#else
+  void RunPromiseHook(PromiseHookType type, DirectHandle<JSPromise> promise,
+                      DirectHandle<Object> parent) {}
+  void RunAllPromiseHooks(PromiseHookType type, DirectHandle<JSPromise> promise,
+                          DirectHandle<Object> parent) {}
+#endif  // V8_ENABLE_PROMISE_HOOKS
   void UpdatePromiseHookProtector();
   void PromiseHookStateUpdated();
 
@@ -2620,8 +2629,12 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   void NotifyExceptionPropagationCallback();
 
   bool HasIsolatePromiseHooks() const {
+#ifdef V8_ENABLE_PROMISE_HOOKS
     return PromiseHookFields::HasIsolatePromiseHook::decode(
         promise_hook_flags_);
+#else
+    return false;
+#endif  // V8_ENABLE_PROMISE_HOOKS
   }
 
   bool HasAsyncEventDelegate() const {
@@ -2706,7 +2719,9 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   base::RandomNumberGenerator* random_number_generator_ = nullptr;
   base::RandomNumberGenerator* fuzzer_rng_ = nullptr;
   v8::Isolate::ReleaseCppHeapCallback release_cpp_heap_callback_ = nullptr;
+#ifdef V8_ENABLE_PROMISE_HOOKS
   PromiseHook promise_hook_ = nullptr;
+#endif  // V8_ENABLE_PROMISE_HOOKS
   HostImportModuleDynamicallyCallback host_import_module_dynamically_callback_ =
       nullptr;
   HostImportModuleWithPhaseDynamicallyCallback
@@ -3006,6 +3021,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 #endif  // V8_ENABLE_DRUMBRAKE
   wasm::WasmOrphanedGlobalHandle* wasm_orphaned_handle_ = nullptr;
   wasm::StackPool stack_pool_;
+  std::unique_ptr<wasm::LiftoffCompilationContext> wasm_liftoff_context_;
 #endif  // V8_ENABLE_WEBASSEMBLY
 
   AllocateCrashKeyStringCallback allocate_crash_key_string_callback_;

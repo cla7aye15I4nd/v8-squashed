@@ -388,7 +388,7 @@ V8_OBJECT class SharedFunctionInfo : public HeapObject {
   // Important: These constructors MUST not allocate.
   SharedFunctionInfo(const AllocationWitness& witness, int unique_id);
   SharedFunctionInfo(const AllocationWitness& witness,
-                     Tagged<SharedFunctionInfo> other,
+                     Tagged<SharedFunctionInfo> other, int unique_id,
                      IsolateForSandbox isolate);
 
   V8_EXPORT_PRIVATE static constexpr Tagged<Smi> const kNoSharedNameSentinel =
@@ -421,7 +421,9 @@ V8_OBJECT class SharedFunctionInfo : public HeapObject {
   // Copy the data from another SharedFunctionInfo. Used for copying data into
   // and out of a placeholder SharedFunctionInfo, for off-thread compilation
   // which is not allowed to touch a main-thread-visible SharedFunctionInfo.
-  void CopyFrom(Tagged<SharedFunctionInfo> other, IsolateForSandbox isolate);
+  // The unique id is not copied.
+  V8_EXPORT_PRIVATE void CopyFrom(Tagged<SharedFunctionInfo> other,
+                                  IsolateForSandbox isolate);
 
   // Layout description of the optimized code map.
   static const int kEntriesStart = 0;
@@ -660,7 +662,7 @@ V8_OBJECT class SharedFunctionInfo : public HeapObject {
 
   // All DebugInfo accessors forward to the Debug object which stores DebugInfo
   // objects in a sidetable.
-  bool HasDebugInfo(Isolate* isolate) const;
+  V8_EXPORT_PRIVATE bool HasDebugInfo(Isolate* isolate) const;
   V8_EXPORT_PRIVATE Tagged<DebugInfo> GetDebugInfo(Isolate* isolate) const;
   V8_EXPORT_PRIVATE std::optional<Tagged<DebugInfo>> TryGetDebugInfo(
       Isolate* isolate) const;

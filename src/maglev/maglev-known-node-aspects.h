@@ -10,6 +10,7 @@
 
 #include "src/base/logging.h"
 #include "src/base/sanitizer/asan.h"
+#include "src/base/vector.h"
 #include "src/common/globals.h"
 #include "src/maglev/maglev-ir.h"
 #include "src/maglev/maglev-kna-map.h"
@@ -665,44 +666,13 @@ class KnownNodeAspects {
   NodeT* FindExpression(uint32_t hash,
                         std::array<ValueNode*, NodeT::kInputCount>& inputs,
                         Args&&... args) {
-    auto it = std::as_const(available_expressions_).find(hash);
-    if (it == available_expressions_.end()) return nullptr;
-
     static constexpr Opcode op = Node::opcode_of<NodeT>;
-    auto candidate = it->second.node;
-
-    if (candidate->Is<Identity>()) {
-      // This expression was removed from the graph. Do not reuse it.
-      available_expressions_.erase(hash);
-      return nullptr;
-    }
-
-    const bool sanity_check =
-        candidate->template Is<NodeT>() &&
-        static_cast<size_t>(candidate->input_count()) == inputs.size();
-    DCHECK_IMPLIES(sanity_check,
-                   (StaticPropertiesForOpcode(op) & candidate->properties()) ==
-                       candidate->properties());
-    const bool epoch_check = !Node::needs_epoch_check(op) ||
-                             effect_epoch_ <= it->second.effect_epoch;
-    if (sanity_check && epoch_check) {
-      if (static_cast<NodeT*>(candidate)->options() ==
-          std::forward_as_tuple(std::forward<Args>(args)...)) {
-        int i = 0;
-        for (const auto& inp : inputs) {
-          if (inp->UnwrapAliases() !=
-              candidate->input(i).node()->UnwrapAliases()) {
-            break;
-          }
-          i++;
-        }
-        if (static_cast<size_t>(i) == inputs.size()) {
-          return static_cast<NodeT*>(candidate);
-        }
-      }
-    }
-    if (!epoch_check) {
-      available_expressions_.erase(hash);
+    NodeBase* candidate = FindCandidateExpression(
+        hash, op, Node::needs_epoch_check(op), base::VectorOf(inputs));
+    if (candidate != nullptr &&
+        static_cast<NodeT*>(candidate)->options() ==
+            std::forward_as_tuple(std::forward<Args>(args)...)) {
+      return static_cast<NodeT*>(candidate);
     }
     return nullptr;
   }
@@ -934,6 +904,10 @@ class KnownNodeAspects {
   bool SetContextCachedValue(ValueNode* context, int offset, ValueNode* value,
                              MaybeAssignedFlag assigned);
 
+  V8_EXPORT_PRIVATE NodeBase* FindCandidateExpression(
+      uint32_t hash, Opcode op, bool needs_epoch_check,
+      base::Vector<ValueNode* const> inputs);
+
   SmallZoneVector<LoadedContextSlotsKey, 8> ClearAliasedContextSlotsFor(
       Graph* graph, ValueNode* context, int offset, ValueNode* value);
 
@@ -1028,6 +1002,17 @@ class KnownNodeAspects {
     return it->second->UnwrapAliases();
   }
 
+  static bool IsCanonical(const ValueNode* node) {
+    if (node->IsAlias()) return false;
+    // Only tagging and untagging conversions can be canonical; untagged-to-
+    // untagged conversions are always unwrapped by GetCanonical.
+    if (node->is_conversion()) {
+      return node->is_tagged() !=
+             node->input_node(0)->UnwrapAliases()->is_tagged();
+    }
+    return true;
+  }
+
   // GetCanonical is used to ensure that nodes in the same conversion chain (eg,
   // a `NumberToInt32` flowing into a `Int32ToFloat64` for instance) share the
   // same NodeInfo. To do so, GetCanonical Unwraps identities and conversions.
@@ -1045,23 +1030,15 @@ class KnownNodeAspects {
   // TODO(496266449): Simply use `Unwrap` once `kTagged` is split into
   // `kTaggedSigned` and `kTaggedPointer` representations.
   static ValueNode* GetCanonical(ValueNode* node) {
-    node = node->UnwrapIdentitiesReturnedValuesAndPhis();
+    node = node->UnwrapAliases();
     if (!node->is_tagged()) {
       while (node->is_conversion()) {
-        ValueNode* input =
-            node->input_node(0)->UnwrapIdentitiesReturnedValuesAndPhis();
+        ValueNode* input = node->input_node(0)->UnwrapAliases();
         if (input->is_tagged()) break;
         node = input;
       }
     }
-    DCHECK(!node->Is<Identity>() && !node->Is<ReturnedValue>());
-    // Only tagging and untagging conversions can be canonical; untagged-to-
-    // untagged conversions are always unwrapped above.
-    DCHECK_IMPLIES(
-        node->is_conversion(),
-        node->is_tagged() != node->input_node(0)
-                                 ->UnwrapIdentitiesReturnedValuesAndPhis()
-                                 ->is_tagged());
+    DCHECK(IsCanonical(node));
     return node;
   }
 

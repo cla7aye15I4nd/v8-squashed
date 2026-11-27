@@ -2516,8 +2516,7 @@ class MachineLoweringReducer : public Next {
   }
 
   V<BigInt> REDUCE(BigIntBinop)(V<BigInt> left, V<BigInt> right,
-                                V<EagerFrameState> eager_frame_state,
-                                OptionalV<LazyFrameState> lazy_frame_state,
+                                V<EagerFrameState> frame_state,
                                 BigIntBinopOp::Kind kind) {
     const Builtin builtin = GetBuiltinForBigIntBinop(kind);
     switch (kind) {
@@ -2531,7 +2530,7 @@ class MachineLoweringReducer : public Next {
 
         // Check for exception sentinel: Smi 0 is returned to signal
         // BigIntTooBig.
-        __ DeoptimizeIf(__ ObjectIsSmi(result), eager_frame_state,
+        __ DeoptimizeIf(__ ObjectIsSmi(result), frame_state,
                         DeoptimizeReason::kBigIntTooBig, FeedbackSource{});
         return V<BigInt>::Cast(result);
       }
@@ -2544,15 +2543,13 @@ class MachineLoweringReducer : public Next {
         // TerminationRequested.
         IF (UNLIKELY(__ TaggedEqual(result, __ TagSmi(1)))) {
           __ template CallRuntime<runtime::TerminateExecution>(
-              lazy_frame_state.value(),
-              __ HeapConstant(broker_->target_native_context().object()), {},
-              LazyDeoptOnThrow{false});
+              __ HeapConstant(broker_->target_native_context().object()), {});
           __ Unreachable();
         }
 
         // Check for exception sentinel: Smi 0 is returned to signal
         // BigIntTooBig or DivisionByZero.
-        __ DeoptimizeIf(__ ObjectIsSmi(result), eager_frame_state,
+        __ DeoptimizeIf(__ ObjectIsSmi(result), frame_state,
                         kind == BigIntBinopOp::Kind::kMul
                             ? DeoptimizeReason::kBigIntTooBig
                             : DeoptimizeReason::kDivisionByZero,

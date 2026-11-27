@@ -38,22 +38,28 @@ When proposing a fix, ensure the code adheres to V8 standards:
   caught immediately by debug builds and fuzzers rather than masked.
 - **Encapsulation**: Encapsulate data-structure mutations as methods on the
   owning class rather than duplicating low-level steps across callers.
-- **Mandatory Reproducer Rule**: Unless explicitly specified otherwise by the
-  user, **every single bug fix in V8 MUST be uploaded with a working reproducer
-  (regression test)**. Uploading just the fix alone is NEVER acceptable. Always
-  verify that every regression test (and every test case within it) a) actually
-  exercises the specific code path/fix being tested and b) fails without the fix
-  (for `%OptimizeFunctionOnNextCall` tests targeting Maglev, omit
-  `--optimize-on-next-call-optimizes-to-maglev` from `// Flags:` in the test
-  file and verify failure under `--variants=stress_maglev`).
-- **Documentation Sync Requirement**: Whenever a CL changes V8 architecture,
-  data structures, object layouts, pipeline passes, bytecodes/IR nodes, flags,
-  or cross-tier invariants (or adds a feature or bug fix that invalidates or
-  expands a concept covered in `docs/`), search `docs/` (`git --no-pager grep`
-  across `docs/` or run the `doc-invalidation-checker` skill) and update the
-  relevant `.md` file(s) in the same CL. Keep `docs/security/triaging.md`
-  unchanged unless explicitly requested by the user, as it is maintained
-  manually.
+- **Mandatory Reproducer Rule**: Unless waived by the user, every bug fix
+  (crash, correctness, or security) MUST include a regression test where every
+  test case exercises the modified path and fails without the fix (for Maglev
+  `%OptimizeFunctionOnNextCall` tests, omit
+  `--optimize-on-next-call-optimizes-to-maglev` from `// Flags:` and verify
+  failure under `--variants=stress_maglev`). Also add concise tests (preferring
+  `mjsunit`, including `%` runtime functions) for new features, cleanly testable
+  behavior/optimization effects, or touched/added paths that lack existing
+  coverage and can be tested. Do NOT add new tests (or bloated C++ `unittests` /
+  brittle change-detector checks) for refactorings or optimizations without such
+  testable effects when existing tests already cover the affected paths.
+- **Documentation and Comments Explain Why**: In code you add or change, add a
+  brief rationale comment for local decisions (tuned constants, fast-path vs.
+  slow-path splits, non-obvious caps and invariants), linking
+  `See docs/<path>.md` (file path only) when deeper rationale lives there. When
+  a CL changes a design decision, trade-off, or cross-component invariant
+  covered by an existing `docs/` file, or contradicts one (search with
+  `git --no-pager grep` or run `doc-invalidation-checker`), update that file in
+  the same CL with the smallest diff describing the new design per "Writing
+  Guidelines" in `docs/README.md`. Most refactorings and bug fixes need no
+  `docs/` change. Keep `docs/security/triaging.md` unchanged unless explicitly
+  requested.
 
 ## Technical Guardrails & Guidelines
 
@@ -68,8 +74,9 @@ When proposing a fix, ensure the code adheres to V8 standards:
   `namespace {}` in the `.cc` file rather than as private class methods.
 - **Pre-Upload Diff Self-Review**: Inspect `git diff` before uploading to ensure
   minimal diff noise, tight local variable scopes (declaring variables at first
-  use), clean regression tests, and synchronized `docs/` updates for any
-  modified invariants, classes, passes, or flags.
+  use), clean regression tests, brief "why" comments on local trade-offs, and
+  focused `docs/` updates when a design decision, invariant, or documented claim
+  changed.
 - **Cleanup Constraint**: Keep diffs small by changing only the code and `docs/`
   documentation intended for the task. Propose cleanups to nearby unrelated code
   as a separate patch to keep the current change focused.

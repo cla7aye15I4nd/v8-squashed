@@ -1059,6 +1059,13 @@ Reduction JSNativeContextSpecialization::ReduceGlobalAccess(
       return NoChange();
     } else if (property_cell_type == PropertyCellType::kUndefined) {
       return NoChange();
+    } else if (property_cell_type == PropertyCellType::kConstant) {
+      if (property_cell_value.IsString() &&
+          !property_cell_value.IsInternalizedString()) {
+        // We cannot guarantee that a non-internalized string's canonical
+        // identity stays the same due to internalization and ThinStrings.
+        return NoChange();
+      }
     } else if (property_cell_type == PropertyCellType::kConstantType) {
       // We rely on stability further below.
       if (property_cell_value.IsHeapObject() &&
@@ -1250,7 +1257,7 @@ Reduction JSNativeContextSpecialization::ReduceJSLoadGlobal(Node* node) {
     Control control = n.control();
     ContextRef script_context_ref = feedback.script_context();
     Node* script_context =
-        jsgraph()->ConstantNoHole(script_context_ref, broker());
+        jsgraph()->HeapConstantNoHole(script_context_ref.object());
     Node* value;
     if (script_context_ref.scope_info(broker()).HasContextCells() &&
         !feedback.immutable()) {
@@ -1294,7 +1301,7 @@ Reduction JSNativeContextSpecialization::ReduceJSStoreGlobal(Node* node) {
     Node* frame_state = n.frame_state();
     ContextRef script_context_ref = feedback.script_context();
     Node* script_context =
-        jsgraph()->ConstantNoHole(script_context_ref, broker());
+        jsgraph()->HeapConstantNoHole(script_context_ref.object());
     if (script_context_ref.scope_info(broker()).HasContextCells()) {
       effect = control =
           graph()->NewNode(javascript()->StoreContext(0, feedback.slot_index()),
@@ -1314,78 +1321,6 @@ Reduction JSNativeContextSpecialization::ReduceJSStoreGlobal(Node* node) {
     DCHECK(feedback.IsMegamorphic());
     return NoChange();
   }
-}
-
-Reduction JSNativeContextSpecialization::ReduceMegaDOMPropertyAccess(
-    Node* node, Node* value, MegaDOMPropertyAccessFeedback const& feedback,
-    FeedbackSource const& source) {
-  DCHECK(node->opcode() == IrOpcode::kJSLoadNamed ||
-         node->opcode() == IrOpcode::kJSLoadProperty);
-  // TODO(mslekova): Add support and tests for kJSLoadNamedFromSuper.
-  static_assert(JSLoadNamedNode::ObjectIndex() == 0 &&
-                    JSLoadPropertyNode::ObjectIndex() == 0,
-                "Assumptions about ObjectIndex have changed, please update "
-                "this function.");
-
-  Node* effect = NodeProperties::GetEffectInput(node);
-  Node* control = NodeProperties::GetControlInput(node);
-  Node* frame_state = NodeProperties::GetFrameStateInput(node);
-
-  Node* lookup_start_object = NodeProperties::GetValueInput(node, 0);
-
-  if (!dependencies()->DependOnMegaDOMProtector()) {
-    return NoChange();
-  }
-
-  FunctionTemplateInfoRef function_template_info = feedback.info();
-
-  // TODO(mslekova): This could be a new InstanceTypeCheck operator
-  // that gets lowered later on (e.g. during generic lowering).
-  Node* receiver_map = effect =
-      graph()->NewNode(simplified()->LoadField(AccessBuilder::ForMap()),
-                       lookup_start_object, effect, control);
-  Node* receiver_instance_type = effect = graph()->NewNode(
-      simplified()->LoadField(AccessBuilder::ForMapInstanceType()),
-      receiver_map, effect, control);
-
-  if (function_template_info.is_signature_undefined(broker())) {
-    // Signature is undefined, enough to check if the receiver is a JSApiObject.
-    Node* check =
-        graph()->NewNode(simplified()->NumberEqual(), receiver_instance_type,
-                         jsgraph()->ConstantNoHole(JS_API_OBJECT_TYPE));
-    effect = graph()->NewNode(
-        simplified()->CheckIf(DeoptimizeReason::kWrongInstanceType), check,
-        effect, control);
-  } else {
-    // Calling out to builtin to do signature check.
-    Callable callable = Builtins::CallableFor(
-        isolate(), Builtin::kCallFunctionTemplate_CheckCompatibleReceiver);
-    int stack_arg_count = callable.descriptor().GetStackParameterCount() +
-                          1 /* implicit receiver */;
-
-    CallDescriptor* call_descriptor = Linkage::GetStubCallDescriptor(
-        graph()->zone(), callable.descriptor(), stack_arg_count,
-        CallDescriptor::kNeedsFrameState, Operator::kNoProperties);
-
-    Node* inputs[8] = {
-        jsgraph()->HeapConstantNoHole(callable.code()),
-        jsgraph()->ConstantNoHole(function_template_info, broker()),
-        jsgraph()->Int32Constant(stack_arg_count),
-        lookup_start_object,
-        jsgraph()->ConstantNoHole(native_context(), broker()),
-        frame_state,
-        effect,
-        control};
-
-    value = effect = control =
-        graph()->NewNode(common()->Call(call_descriptor), 8, inputs);
-    return Replace(value);
-  }
-
-  value = InlineApiCall(lookup_start_object, frame_state, nullptr /*value*/,
-                        &effect, &control, function_template_info, source);
-  ReplaceWithValue(node, value, effect, control);
-  return Replace(value);
 }
 
 Reduction JSNativeContextSpecialization::ReduceNamedAccess(
@@ -2654,11 +2589,6 @@ Reduction JSNativeContextSpecialization::ReducePropertyAccess(
       return ReduceHomomorphicAccess(node, value,
                                      feedback->AsHomomorphicPropertyAccess(),
                                      access_mode, key);
-    case ProcessedFeedback::kMegaDOMPropertyAccess:
-      DCHECK_EQ(access_mode, AccessMode::kLoad);
-      DCHECK_NULL(key);
-      return ReduceMegaDOMPropertyAccess(
-          node, value, feedback->AsMegaDOMPropertyAccess(), source);
     case ProcessedFeedback::kElementAccess:
       DCHECK_EQ(feedback->AsElementAccess().keyed_mode().access_mode(),
                 access_mode);
@@ -3017,7 +2947,7 @@ CallDescriptor* PushRegularApiCallInputs(
 
   // Add CallApiCallbackStub's register argument as well.
   Node* context =
-      jsgraph->ConstantNoHole(broker->target_native_context(), broker);
+      jsgraph->HeapConstantNoHole(broker->target_native_context().object());
   inputs[cursor++] = code;
   inputs[cursor++] = function_reference;
   inputs[cursor++] = jsgraph->ConstantNoHole(argc);

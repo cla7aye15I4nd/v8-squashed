@@ -12,12 +12,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <span>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 
@@ -106,6 +108,8 @@
 #include "src/objects/objects.h"
 #include "src/objects/promise-inl.h"
 #include "src/objects/property-descriptor.h"
+#include "src/objects/script-inl.h"
+#include "src/objects/shared-function-info-inl.h"
 #include "src/objects/slots.h"
 #include "src/objects/smi.h"
 #include "src/objects/source-text-module-inl.h"
@@ -150,6 +154,7 @@
 #include "src/builtins/builtins-inl.h"
 #include "src/debug/debug-wasm-objects.h"
 #include "src/trap-handler/trap-handler.h"
+#include "src/wasm/baseline/liftoff-compiler.h"
 #include "src/wasm/stacks.h"
 #include "src/wasm/wasm-code-manager.h"
 #include "src/wasm/wasm-code-pointer-table-inl.h"
@@ -839,7 +844,7 @@ void Isolate::PushParamsAndContinue(void* ptr1, void* ptr2, void* ptr3,
 void StackTraceFailureMessage::Print() volatile {
   // Print the details of this failure message object, including its own address
   // to force stack allocation.
-  static_assert(arraysize(ptrs_) >= 6);
+  static_assert(std::extent_v<decltype(ptrs_)> >= 6);
   base::OS::PrintError(
       "Stacktrace:\n    ptr0=%p\n    ptr1=%p\n    ptr2=%p\n    ptr3=%p\n    "
       "ptr4=%p\n    ptr5=%p\n    failure_message_object=%p\n%s",
@@ -853,23 +858,27 @@ StackTraceFailureMessage::StackTraceFailureMessage(
     Isolate* isolate, StackTraceFailureMessage::StackTraceMode mode,
     const Address* ptrs, size_t ptrs_count)
     : isolate_(isolate) {
-  size_t ptrs_size = std::min(arraysize(ptrs_), ptrs_count);
+  size_t ptrs_size = std::min(std::size(ptrs_), ptrs_count);
   std::copy(ptrs, ptrs + ptrs_size, &ptrs_[0]);
 
   if (mode == kIncludeStackTrace) {
     // Write a stracktrace into the {js_stack_trace_} buffer.
-    const size_t buffer_length = arraysize(js_stack_trace_);
+    constexpr size_t buffer_length = std::extent_v<decltype(js_stack_trace_)>;
     FixedStringAllocator fixed(&js_stack_trace_[0], buffer_length - 1);
     StringStream accumulator(&fixed, StringStream::kPrintObjectConcise);
     isolate_->PrintStack(&accumulator, Isolate::kPrintStackVerbose,
                          AllowAllocation{false});
-    // Keeping a reference to the last code objects to increase likelihood that
-    // they get included in the minidump.
-    const size_t code_objects_length = arraysize(code_objects_);
+    // Keeping a reference to the code objects of the topmost frames to increase
+    // likelihood that they get included in the minidump.
+    const size_t code_objects_length = std::size(code_objects_);
     size_t i = 0;
     StackFrameIterator it(isolate_);
     for (; !it.done() && i < code_objects_length; it.Advance()) {
-      code_objects_[i++] = it.frame()->unchecked_code().ptr();
+      std::optional<Tagged<GcSafeCode>> code =
+          isolate_->heap()->GcSafeTryFindCodeForInnerPointer(
+              it.frame()->maybe_unauthenticated_pc());
+      if (!code.has_value()) continue;
+      code_objects_[i++] = code->ptr();
     }
   }
 }
@@ -2822,15 +2831,19 @@ Tagged<Object> Isolate::Throw(Tagged<Object> raw_exception,
 
   // Determine whether a message needs to be created for the given exception
   // depending on the following criteria:
-  // 1) External v8::TryCatch missing: Always create a message because any
+  // 1) Uncatchable termination exceptions: No message is ever reported or
+  //    propagated to v8::TryCatch, so skip message creation (and stack
+  //    walking).
+  // 2) External v8::TryCatch missing: Always create a message because any
   //    JavaScript handler for a finally-block might re-throw to top-level.
-  // 2) External v8::TryCatch exists: Only create a message if the handler
+  // 3) External v8::TryCatch exists: Only create a message if the handler
   //    captures messages or is verbose (which reports despite the catch).
-  // 3) ReThrow from v8::TryCatch: The message from a previous throw still
+  // 4) ReThrow from v8::TryCatch: The message from a previous throw still
   //    exists and we preserve it instead of creating a new message.
-  bool requires_message = try_catch_handler() == nullptr ||
-                          try_catch_handler()->IsVerbose() ||
-                          try_catch_handler()->capture_message();
+  bool requires_message =
+      is_catchable_by_javascript(*exception) &&
+      (try_catch_handler() == nullptr || try_catch_handler()->IsVerbose() ||
+       try_catch_handler()->capture_message());
   bool rethrowing_message = thread_local_top()->rethrowing_message_;
 
   thread_local_top()->rethrowing_message_ = false;
@@ -5328,6 +5341,7 @@ void Isolate::Deinit() {
 #endif  // defined(V8_ENABLE_ETW_STACK_WALKING)
 
 #if V8_ENABLE_WEBASSEMBLY
+  ReleaseWasmLiftoffContext();
   wasm::GetWasmEngine()->RemoveIsolate(this);
 
   delete wasm_code_look_up_cache_;
@@ -5432,13 +5446,6 @@ void Isolate::SetIsolateThreadLocals(Isolate* isolate,
   Sandbox::set_current(isolate ? isolate->isolate_group()->sandbox() : nullptr);
 #endif
 #endif  // V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
-
-  if (isolate && isolate->main_thread_local_isolate()) {
-    WriteBarrier::SetForThread(
-        isolate->main_thread_local_heap()->marking_barrier());
-  } else {
-    WriteBarrier::SetForThread(nullptr);
-  }
 }
 
 Isolate::~Isolate() {
@@ -6392,20 +6399,13 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
 #endif  // V8_ENABLE_SANDBOX
   }
 
-  {
-    // LocalHeap initialization requires the TLS variable to be set already.
-    // However, we can't move SetIsolateThreadLocals here because the marking
-    // barrier isn't setup yet.
-    SetCurrentLocalHeapScope local_heap_scope(this);
-    isolate_group()->SetupReadOnlyHeap(this, read_only_snapshot_data,
-                                       can_rehash);
-    heap_.SetUpSpaces();
-  }
-
   DCHECK_EQ(this, Isolate::Current());
   PerIsolateThreadData* const current_data = CurrentPerIsolateThreadData();
   DCHECK_EQ(current_data->isolate(), this);
   SetIsolateThreadLocals(this, current_data);
+
+  isolate_group()->SetupReadOnlyHeap(this, read_only_snapshot_data, can_rehash);
+  heap_.SetUpSpaces();
 
   // The main thread's marking barrier is now set up and installed, so write
   // barriers may observe shared marking from here on.
@@ -6986,7 +6986,7 @@ bool Isolate::NeedsSourcePositions() const {
       v8_flags.log_ic || v8_flags.log_function_events ||
       v8_flags.heap_snapshot_on_oom ||
       // Dynamic conditions; changing any of these conditions triggers source
-      // position collection for the entire heap
+      // position collection for all finalized scripts
       // (CollectSourcePositionsForAllBytecodeArrays).
       is_profiling() || debug_->is_active() || v8_file_logger_->is_logging();
 }
@@ -7095,7 +7095,6 @@ void Isolate::UpdateProtectorsOnSetPrototype(
     DirectHandle<JSObject> object, DirectHandle<Object> new_prototype) {
   UpdateNoElementsProtectorOnSetPrototype(object);
   UpdateTypedArraySpeciesLookupChainProtectorOnSetPrototype(object);
-  UpdateNumberStringNotRegexpLikeProtectorOnSetPrototype(object);
   UpdateStringWrapperToPrimitiveProtectorOnSetPrototype(object, new_prototype);
 }
 
@@ -7106,24 +7105,6 @@ void Isolate::UpdateTypedArraySpeciesLookupChainProtectorOnSetPrototype(
   if (IsTypedArrayConstructor(*object) &&
       Protectors::IsTypedArraySpeciesLookupChainIntact(this)) {
     Protectors::InvalidateTypedArraySpeciesLookupChain(this);
-  }
-}
-
-void Isolate::UpdateNumberStringNotRegexpLikeProtectorOnSetPrototype(
-    DirectHandle<JSObject> object) {
-  if (!Protectors::IsNumberStringNotRegexpLikeIntact(this)) {
-    return;
-  }
-  // We need to protect the prototype chain of `Number.prototype` and
-  // `String.prototype`.
-  // Since `Object.prototype.__proto__` is not writable, we can assume it
-  // doesn't occur here. We detect `Number.prototype` and `String.prototype` by
-  // checking for a prototype that is a JSPrimitiveWrapper. This is a safe
-  // approximation. Using JSPrimitiveWrapper as prototype should be
-  // sufficiently rare.
-  DCHECK(!IsJSObjectPrototype(*object));
-  if (object->map()->is_prototype_map() && (IsJSPrimitiveWrapper(*object))) {
-    Protectors::InvalidateNumberStringNotRegexpLike(this);
   }
 }
 
@@ -7313,11 +7294,17 @@ void Isolate::UpdatePromiseHookProtector() {
 }
 
 void Isolate::PromiseHookStateUpdated() {
+#ifdef V8_ENABLE_PROMISE_HOOKS
   promise_hook_flags_ =
       (promise_hook_flags_ & PromiseHookFields::HasContextPromiseHook::kMask) |
       PromiseHookFields::HasIsolatePromiseHook::encode(promise_hook_) |
       PromiseHookFields::HasAsyncEventDelegate::encode(async_event_delegate_) |
       PromiseHookFields::IsDebugActive::encode(debug()->is_active());
+#else
+  promise_hook_flags_ =
+      PromiseHookFields::HasAsyncEventDelegate::encode(async_event_delegate_) |
+      PromiseHookFields::IsDebugActive::encode(debug()->is_active());
+#endif  // V8_ENABLE_PROMISE_HOOKS
 
   if (promise_hook_flags_ != 0) {
     UpdatePromiseHookProtector();
@@ -7770,6 +7757,7 @@ std::shared_ptr<bool> Isolate::cpp_heap_isolate_alive_token() const {
   return CppHeap::From(heap_.cpp_heap())->isolate_alive_token();
 }
 
+#ifdef V8_ENABLE_PROMISE_HOOKS
 void Isolate::SetPromiseHook(PromiseHook hook) {
   promise_hook_ = hook;
   PromiseHookStateUpdated();
@@ -7795,6 +7783,7 @@ void Isolate::RunPromiseHook(PromiseHookType type,
   DCHECK(promise_hook_ != nullptr);
   promise_hook_(type, v8::Utils::ToLocal(promise), v8::Utils::ToLocal(parent));
 }
+#endif  // V8_ENABLE_PROMISE_HOOKS
 
 void Isolate::OnAsyncFunctionSuspended(DirectHandle<JSPromise> promise,
                                        DirectHandle<JSPromise> parent,
@@ -8158,20 +8147,22 @@ void Isolate::CollectSourcePositionsForAllBytecodeArrays() {
   HandleScope scope(this);
   std::vector<Handle<SharedFunctionInfo>> sfis;
   {
-    HeapObjectIterator iterator(heap());
-    for (Tagged<HeapObject> obj = iterator.Next(); !obj.is_null();
-         obj = iterator.Next()) {
-      if (!IsSharedFunctionInfo(obj)) continue;
-      Tagged<SharedFunctionInfo> sfi = Cast<SharedFunctionInfo>(obj);
-      // If the script is a Smi, then the SharedFunctionInfo is in
-      // the process of being deserialized.
-      Tagged<Object> script = sfi->raw_script(kAcquireLoad);
-      if (IsSmi(script)) {
-        DCHECK_EQ(script, Smi::uninitialized_deserialization_value());
-        continue;
+    // Walk script_list() rather than the heap, so that SFIs of Scripts that are
+    // still being deserialized off-thread are skipped. Like the heap walk, hold
+    // a safepoint so that no background thread changes SFIs under us.
+    SafepointScope safepoint(this, kGlobalSafepointForSharedSpaceIsolate);
+    Script::Iterator script_iterator(this);
+    for (Tagged<Script> script = script_iterator.Next(); !script.is_null();
+         script = script_iterator.Next()) {
+      // Scripts without a valid source cannot be reparsed.
+      if (!script->HasValidSource()) continue;
+
+      SharedFunctionInfo::ScriptIterator sfi_iterator(this, script);
+      for (Tagged<SharedFunctionInfo> sfi = sfi_iterator.Next(); !sfi.is_null();
+           sfi = sfi_iterator.Next()) {
+        if (!sfi->CanCollectSourcePosition(this)) continue;
+        sfis.push_back(Handle<SharedFunctionInfo>(sfi, this));
       }
-      if (!sfi->CanCollectSourcePosition(this)) continue;
-      sfis.push_back(Handle<SharedFunctionInfo>(sfi, this));
     }
   }
   for (auto sfi : sfis) {
@@ -8518,6 +8509,22 @@ void Isolate::RemoveCodeMemoryChunk(MutablePage* chunk) {
   SetCodePages(new_code_pages);
 #endif  // !defined(V8_TARGET_ARCH_ARM)
 }
+
+#if V8_ENABLE_WEBASSEMBLY
+wasm::LiftoffCompilationContext* Isolate::wasm_liftoff_context() {
+  DCHECK_EQ(thread_id(), base::ThreadId::Current());
+  if (!wasm_liftoff_context_) {
+    wasm_liftoff_context_ = std::make_unique<wasm::LiftoffCompilationContext>();
+  }
+  return wasm_liftoff_context_.get();
+}
+
+void Isolate::ReleaseWasmLiftoffContext() {
+  // Only called during Isolate teardown or in a Mark-Compact GC safepoint
+  // (CompileLazy runs under DisallowGarbageCollection on the Isolate thread).
+  wasm_liftoff_context_.reset();
+}
+#endif  // V8_ENABLE_WEBASSEMBLY
 
 #if V8_ENABLE_DRUMBRAKE
 void Isolate::initialize_wasm_execution_timer() {

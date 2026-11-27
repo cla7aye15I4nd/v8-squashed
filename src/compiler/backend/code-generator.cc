@@ -31,7 +31,6 @@
 #include "src/wasm/effect-handler.h"
 
 #if V8_ENABLE_WEBASSEMBLY
-#include "src/wasm/leb-helper.h"
 #include "src/wasm/wasm-deopt-data.h"
 #endif
 
@@ -53,6 +52,23 @@ class CodeGenerator::JumpTable final : public ZoneObject {
   JumpTable* const next_;
   base::Vector<Label*> const targets_;
 };
+
+namespace {
+
+SafepointTableBuilder::LazyDeoptSupport GetLazyDeoptSupport(
+    InstructionSequence* instructions) {
+  for (int i = 0, count = instructions->GetDeoptimizationEntryCount();
+       i < count; ++i) {
+    DeoptimizeKind kind = instructions->GetDeoptimizationEntry(i).kind();
+    if (kind == DeoptimizeKind::kLazy ||
+        kind == DeoptimizeKind::kLazyAfterFastCall) {
+      return SafepointTableBuilder::LazyDeoptSupport::kYes;
+    }
+  }
+  return SafepointTableBuilder::LazyDeoptSupport::kNo;
+}
+
+}  // namespace
 
 CodeGenerator::CodeGenerator(Zone* codegen_zone, Frame* frame, Linkage* linkage,
                              InstructionSequence* instructions,
@@ -79,7 +95,7 @@ CodeGenerator::CodeGenerator(Zone* codegen_zone, Frame* frame, Linkage* linkage,
       masm_(isolate, codegen_zone, options, CodeObjectRequired{false},
             std::unique_ptr<AssemblerBuffer>{}),
       resolver_(this),
-      safepoints_(codegen_zone),
+      safepoints_(codegen_zone, GetLazyDeoptSupport(instructions)),
       handlers_(codegen_zone),
       deoptimization_exits_(codegen_zone),
       protected_deoptimization_literals_(codegen_zone),
@@ -614,6 +630,12 @@ bool CodeGenerator::IsNextInAssemblyOrder(RpoNumber block) const {
 }
 
 void CodeGenerator::RecordSafepoint(ReferenceMap* references, int pc_offset) {
+  if (frame()->tagged_slots().IsEmpty() &&
+      references->reference_operands().empty()) {
+    safepoints()->DefineEmptySafepoint(masm(), pc_offset);
+    return;
+  }
+
   auto safepoint = safepoints()->DefineSafepoint(masm(), pc_offset);
 
   safepoint.DefineTaggedStackSlots(frame()->tagged_slots());
@@ -635,7 +657,7 @@ void CodeGenerator::RecordSafepoint(ReferenceMap* references, int pc_offset) {
 }
 
 void CodeGenerator::RecordSafepointWithoutTaggedSlots() {
-  safepoints()->DefineSafepoint(masm());
+  safepoints()->DefineEmptySafepoint(masm());
 }
 
 bool CodeGenerator::IsMaterializableFromRoot(Handle<HeapObject> object,
@@ -1164,11 +1186,11 @@ Handle<DeoptimizationData> CodeGenerator::GenerateDeoptimizationData(
 
   if (info->is_osr()) {
     DCHECK_LE(0, osr_pc_offset_);
-    data->SetOsrBytecodeOffset(Smi::FromInt(info_->osr_offset().ToInt()));
+    DCHECK(info->has_bytecode_array());
+    data->SetOsrBytecodeArray(*info->bytecode_array());
     data->SetOsrPcOffset(Smi::FromInt(osr_pc_offset_));
   } else {
-    BytecodeOffset osr_offset = BytecodeOffset::None();
-    data->SetOsrBytecodeOffset(Smi::FromInt(osr_offset.ToInt()));
+    data->SetOsrBytecodeArray(Smi::zero());
     data->SetOsrPcOffset(Smi::FromInt(-1));
   }
 
@@ -1245,30 +1267,26 @@ base::UniqueArray<uint8_t> CodeGenerator::GenerateWasmDeoptimizationData() {
   return result;
 }
 
-base::UniqueArray<uint8_t> CodeGenerator::GenerateWasmEffectHandlers() {
-  size_t size = 0;
+base::UniqueArray<wasm::EffectHandlerEntry>
+CodeGenerator::GenerateWasmEffectHandlers() {
+  if (effect_handlers_.empty()) return {};
+  // Preserve source order within each call site (first matching tag wins).
+  base::UniqueArray<wasm::EffectHandlerEntry> entries =
+      base::UniqueArray<wasm::EffectHandlerEntry>::NewForOverwrite(
+          effect_handlers_.size());
   for (size_t i = 0; i < effect_handlers_.size(); ++i) {
-    size += wasm::LEBHelper::sizeof_u32v(effect_handlers_[i].pc_offset);
-    size += wasm::LEBHelper::sizeof_u32v(
-        effect_handlers_[i].tag_and_kind.raw_value());
-    if (!effect_handlers_[i].tag_and_kind.is_switch()) {
-      size += wasm::LEBHelper::sizeof_u32v(effect_handlers_[i].handler->pos());
-      size += wasm::LEBHelper::sizeof_u32v(effect_handlers_[i].sig.index);
+    const EffectHandlerInfo& info = effect_handlers_[i];
+    DCHECK_GE(info.pc_offset, 0);
+    uint32_t handler_offset = 0;
+    if (!info.tag_and_kind.is_switch()) {
+      DCHECK(info.handler->is_bound());
+      DCHECK_GE(info.handler->pos(), 0);
+      handler_offset = static_cast<uint32_t>(info.handler->pos());
     }
+    entries[i] = {static_cast<uint32_t>(info.pc_offset), info.tag_and_kind,
+                  handler_offset, info.sig};
   }
-  auto bytes = base::UniqueArray<uint8_t>::New(size);
-  uint8_t* ptr = bytes.data();
-  for (size_t i = 0; i < effect_handlers_.size(); ++i) {
-    wasm::LEBHelper::write_u32v(&ptr, effect_handlers_[i].pc_offset);
-    wasm::LEBHelper::write_u32v(&ptr,
-                                effect_handlers_[i].tag_and_kind.raw_value());
-    if (!effect_handlers_[i].tag_and_kind.is_switch()) {
-      wasm::LEBHelper::write_u32v(&ptr, effect_handlers_[i].handler->pos());
-      wasm::LEBHelper::write_u32v(&ptr, effect_handlers_[i].sig.index);
-    }
-  }
-  DCHECK_EQ(ptr, bytes.end());
-  return bytes;
+  return entries;
 }
 #endif  // V8_ENABLE_WEBASSEMBLY
 

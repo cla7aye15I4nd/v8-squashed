@@ -56,10 +56,12 @@ description: Reviews a V8 CL, commit, or local diff using targeted parallel suba
      hot builtins) or adding/modifying data structures, containers, and loops.
      Skip for cold error paths, small localized fixes with no container/loop
      changes, or test-only diffs.
-   - `tests`: Select when `test/` files are added/modified **or** when reviewing
-     a bug fix (to verify the mandatory regression test is present and
-     effective). Skip for pure refactorings, comments, or build changes that
-     neither touch `test/` nor fix a bug.
+   - `tests`: Select when `test/` files are added/modified, or when the CL fixes
+     a bug (crash, correctness, or security), has an effect concisely testable
+     via `mjsunit` (including `%` runtime functions), or touches/adds paths that
+     appear to lack existing coverage. Skip for comments, build changes, or
+     refactorings and optimizations without such testable effects on
+     already-covered paths when `test/` is untouched.
    - `style-comments`: Select when adding/modifying C++ (`.cc`, `.h`, `-inl.h`),
      Torque (`.tq`), or Markdown documentation (`docs/*.md`) files. Skip for
      test-only `.js`/`.mjs` diffs or tiny 1–2 line changes where the main agent
@@ -67,10 +69,26 @@ description: Reviews a V8 CL, commit, or local diff using targeted parallel suba
 
 ## Step 2: Parallel Subagents
 
-Call `invoke_subagent` for each selected subagent in parallel in a single turn
-(`TypeName: "self"`, `Model: "inherit"`), passing each subagent only its own
-**verbatim** checklist (do not paraphrase or narrow) and the shared subagent
-instructions below:
+Run all selected reviewers concurrently, passing each reviewer only its own
+**verbatim** checklist (do not paraphrase or narrow), the patch path from Step
+1, and the shared instructions below:
+
+- **When `run_workflow` is available (preferred)**: Launch a single background
+  `run_workflow` call using built-in `parallel()` so the main agent wakes up
+  once with all results instead of once per reviewer. Inside `parallel()`, wrap
+  each
+  `agent(prompt, schema=FINDING_SCHEMA, role=name, type_name="self", workspace="inherit", model="inherit")`
+  in an `async def` helper with `try`/`except Exception as e` returning
+  `{"reviewer": name, "error": str(e), "findings": []}` so a single failure does
+  not cancel sibling reviewers. Define `FINDING_SCHEMA` to match the JSON array
+  below (`required: ["file", "line", "type", "comment"]`, optional
+  `"suggestion"`), stick to built-in workflow primitives (`parallel`, `agent`)
+  for portability, and `print(json.dumps(results))` so all findings appear in
+  `Output:`.
+- **Fallback (if `run_workflow` is unavailable or denied)**: Call
+  `invoke_subagent` (or the harness's parallel subagent tool) for each selected
+  reviewer in parallel in a single turn (`TypeName: "self"`,
+  `Model: "inherit"`).
 
 1. `sandbox-security`:
 
@@ -203,14 +221,19 @@ instructions below:
      production `.cc` code calling `*ForTest*` helpers, new `V8_OBJECT`/`V8_IT_`
      headers missing from `src/objects/all-objects.h`.
    - **Documentation sync (`docs/`)**: Search `docs/` (`git --no-pager grep` on
-     `docs/`) for classes, methods, enums, bitmasks, pipeline passes,
-     bytecodes/IR nodes, flags, or cross-tier invariants modified by the CL.
-     Flag a `design` (or `bug`) comment anchored on the relevant modified line
-     in `src/` if the CL invalidates or makes incomplete any design document in
-     `docs/` without updating it (excluding `docs/security/triaging.md`, which
-     is maintained manually). When the CL modifies `.md` files in `docs/`,
-     verify every C++ class/method/enum name, bitmask, register, flag, pipeline
-     step, and invariant against `src/` and flag any factual mismatch.
+     `docs/`) for symbols, flags, passes, or cross-component invariants modified
+     by the CL. Flag a `design` (or `bug`) comment anchored on the relevant
+     modified line in `src/` if the CL contradicts an existing `docs/` file or
+     changes a design-level trade-off, cost model, or cross-component invariant
+     covered by one without a concise update per `docs/README.md` (excluding
+     `docs/security/triaging.md`, which is maintained manually). When the CL
+     modifies `.md` files in `docs/`, verify every C++ symbol, bitmask,
+     register, flag, pipeline step, and invariant against `src/`: flag factual
+     mismatches as `bug`s, flag documented rationale not backed by `src/`, code
+     comments, or the commit message as a `question` for the author to confirm,
+     and ensure the `docs/` diff stays small and proportional, focusing on
+     present-tense design rationale rather than mechanical code restatement, CL
+     history, or benchmark numbers.
 
 6. `performance-containers`:
 
@@ -229,12 +252,19 @@ instructions below:
 
 7. `tests`:
 
-   - **Mandatory reproducer & fidelity**: Flag a `bug` if a bug fix omits a
-     regression test. Verify tests (`test/mjsunit/`, `test/unittests/`) exercise
-     the modified path and fail without the fix (watch for early errors in
-     helper closures before target code, or missing
-     `%PrepareFunctionForOptimization` + warmup call before
-     `%OptimizeFunctionOnNextCall`).
+   - **Mandatory reproducer & fidelity**: Flag a `bug` if a bug fix (crash,
+     correctness, or security) omits a regression test, and verify bug-fix
+     regression tests (`test/mjsunit/`, `test/unittests/`) exercise the modified
+     path and fail without the fix (watch for early errors in helper closures
+     before target code, or missing `%PrepareFunctionForOptimization` + warmup
+     call before `%OptimizeFunctionOnNextCall`). Refactorings and optimizations
+     need tests only when their effect is concisely testable via `mjsunit`
+     (including `%` runtime functions) or when touched/added paths genuinely
+     lack coverage and can be tested (do not ask for tests on already-covered
+     refactorings/optimizations, heavy new C++ `unittests` fixtures, or brittle
+     assembly/change-detector checks): flag missing coverage as `design`, and
+     suggest dropping added tests that pass without the CL and only re-exercise
+     covered paths (or rely on brittle/bloated checks).
    - **Boundary coverage**: Edge cases (`0`, `-0`, `NaN`, `INT32_MIN`,
      `INT32_MAX`, `UINT32_MAX`, `Smi` range, empty/max-size buffers or Wasm
      modules).
@@ -261,10 +291,13 @@ instructions below:
      constructors and assignment operators; `{}` braces on all multi-line `if`
      statements; copyright header on new files.
    - **Comments, `docs/` & readability**: Documenting class invariants and
-     non-obvious rationale; updating stale adjacent comments or `docs/*.md`
-     sections contradicted by the diff; checking modified `docs/*.md` files for
-     broken relative links or Unicode em-dashes (`U+2014`); identifying pure
-     code moves.
+     non-obvious rationale, including flagging new tuned constants, caps, or
+     fast-path vs. slow-path splits that lack a brief "why" comment; verifying
+     `See docs/...` comments resolve to existing files (without heading
+     anchors); updating stale adjacent comments or `docs/*.md` sections
+     contradicted by the diff; checking modified `docs/*.md` files for broken
+     relative links or Unicode em-dashes (`U+2014`); identifying pure code
+     moves.
 
 Instructions for every subagent:
 
@@ -285,7 +318,7 @@ Instructions for every subagent:
   (`tools/run-tests.py` runs one test per process/fork); only flag static,
   global, or `v8_flags` state issues in those suites if they cause a bug within
   a single test execution.
-- Send ONLY a JSON array (`[]` if clean):
+- Return ONLY a JSON array (`[]` if clean):
   `[{"file": "src/...", "line": 123, "type": "security|bug|design|question|nit", "comment": "Issue, impact, and suggested fix.", "suggestion": "..."}]`
 
 ## Step 3: Filter, Merge & Format (Main Agent)
@@ -293,15 +326,18 @@ Instructions for every subagent:
 1. **Verify**: Check every candidate comment against the source files; drop
    false positives, speculative issues without a concrete mechanism, and
    comments on unmodified lines (unless flagging a newly exposed bug or missed
-   variant anchored to the diff).
+   variant anchored to the diff). If any reviewer errored in Step 2, cover its
+   checklist directly (or re-run it) before finalizing.
 2. **Commit Message** (if reviewing a commit/CL): Verify factual accuracy
    against the diff. Check `[subsystem] Imperative subject` (\<= 72 chars,
    aiming for < 50, no period), concise body (\<= 10 lines when needed, wrapped
    at \<= 72 chars, explaining *why* and high-level *what*), CL references as
    `https://crrev.com/c/<number>` (not git hashes), and footers (`Bug: <id>` or
    `Fixed: <id>` with plain numeric ID for Chromium or `b:<id>` for Buganizer,
-   never `BUG=`; plus `TAG=agy` and `CONV=<id>` in a paragraph above the
-   `Bug:`/`Fixed:` and `Change-Id:` footer block for agent-authored CLs).
+   never `BUG=`; single-line `No-Regression-Test: <reason>` only when a
+   test-exempt or waived `Fixed:` CL modifies `src/` without `test/`; plus
+   `TAG=agy` and `CONV=<id>` in a paragraph above the `Bug:`/`Fixed:` and
+   `Change-Id:` footer block for agent-authored CLs).
 3. **Deduplicate**: Merge overlapping comments on the same `file:line` (within 2
    lines) or the same root cause repeated across architectures/files. Keep \<=
    25 comments ordered by `security` > `bug` > `design` > `question` > `nit`.

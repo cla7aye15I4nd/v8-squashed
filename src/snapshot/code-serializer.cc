@@ -142,7 +142,11 @@ AlignedCachedData* CodeSerializer::SerializeSharedFunctionInfo(
     Handle<SharedFunctionInfo> info) {
   DisallowGarbageCollection no_gc;
 
-  if (!isolate()->requires_bytecode_for_code_coverage()) {
+  // Do not serialize bytecode if code coverage is active or was toggled in this
+  // isolate (indicated by disable_bytecode_flushing), since existing bytecode
+  // on the heap may have been compiled under non-best-effort coverage settings.
+  if (!isolate()->requires_bytecode_for_code_coverage() &&
+      !isolate()->disable_bytecode_flushing()) {
     VisitRootPointer(Root::kHandleScope, nullptr,
                      FullObjectSlot(info.location()));
     SerializeDeferredObjects();
@@ -340,16 +344,28 @@ void CreateInterpreterDataForDeserializedCode(
     DCHECK(shared_info->HasBytecodeArray());
     DirectHandle<SharedFunctionInfo> sfi(shared_info, isolate);
 
-    DirectHandle<BytecodeArray> bytecode(sfi->GetBytecodeArray(isolate),
-                                         isolate);
+    // Read the trusted data once, so that the InterpreterData is installed on
+    // the same baseline Code (if any) whose bytecode it wraps.
+    DirectHandle<Code> baseline_code;
+    DirectHandle<BytecodeArray> bytecode;
+    {
+      DisallowGarbageCollection no_gc;
+      Tagged<Code> raw_baseline_code;
+      if (TryCast<Code>(sfi->GetTrustedData(isolate), &raw_baseline_code)) {
+        baseline_code = direct_handle(raw_baseline_code, isolate);
+        bytecode = direct_handle(raw_baseline_code->GetBaselineBytecodeArray(),
+                                 isolate);
+      } else {
+        bytecode = direct_handle(sfi->GetBytecodeArray(isolate), isolate);
+      }
+    }
     DirectHandle<Code> code =
         Builtins::CreateInterpreterEntryTrampolineForProfiling(isolate);
     DirectHandle<InterpreterData> interpreter_data =
         isolate->factory()->NewInterpreterData(bytecode, code);
 
-    if (sfi->HasBaselineCode()) {
-      sfi->baseline_code(kAcquireLoad)
-          ->set_bytecode_or_interpreter_data(*interpreter_data);
+    if (!baseline_code.is_null()) {
+      baseline_code->set_bytecode_or_interpreter_data(*interpreter_data);
     } else {
       sfi->set_interpreter_data(isolate, *interpreter_data);
     }
@@ -407,18 +423,19 @@ void FinalizeDeserialization(Isolate* isolate,
   TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
                "V8.FinalizeDeserialization");
 
+  DirectHandle<Script> script(Cast<Script>(result->script()), isolate);
+  // Reset the script details, including origin options and host-defined
+  // options, before any logging/profiling hooks inspect the script.
+  {
+    DisallowGarbageCollection no_gc;
+    SetScriptFieldsFromDetails(isolate, *script, script_details, &no_gc);
+  }
+
   const bool log_code_creation = isolate->IsLoggingCodeCreation();
 
   if (V8_UNLIKELY(isolate->interpreted_frames_native_stack())) {
     CreateInterpreterDataForDeserializedCode(isolate, result,
                                              log_code_creation);
-  }
-
-  DirectHandle<Script> script(Cast<Script>(result->script()), isolate);
-  // Reset the script details, including host-defined options.
-  {
-    DisallowGarbageCollection no_gc;
-    SetScriptFieldsFromDetails(isolate, *script, script_details, &no_gc);
   }
 
   bool needs_source_positions = isolate->NeedsSourcePositions();
@@ -712,6 +729,11 @@ CodeSerializer::FinishOffThreadDeserialize(
 
   if (background_merge_task &&
       background_merge_task->HasPendingForegroundWork()) {
+    if (isolate->disable_bytecode_flushing()) {
+      // Coverage mode changed while this merge was in flight; abort and fall
+      // back to compiling a fresh script.
+      return MaybeDirectHandle<SharedFunctionInfo>();
+    }
     DCHECK_EQ(data.scripts.size(), 1);
     DirectHandle<Script> new_script = data.scripts[0];
     result =

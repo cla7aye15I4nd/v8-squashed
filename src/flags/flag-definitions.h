@@ -2056,8 +2056,8 @@ DEFINE_DEVELOPER_FLAG(
     trace_wasm_offheap_memory,
     "print details of wasm off-heap memory when the memory measurement "
     "API is used")
-DEFINE_BOOL(
-    print_wasm_offheap_memory_size, false,
+DEFINE_DEVELOPER_FLAG(
+    print_wasm_offheap_memory_size,
     "print off-heap memory consumption per module and engine when they die")
 DEFINE_DEBUG_BOOL(trace_wasm_serialization, false,
                   "trace serialization/deserialization")
@@ -2930,16 +2930,6 @@ DEFINE_NEG_NEG_IMPLICATION(cppheap_incremental_marking,
 DEFINE_NEG_NEG_IMPLICATION(concurrent_marking, cppheap_concurrent_marking)
 DEFINE_WEAK_IMPLICATION(concurrent_marking, cppheap_concurrent_marking)
 
-DEFINE_BOOL(memory_balancer, false,
-            "use membalancer, "
-            "a new heap limit balancing algorithm")
-DEFINE_FLOAT(memory_balancer_c_value, 3e-10,
-             "c value for membalancer. "
-             "A special constant to balance between memory and space tradeoff. "
-             "The smaller the more memory it uses.")
-DEFINE_NEG_IMPLICATION(memory_balancer, memory_reducer)
-DEFINE_DEVELOPER_FLAG(trace_memory_balancer, "print memory balancer behavior.")
-
 // assembler-ia32.cc / assembler-arm.cc / assembler-arm64.cc / assembler-x64.cc
 #ifdef V8_ENABLE_DEBUG_CODE
 DEFINE_BOOL(debug_code, DEBUG_BOOL,
@@ -3363,8 +3353,6 @@ DEFINE_BOOL_READONLY(sparkplug_inline_smi, false,
 DEFINE_IMPLICATION(sparkplug_plus, short_builtin_calls)
 
 DEFINE_BOOL(super_ic, true, "use an IC for super property loads")
-
-DEFINE_EXPERIMENTAL_FEATURE(mega_dom_ic, "use MegaDOM IC state for API objects")
 
 DEFINE_UINT(homomorphic_ic_count, 8, "local cache size in homomorphic ICs")
 DEFINE_REQUIREMENT(base::bits::IsPowerOfTwo(homomorphic_ic_count.value()))
