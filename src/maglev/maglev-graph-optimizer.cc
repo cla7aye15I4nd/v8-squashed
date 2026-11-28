@@ -2098,12 +2098,12 @@ ProcessResult MaglevGraphOptimizer::VisitHasInPrototypeChain(
 
 ProcessResult MaglevGraphOptimizer::VisitInitialValue(
     InitialValue* node, const ProcessingState& state) {
-  // Set the type for the `this` register in sloppy mode.
+  // Set the type for the `this` register in non-native sloppy mode.
   const MaglevCompilationUnit* unit =
       reducer_.graph()->compilation_info()->toplevel_compilation_unit();
   if (node->source() == interpreter::Register::FromParameterIndex(0) &&
-      is_sloppy(unit->shared_function_info().language_mode())) {
-    DCHECK(unit->shared_function_info().IsUserJavaScript());
+      is_sloppy(unit->shared_function_info().language_mode()) &&
+      !unit->shared_function_info().native()) {
     NodeInfo* node_info =
         known_node_aspects().GetOrCreateInfoFor(broker(), node);
     node_info->IntersectType(NodeType::kJSReceiver);
@@ -2946,6 +2946,17 @@ ProcessResult MaglevGraphOptimizer::VisitStringLength(
     StringLength* node, const ProcessingState& state) {
   REPLACE_AND_RETURN_IF_DONE(
       reducer_.TryReduceStringLength(node->StringInput().node()));
+  return ProcessResult::kContinue;
+}
+
+ProcessResult MaglevGraphOptimizer::VisitRegExpDataQuickCheckRejects(
+    RegExpDataQuickCheckRejects* node, const ProcessingState& state) {
+  return ProcessResult::kContinue;
+}
+
+ProcessResult MaglevGraphOptimizer::VisitRegExpExecQuickCheckRejects(
+    RegExpExecQuickCheckRejects* node, const ProcessingState& state) {
+  // TODO(b/424157317): Optimize.
   return ProcessResult::kContinue;
 }
 

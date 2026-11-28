@@ -392,6 +392,10 @@ class StackFrame {
   // Compute the stack pointer for the calling frame.
   virtual Address GetCallerStackPointer() const = 0;
 
+  // Notify the owning wasm stack (if any) that a tagged value was written into
+  // a slot of this frame, so minor GC does not skip scanning this stack.
+  void NotifyStackSlotWritten(Tagged<Object> value) const;
+
   const StackFrameIteratorBase* const iterator_;
 
  private:
@@ -651,7 +655,7 @@ class CommonFrame : public StackFrame {
 
   // Access the expressions in the stack frame including locals.
   inline Tagged<Object> GetExpression(int index) const;
-  inline void SetExpression(int index, Tagged<Object> value);
+  void SetExpression(int index, Tagged<Object> value);
   int ComputeExpressionsCount() const;
 
   Address GetCallerStackPointer() const override;
@@ -772,7 +776,7 @@ class JavaScriptFrame : public CommonFrameWithJSLinkage {
   Tagged<Object> context() const override;
   uint32_t GetActualArgumentCount() const override;
 
-  inline void set_receiver(Tagged<Object> value);
+  void set_receiver(Tagged<Object> value);
 
   // Debugger access.
   void SetParameterValue(int index, Tagged<Object> value) const;
@@ -1212,10 +1216,15 @@ class UnoptimizedJSFrame : public JavaScriptFrame {
   // Returns the frame's current bytecode array.
   Tagged<BytecodeArray> GetBytecodeArray() const;
 
+  // Returns the original (non-debug) BytecodeArray associated with this frame's
+  // SharedFunctionInfo after verifying that the frame's current BytecodeArray
+  // is consistent with it.
+  Tagged<BytecodeArray> GetOriginalBytecodeArray() const;
+
   // Access to the interpreter register file for this frame.
   Tagged<Object> ReadInterpreterRegister(int register_index) const;
 
-  inline void SetFeedbackVector(Tagged<FeedbackVector> feedback_vector);
+  void SetFeedbackVector(Tagged<FeedbackVector> feedback_vector);
 
   // Build a list with summaries for this frame including all inlined frames.
   FrameSummaries Summarize(AllowAllocation allow_allocation = AllowAllocation{
@@ -1253,11 +1262,6 @@ class InterpretedFrame : public UnoptimizedJSFrame {
   // Updates the frame's BytecodeArray with |bytecode_array|. Used by the
   // debugger to swap execution onto a BytecodeArray patched with breakpoints.
   void PatchBytecodeArray(Tagged<BytecodeArray> bytecode_array);
-
-  // Returns the original (non-debug) BytecodeArray associated with this frame's
-  // SharedFunctionInfo after verifying that the frame's current BytecodeArray
-  // is consistent with it.
-  Tagged<BytecodeArray> GetOriginalBytecodeArray() const;
 
   static InterpretedFrame* cast(StackFrame* frame) {
     DCHECK(frame->is_interpreted());

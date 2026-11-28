@@ -1131,6 +1131,15 @@ StackFrame::Type StackFrame::GetCallerState(State* state) const {
   return iterator_->ComputeStackFrameType(state);
 }
 
+void StackFrame::NotifyStackSlotWritten(Tagged<Object> value) const {
+#if V8_ENABLE_WEBASSEMBLY
+  if (!IsSmi(value) && iterator_ != nullptr &&
+      iterator_->wasm_stack() != nullptr) {
+    iterator_->wasm_stack()->set_contains_only_old_pointers(false);
+  }
+#endif
+}
+
 Address CommonFrame::GetCallerStackPointer() const {
   return fp() + CommonFrameConstants::kCallerSPOffset;
 }
@@ -1587,6 +1596,11 @@ void ApiIndexedAccessorExitFrame::Print(
 Address CommonFrame::GetExpressionAddress(int n) const {
   const int offset = StandardFrameConstants::kExpressionsOffset;
   return fp() + offset - n * kSystemPointerSize;
+}
+
+void CommonFrame::SetExpression(int index, Tagged<Object> value) {
+  Memory<Address>(GetExpressionAddress(index)) = value.ptr();
+  NotifyStackSlotWritten(value);
 }
 
 Address UnoptimizedJSFrame::GetExpressionAddress(int n) const {
@@ -2552,12 +2566,18 @@ FrameSummaries StubFrame::Summarize(AllowAllocation allow_allocation) const {
   return summaries;
 }
 
+void JavaScriptFrame::set_receiver(Tagged<Object> value) {
+  Memory<Address>(GetParameterSlot(-1)) = value.ptr();
+  NotifyStackSlotWritten(value);
+}
+
 void JavaScriptFrame::SetParameterValue(int index, Tagged<Object> value) const {
   CHECK_LE(-1, index);
   CHECK(index == -1 ||
         static_cast<uint32_t>(index) <
             std::max(GetActualArgumentCount(), ComputeParametersCount()));
   Memory<Address>(GetParameterSlot(index)) = value.ptr();
+  NotifyStackSlotWritten(value);
 }
 
 bool JavaScriptFrame::IsConstructor() const {
@@ -2839,6 +2859,7 @@ void JavaScriptBuiltinContinuationWithCatchFrame::SetException(
   CHECK_EQ(ReadOnlyRoots(isolate()).the_hole_value(),
            Tagged<Object>(Memory<Address>(exception_argument_slot)));
   Memory<Address>(exception_argument_slot) = exception.ptr();
+  NotifyStackSlotWritten(exception);
 }
 
 FrameSummary::JavaScriptFrameSummary::JavaScriptFrameSummary(
@@ -2878,9 +2899,11 @@ void FrameSummary::JavaScriptFrameSummary::EnsureSourcePositionsAvailable() {
 
 bool FrameSummary::JavaScriptFrameSummary::AreSourcePositionsAvailable() const {
   if (!v8_flags.enable_lazy_source_positions) return true;
-  Tagged<SharedFunctionInfo> sfi = function()->shared();
-  return sfi->HasBytecodeArray() &&
-         sfi->GetBytecodeArray(isolate())->HasSourcePositionTable();
+  if (Tagged<BytecodeArray> bytecode;
+      TryCast(abstract_code_->ToUnionType(), &bytecode)) {
+    return bytecode->HasSourcePositionTable();
+  }
+  return false;
 }
 
 bool FrameSummary::JavaScriptFrameSummary::is_subject_to_debugging() const {
@@ -3217,6 +3240,8 @@ FrameSummaries OptimizedJSFrame::Summarize(
   // would parse every value in every inlined frame.
 
   Tagged<DeoptimizationLiteralArray> literal_array = data->LiteralArray();
+  Tagged<ProtectedDeoptimizationLiteralArray> protected_literal_array =
+      data->ProtectedLiteralArray();
 
   // Lightweight walk: resolve function and receiver from live frame headers
   // and build JavaScriptFrameSummary objects directly.
@@ -3252,18 +3277,28 @@ FrameSummaries OptimizedJSFrame::Summarize(
         continue;
       }
 
-      bool is_builtin_cont =
-          (opcode == TranslationOpcode::JAVASCRIPT_BUILTIN_CONTINUATION_FRAME ||
-           opcode == TranslationOpcode::
-                         JAVASCRIPT_BUILTIN_CONTINUATION_WITH_CATCH_FRAME);
-
       int bytecode_offset = it.NextOperand();
-      int sfi_id = it.NextOperand();
-      Tagged<SharedFunctionInfo> sfi =
-          Cast<SharedFunctionInfo>(literal_array->get(sfi_id));
+      it.NextOperand();  // Skip SFI; BytecodeArray comes from protected data.
 
-      // Skip remaining header operands to reach the values.
-      it.SkipOperands(TranslationOpcodeOperandCount(opcode) - 2);
+      Tagged<AbstractCode> abstract_code;
+      int code_offset;
+      if (IsTranslationInterpreterFrameOpcode(opcode)) {
+        int bytecode_array_id = it.NextOperand();
+        abstract_code = Cast<AbstractCode>(TrustedCast<BytecodeArray>(
+            protected_literal_array->get(bytecode_array_id)));
+        code_offset = bytecode_offset;
+        it.SkipOperands(TranslationOpcodeOperandCount(opcode) - 3);
+      } else {
+        DCHECK(opcode ==
+                   TranslationOpcode::JAVASCRIPT_BUILTIN_CONTINUATION_FRAME ||
+               opcode == TranslationOpcode::
+                             JAVASCRIPT_BUILTIN_CONTINUATION_WITH_CATCH_FRAME);
+        code_offset = 0;
+        abstract_code = Cast<AbstractCode>(
+            isolate()->builtins()->code(Builtins::GetBuiltinFromBytecodeOffset(
+                BytecodeOffset(bytecode_offset))));
+        it.SkipOperands(TranslationOpcodeOperandCount(opcode) - 2);
+      }
 
       // Resolve closure and receiver from the live frame.  The closure is
       // always tagged (LITERAL or TAGGED_STACK_SLOT), but the receiver is
@@ -3280,18 +3315,6 @@ FrameSummaries OptimizedJSFrame::Summarize(
       if (!receiver_obj.has_value()) {
         needs_full_walk = true;
         break;
-      }
-
-      Tagged<AbstractCode> abstract_code;
-      int code_offset;
-      if (is_builtin_cont) {
-        code_offset = 0;
-        abstract_code = Cast<AbstractCode>(
-            isolate()->builtins()->code(Builtins::GetBuiltinFromBytecodeOffset(
-                BytecodeOffset(bytecode_offset))));
-      } else {
-        code_offset = bytecode_offset;
-        abstract_code = Cast<AbstractCode>(sfi->GetBytecodeArray(isolate()));
       }
 
       FrameSummary::JavaScriptFrameSummary summary(
@@ -3331,8 +3354,6 @@ FrameSummaries OptimizedJSFrame::SummarizeFull(
   bool is_constructor = IsConstructor();
   for (auto it = translated.begin(); it != translated.end(); it++) {
     if (TranslatedFrame::IsJavaScriptFrame(it->kind())) {
-      DirectHandle<SharedFunctionInfo> shared_info = it->shared_info();
-
       // The translation commands are ordered and the function is always
       // at the first position, and the receiver is next.
       TranslatedFrame::iterator translated_values = it->begin();
@@ -3376,8 +3397,7 @@ FrameSummaries OptimizedJSFrame::SummarizeFull(
       } else {
         DCHECK_EQ(it->kind(), TranslatedFrame::kUnoptimizedFunction);
         code_offset = it->bytecode_offset().ToInt();
-        abstract_code =
-            direct_handle(shared_info->abstract_code(isolate()), isolate());
+        abstract_code = Cast<AbstractCode>(it->bytecode_array());
       }
 
       // Append full summary of the encountered JS frame.
@@ -3573,6 +3593,13 @@ Tagged<BytecodeArray> UnoptimizedJSFrame::GetBytecodeArray() const {
   return TrustedCast<BytecodeArray>(GetExpression(index));
 }
 
+Tagged<BytecodeArray> UnoptimizedJSFrame::GetOriginalBytecodeArray() const {
+  auto bytecodes = function()->shared()->GetBytecodeArrays(isolate());
+  Tagged<BytecodeArray> frame_bytecode = GetBytecodeArray();
+  SBXCHECK_EQ(bytecodes.active, frame_bytecode);
+  return bytecodes.original;
+}
+
 namespace {
 // Validates that an interpreter register index points to a legitimate register
 // in the unoptimized frame: either a local register in the register file,
@@ -3611,6 +3638,13 @@ Tagged<Object> UnoptimizedJSFrame::ReadInterpreterRegister(
             UnoptimizedFrameConstants::kExpressionsOffset -
                 index * kSystemPointerSize);
   return GetExpression(index + register_index);
+}
+
+void UnoptimizedJSFrame::SetFeedbackVector(
+    Tagged<FeedbackVector> feedback_vector) {
+  const int offset = InterpreterFrameConstants::kFeedbackVectorFromFp;
+  Memory<Address>(fp() + offset) = feedback_vector.ptr();
+  NotifyStackSlotWritten(feedback_vector);
 }
 
 FrameSummaries UnoptimizedJSFrame::Summarize(
@@ -3657,12 +3691,6 @@ void InterpretedFrame::PatchBytecodeArray(
   SetExpression(index, bytecode_array);
 }
 
-Tagged<BytecodeArray> InterpretedFrame::GetOriginalBytecodeArray() const {
-  auto bytecodes = function()->shared()->GetBytecodeArrays(isolate());
-  SBXCHECK_EQ(bytecodes.active, GetBytecodeArray());
-  return bytecodes.original;
-}
-
 int BaselineFrame::GetBytecodeOffset() const {
   Tagged<Code> code = LookupCode();
   return code->GetBytecodeOffsetForBaselinePC(this->pc(), GetBytecodeArray());
@@ -3676,6 +3704,7 @@ intptr_t BaselineFrame::GetPCForBytecodeOffset(int bytecode_offset) const {
 
 void BaselineFrame::PatchContext(Tagged<Context> value) {
   Memory<Address>(fp() + BaselineFrameConstants::kContextOffset) = value.ptr();
+  NotifyStackSlotWritten(value);
 }
 
 Tagged<JSFunction> BuiltinFrame::function() const {

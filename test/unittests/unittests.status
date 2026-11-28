@@ -573,6 +573,9 @@
   'ApiTest.InternalFieldsSubclassing': [PASS, ['mode == debug and arch == ia32', SKIP]],
   'HeapProfilerTest.SamplingHeapProfiler': [SKIP],
 
+  # BUG(590940690): Times out.
+  'StartupSnapshotUntrustedSectionTest.PendingWeakPrefix': [PASS, ['tsan', SKIP]],
+
   # BUG(v8:11820): the test adjusts GC flags, which does not work
   # if GC starts before the test.
   'RuntimeCallStatsTest.GarbageCollection': [SKIP],
@@ -910,6 +913,14 @@
   'LogAllTest.LogAll': [SKIP],
   'SerializeTest.*': [PASS, NO_VARIANTS],
   'UninitializedSerializeTest.*': [PASS, NO_VARIANTS],
+
+  # Too slow based on test durations in ResultDB.
+  'UninitializedSerializeTest.ContextSerializerContext': [SKIP],
+  'UninitializedSerializeTest.ContextSerializerCustomContext': [SKIP],
+  'UninitializedSerializeTest.StartupSerializerOnce': [SKIP],
+  'UninitializedSerializeTest.StartupSerializerOnceRunScript': [SKIP],
+  'UninitializedSerializeTest.StartupSerializerTwice': [SKIP],
+  'UninitializedSerializeTest.StartupSerializerTwiceRunScript': [SKIP],
 }],
 
 ['variant == stress_regexp_jit or variant == always_sparkplug_and_stress_regexp_jit', {
@@ -1090,6 +1101,7 @@
   # Tests too slow in non-optimized debug mode.
   'ApiTest.FastApiCalls': [SKIP],
   'ApiTest.InternalFieldsSubclassing': [SKIP],
+  'ApiThreadingTest.Threading6': [SKIP],
   'ApiThreadingTest.Threading8': [SKIP],
   'ConcurrentAllocationUninitializedTest.ConcurrentAllocationInLargeSpace': [SKIP],
   'LogAllTest.LogAll': [SKIP],
@@ -1121,5 +1133,23 @@
   'MergeDeserializedCodeTest.ConcurrentLazyCompileDuringTryGetScopeInfoForMerge': [SKIP],
   'MergeDeserializedCodeTest.ConcurrentScopeInfoMutationDuringCodeCacheSerialization': [SKIP],
 }],  # not test_only_sync_points
+
+##############################################################################
+# Tests that are too slow in particular slow configurations, based on test
+# durations in ResultDB (median >= 300s, or >= 120s for jitless and
+# nooptimization on arm64 simulator debug).
+['arch == arm and mode == debug and simulator_run and lite_mode', {
+  'CpuProfilerUninitializedTest.MultipleIsolates': [SKIP],
+}],  # 'arch == arm and mode == debug and simulator_run and lite_mode'
+
+##############################################################################
+['system == macos and arch == x64 and mode == debug', {
+  'LogAllTest.LogAll': [SKIP],
+}],  # 'system == macos and arch == x64 and mode == debug'
+
+##############################################################################
+['system == windows and mode == debug', {
+  'LogAllTest.LogAll': [SKIP],
+}],  # 'system == windows and mode == debug'
 
 ]

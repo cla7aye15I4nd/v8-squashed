@@ -11905,24 +11905,25 @@ MaglevGraphBuilder::TryReduceConstructWithSpreadForArgumentsObject(
   return BuildConstruct(target, new_target, new_args, feedback_source);
 }
 
+InlinedAllocation* MaglevGraphBuilder::TryGetNonEscapingAllocation(
+    ValueNode* node) {
+  if (!node->Is<InlinedAllocation>()) {
+    return nullptr;
+  }
+  InlinedAllocation* alloc = node->Cast<InlinedAllocation>();
+  if (IsInsideLoop() && (!is_loop_effect_tracking() ||
+                         !loop_effects_->allocations.contains(alloc))) {
+    return nullptr;
+  }
+  if (IsEscaping(alloc)) {
+    return nullptr;
+  }
+  return alloc;
+}
+
 std::optional<VirtualObject*>
 MaglevGraphBuilder::TryGetNonEscapingArgumentsOrArray(ValueNode* value) {
-  auto try_get_non_escaping_alloc = [&](ValueNode* node) -> InlinedAllocation* {
-    if (!node->Is<InlinedAllocation>()) {
-      return nullptr;
-    }
-    InlinedAllocation* alloc = node->Cast<InlinedAllocation>();
-    if (IsInsideLoop() && (!is_loop_effect_tracking() ||
-                           !loop_effects_->allocations.contains(alloc))) {
-      return nullptr;
-    }
-    if (IsEscaping(alloc)) {
-      return nullptr;
-    }
-    return alloc;
-  };
-
-  InlinedAllocation* alloc = try_get_non_escaping_alloc(value);
+  InlinedAllocation* alloc = TryGetNonEscapingAllocation(value);
   if (!alloc) {
     return {};
   }
@@ -11958,7 +11959,7 @@ MaglevGraphBuilder::TryGetNonEscapingArgumentsOrArray(ValueNode* value) {
   if (elements->Is<ArgumentsElements>()) {
     return object;
   }
-  if (try_get_non_escaping_alloc(elements)) {
+  if (TryGetNonEscapingAllocation(elements)) {
     return object;
   }
   if (elements->Is<RootConstant>() || elements->Is<HeapConstant>()) {
@@ -12830,20 +12831,16 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildAndAllocateJSGeneratorObject(
   VirtualObject* register_file =
       reducer_.CreateFixedArray(base::VectorOf(values));
 
-  // Create the JS[Async]GeneratorObject instance.
-  compiler::SlackTrackingPrediction slack_tracking_prediction =
-      broker()->dependencies()->DependOnInitialMapInstanceSizePrediction(
-          function);
-  compiler::MapRef initial_map = function.initial_map(broker());
+  // Create the JS[Async]GeneratorObject instance. Generator initial maps have
+  // no in-object properties and never start slack tracking, so their instance
+  // size is final.
+  compiler::MapRef initial_map =
+      broker()->dependencies()->DependOnInitialMap(function);
+  DCHECK(!initial_map.IsInobjectSlackTrackingInProgress());
+  DCHECK_EQ(0, initial_map.GetInObjectProperties());
   VirtualObject* generator = reducer_.CreateJSGeneratorObject(
-      initial_map, slack_tracking_prediction.instance_size(), GetContext(),
-      closure, receiver, register_file);
-
-  // Handle in-object properties.
-  for (int i = 0; i < slack_tracking_prediction.inobject_property_count();
-       i++) {
-    generator->set(initial_map.GetInObjectPropertyOffset(i), undefined);
-  }
+      initial_map, initial_map.instance_size(), GetContext(), closure, receiver,
+      register_file);
 
   return reducer_.BuildInlinedAllocation(generator);
 }
@@ -14752,6 +14749,13 @@ void MaglevGraphBuilder::BuildLoopForPeeling() {
   decremented_predecessor_offsets_.clear();
 
   DCHECK(current_block());
+  // Finish tracking the peeled iteration's effects before creating the loop
+  // header merge state so `EndLoopEffects` does not attach them to the loop.
+  LoopEffects* peeled_effects = nullptr;
+  if (track_peeled_effects) {
+    peeled_effects = loop_effects_;
+    EndLoopEffects(loop_header);
+  }
   // After resetting, the actual loop header always has exactly 2
   // predecessors: the two copies of `JumpLoop`.
   InitializePredecessorCount(loop_header, 2);
@@ -14769,11 +14773,8 @@ void MaglevGraphBuilder::BuildLoopForPeeling() {
                  v8_flags.maglev_optimistic_peeled_loops);
   merge_states_[loop_header]->InitializeLoop(
       graph(), is_tracing(), *compilation_unit_, current_interpreter_frame_,
-      block, GetCurrentScopeInfo(), in_peeled_iteration(), loop_effects_);
+      block, GetCurrentScopeInfo(), in_peeled_iteration(), peeled_effects);
 
-  if (track_peeled_effects) {
-    EndLoopEffects(loop_header);
-  }
   DCHECK_NE(iterator_.current_offset(), loop_header);
   iterator_.SetOffset(loop_header);
 }
@@ -14789,6 +14790,7 @@ void MaglevGraphBuilder::EndLoopEffects(int loop_header) {
   // TODO(olivf): Update merge states dominated by the loop header with
   // information we know to be unaffected by the loop.
   if (merge_states_[loop_header] && merge_states_[loop_header]->is_loop()) {
+    DCHECK(is_loop_effect_tracking_enabled());
     merge_states_[loop_header]->AsLoopHeader()->set_loop_effects(loop_effects_);
   }
   if (loop_effects_stack_.size() > 1) {
@@ -16565,16 +16567,16 @@ bool MaglevGraphBuilder::Build() {
     if (i == 0) {
       // This is the receiver (the "this" register).
       if (is_sloppy(
-              compilation_unit_->shared_function_info().language_mode())) {
-        DCHECK(compilation_unit_->shared_function_info().IsUserJavaScript());
+              compilation_unit_->shared_function_info().language_mode()) &&
+          !compilation_unit_->shared_function_info().native()) {
         if (reducer_.RecordType(v, NodeType::kJSReceiver).IsDoneWithAbort()) {
           return false;
         }
       }
-      // In strict mode, the receiver can be pretty much anything (ie, not just
-      // a JSReceiver but also a Smi or undefined, and in derived constructors
-      // it can even be the_hole). The type would be NodeType::kUnknown, so we
-      // just don't set it.
+      // In strict mode (or for native functions), the receiver can be pretty
+      // much anything (ie, not just a JSReceiver but also a Smi or undefined,
+      // and in derived constructors it can even be the_hole). The type would be
+      // NodeType::kUnknown, so we just don't set it.
     }
   }
 

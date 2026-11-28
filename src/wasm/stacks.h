@@ -102,7 +102,10 @@ class V8_EXPORT_PRIVATE StackMemory
     current_cont_ = cont;
     contains_only_old_pointers_ = false;
   }
-  void set_stack_obj(Tagged<WasmStackObject> stack) { stack_obj_ = stack; }
+  void set_stack_obj(Tagged<WasmStackObject> stack) {
+    stack_obj_ = stack;
+    contains_only_old_pointers_ = false;
+  }
   Tagged<WasmStackObject> stack_obj() { return stack_obj_; }
   JumpBuffer* jmpbuf() { return &jmpbuf_; }
   bool Contains(Address addr) const {
@@ -208,7 +211,10 @@ class V8_EXPORT_PRIVATE StackMemory
     stack_switch_info_.source_fp = kNullAddress;
   }
 
-  void set_func_ref(Tagged<WasmFuncRef> func_ref) { func_ref_ = func_ref; }
+  void set_func_ref(Tagged<WasmFuncRef> func_ref) {
+    func_ref_ = func_ref;
+    contains_only_old_pointers_ = false;
+  }
   Tagged<WasmFuncRef> func_ref() const { return func_ref_; }
   static int func_ref_offset() { return OFFSET_OF(StackMemory, func_ref_); }
 
@@ -312,8 +318,9 @@ class V8_EXPORT_PRIVATE StackMemory
   Tagged<WasmContinuationObject> current_cont_ = {};
   Tagged<WasmFuncRef> func_ref_ = {};
   Tagged<WasmStackObject> stack_obj_ = {};
-  // Param type vector, to know which bound arguments are references and need to
-  // be visited by the GC. The memory is owned by the type canonicalizer.
+  // Param type vector, populated lazily on first {cont.bind} with >0 args
+  // (or {cont.new}) to know which bound arguments are references and need to be
+  // visited by the GC. The memory is owned by the type canonicalizer.
   base::Vector<const CanonicalValueType> param_types_;
   Address arg_buffer_ = kNullAddress;
   int num_bound_args_ = 0;

@@ -74,7 +74,7 @@ class WasmStreaming::WasmStreamingImpl {
     // Finish can only be called on the main thread of the isolate.
     CHECK_EQ(i_isolate_->thread_id(), base::ThreadId::Current());
     // Hold a local reference in case the embedder destroys `WasmStreaming`
-    // inside `caching_callback` or `OnCompilationSucceeded`.
+    // inside `caching_callback`.
     std::shared_ptr<i::wasm::StreamingDecoder> streaming_decoder =
         streaming_decoder_;
     streaming_decoder->Finish(caching_callback);
@@ -176,11 +176,15 @@ std::shared_ptr<WasmStreaming> WasmStreaming::Unpack(Isolate* isolate,
 class WasmModuleCompilation::Impl {
  public:
   Impl(WasmEnabledFeatures enabled_features, CompileTimeImports compile_imports)
-      : streaming_decoder_(i::wasm::GetWasmEngine()->StartStreamingCompilation(
-            enabled_features, std::move(compile_imports),
-            "WasmModuleCompilation", resolver_)) {}
+      : streaming_decoder_(
+            (i::v8_flags.jitless && !i::v8_flags.wasm_jitless)
+                ? nullptr
+                : i::wasm::GetWasmEngine()->StartStreamingCompilation(
+                      enabled_features, std::move(compile_imports),
+                      "WasmModuleCompilation", resolver_)) {}
 
   void OnBytesReceived(const uint8_t* bytes, size_t size) {
+    if (!streaming_decoder_) return;
     streaming_decoder_->OnBytesReceived(base::VectorOf(bytes, size));
   }
 
@@ -190,6 +194,14 @@ class WasmModuleCompilation::Impl {
           std::variant<Local<WasmModuleObject>, Local<Value>> module_or_error)>&
           resolution_callback) {
     DCHECK_NULL(resolver_->callback_);
+    if (!streaming_decoder_) {
+      DCHECK(i::v8_flags.jitless && !i::v8_flags.wasm_jitless);
+      i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
+      ErrorThrower thrower(i_isolate, "WasmModuleCompilation");
+      thrower.CompileError("Wasm code generation disallowed in jitless mode");
+      resolution_callback(Local<Value>{Utils::ToLocal(thrower.Reify())});
+      return;
+    }
     resolver_->callback_ = resolution_callback;
 
     // Hold a local reference in case the embedder destroys
@@ -199,13 +211,22 @@ class WasmModuleCompilation::Impl {
         streaming_decoder_;
     streaming_decoder->InitializeIsolateSpecificInfo(
         reinterpret_cast<i::Isolate*>(isolate));
-    streaming_decoder->Finish(caching_callback);
+    // `WasmModuleCompilation` invokes a C++ callback with the compiled
+    // `WasmModuleObject` without resolving JS promises or instantiating the
+    // module, and Node.js (`DeserializeWasmModule`) relies on synchronous
+    // completion when cached module bytes are accepted.
+    streaming_decoder->Finish(caching_callback,
+                              /*can_finish_synchronously=*/true);
   }
 
-  void Abort() { streaming_decoder_->Abort(); }
+  void Abort() {
+    if (!streaming_decoder_) return;
+    streaming_decoder_->Abort();
+  }
 
   void SetMoreFunctionsCanBeSerializedCallback(
       std::function<void(CompiledWasmModule)> callback) {
+    if (!streaming_decoder_) return;
     streaming_decoder_->SetMoreFunctionsCanBeSerializedCallback(
         [callback = std::move(callback),
          url = streaming_decoder_->shared_url()](
@@ -215,10 +236,14 @@ class WasmModuleCompilation::Impl {
   }
 
   void SetHasCompiledModuleBytes() {
+    if (!streaming_decoder_) return;
     streaming_decoder_->SetHasCompiledModuleBytes();
   }
 
-  void SetUrl(std::string_view url) { streaming_decoder_->SetUrl(url); }
+  void SetUrl(std::string_view url) {
+    if (!streaming_decoder_) return;
+    streaming_decoder_->SetUrl(url);
+  }
 
  private:
   class Resolver final : public i::wasm::CompilationResultResolver {

@@ -42,6 +42,9 @@
   # loop instead of properly reporting a RangeError for a stack overflow.
   'regress/regress-crbug-1080638': [SKIP],
 
+  # https://crbug.com/580790013
+  'regress/regress-580790013-*': [PASS, ['not memory_corruption_api', SKIP]],
+
   # Tests that need to run sequentially (e.g. due to memory consumption).
   'runtime/console-messages-limits': [PASS, SLOW, HEAVY],
   'debugger/debug-stepout-scope-part1': [PASS, HEAVY],
@@ -317,6 +320,7 @@
 ##############################################################################
 ['full_debug', {
   # Tests too slow in non-optimized debug mode.
+  'debugger/regress-532099983': [SKIP],
   'runtime/console-messages-limits': [SKIP],
 }],  # 'full_debug'
 
@@ -364,6 +368,7 @@
 ['((arch != x64 and arch != arm64 and arch != ia32 and arch != arm and arch != ppc64 and arch != s390x) or (simulator_run and direct_handle))', {
   # Stack switching is only supported on x64/arm64/ia32/arm.
   'debugger/wasm-jspi-async-stack': [SKIP],
+  'debugger/wasm-jspi-set-variable-value': [SKIP],
 }],  # (arch != x64 and arch != arm64 and arch != ia32 and arch != arm and arch != ppc64 and arch != s390x)
 
 ##############################################################################
@@ -404,5 +409,29 @@
   'debugger/wasm-inlined-breakpoints': [SKIP],
   'debugger/wasm-inlined-frame-summary': [SKIP],
 }],  # 'arch in (ia32, arm, riscv32)'
+
+##############################################################################
+# Tests that are too slow in particular slow configurations, based on test
+# durations in ResultDB (median >= 300s, or >= 120s for jitless and
+# nooptimization on arm64 simulator debug).
+['arch == arm and mode == debug and simulator_run and lite_mode', {
+  'regress/regress-575838270': [SKIP],
+}],  # 'arch == arm and mode == debug and simulator_run and lite_mode'
+
+##############################################################################
+['arch == arm64 and mode == debug and simulator_run', {
+  'debugger/regress-532099983': [SKIP],
+}],  # 'arch == arm64 and mode == debug and simulator_run'
+
+##############################################################################
+['arch == arm64 and mode == debug and simulator_run and variant in (jitless, nooptimization)', {
+  'debugger/debug-scopes': [SKIP],
+  'debugger/limit-size-of-collected-scripts': [SKIP],
+  'heap-profiler/heap-snapshot-js-weak-refs': [SKIP],
+  'regress/regress-575838270': [SKIP],
+  'regress/regress-617882': [SKIP],
+  'regress/regress-crbug-572821841': [SKIP],
+  'runtime/console-table': [SKIP],
+}],  # 'arch == arm64 and mode == debug and simulator_run and variant in (jitless, nooptimization)'
 
 ]

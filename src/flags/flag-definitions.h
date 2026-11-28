@@ -1469,7 +1469,7 @@ DEFINE_BOOL(
     trace_turbo_stack_accesses, false,
     "trace stack load/store counters for optimized code in run-time (x64 only)")
 
-// When fuzzing and concurrent compilation is enabled, disable Turbofan
+// When fuzzing and concurrent compilation is enabled, disable Turbofan/Maglev
 // tracing flags since reading/printing heap state is not thread-safe and
 // leads to false positives on TSAN bots.
 // TODO(chromium:1205289): Teach relevant fuzzers to not pass TF tracing
@@ -1507,6 +1507,8 @@ DEFINE_DISABLE_FLAG_IMPLICATION(fuzzing_and_concurrent_recompilation,
 #endif
 DEFINE_DISABLE_FLAG_IMPLICATION(fuzzing_and_concurrent_recompilation,
                                 trace_turbo_stack_accesses)
+DEFINE_DISABLE_FLAG_IMPLICATION(fuzzing_and_concurrent_recompilation,
+                                trace_maglev)
 
 DEFINE_BOOL(turbo_verify, DEBUG_BOOL, "verify TurboFan graphs at each phase")
 DEFINE_STRING(turbo_verify_machine_graph, nullptr,
@@ -1796,6 +1798,10 @@ DEFINE_BOOL(turbolev, false,
 DEFINE_WEAK_IMPLICATION(array_destructure_bytecode, turbolev)
 DEFINE_NEG_IMPLICATION(turbofan && !turbolev, array_destructure_bytecode)
 
+DEFINE_BOOL(turbolev_regexp_quick_check, false,
+            "reject regexp mismatches with an inline quick check in front of "
+            "calls to the fast regexp builtins")
+
 DEFINE_DEVELOPER_FLAG(print_turbolev_frontend,
                       "print Turbolev frontend (Maglev graphs)")
 DEFINE_STRING(turbolev_phase_filter, "*",
@@ -1808,6 +1814,7 @@ DEFINE_EXPERIMENTAL_FEATURE(
     turbolev_future,
     "enable Turbolev features that we want to ship in the not-too-far future")
 DEFINE_IMPLICATION(turbolev_future, turbolev)
+DEFINE_WEAK_IMPLICATION(turbolev_future, turbolev_regexp_quick_check)
 DEFINE_NEG_IMPLICATION(turbofan && !turbolev, forin_enumerator_holder)
 
 #if TAGGED_SIZE_8_BYTES
@@ -2543,9 +2550,8 @@ DEFINE_SIZE_T(
     "All three flags cannot be specified at the same time.")
 DEFINE_SIZE_T(initial_heap_size, 0, "initial size of the heap (in Mbytes)")
 DEFINE_SIZE_T(initial_old_space_size, 0, "initial old space size (in Mbytes)")
-DEFINE_SIZE_T(preconfigured_old_space_size, 32,
+DEFINE_SIZE_T(preconfigured_old_space_size, 0,
               "preconfigured old space size (in Mbytes)")
-DEFINE_WEAK_VALUE_IMPLICATION(future, preconfigured_old_space_size, size_t{32})
 DEFINE_BOOL(gc_global, false, "always perform global GCs")
 
 // TODO(12950): The next three flags only have an effect if
@@ -2829,6 +2835,8 @@ DEFINE_BOOL(shortcut_strings_with_stack, true,
 DEFINE_BOOL(stress_compaction, false,
             "Stress GC compaction to flush out bugs with moving objects")
 DEFINE_BOOL(resize_large_object, true, "Support resizing of large objects")
+DEFINE_BOOL(shrink_string_table, false,
+            "Shrink off-heap StringTable at Mark-Compact safepoint")
 DEFINE_BOOL(stress_compaction_random, false,
             "Stress GC compaction by selecting random percent of pages as "
             "evacuation candidates. Overrides stress_compaction.")
